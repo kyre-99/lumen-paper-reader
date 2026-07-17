@@ -11,6 +11,7 @@ function environmentModelConfig() {
   return {
     endpoint: String(runtime.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1"),
     model: String(runtime.OPENAI_MODEL || process.env.OPENAI_MODEL || "gpt-4.1-mini"),
+    apiKey: String(runtime.OPENAI_API_KEY || process.env.OPENAI_API_KEY || ""),
     hasApiKey: Boolean(runtime.OPENAI_API_KEY || process.env.OPENAI_API_KEY),
   };
 }
@@ -19,8 +20,22 @@ export async function GET() {
   const user = await requireAppUser();
   if (!user) return Response.json({ error: "需要登录" }, { status: 401 });
   const db = getDb();
-  const [settings] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
+  let [settings] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
   const environment = environmentModelConfig();
+  if (environment.apiKey && !settings?.apiKeyEncrypted) {
+    const imported = {
+      userId: user.id,
+      globalSystemPrompt: settings?.globalSystemPrompt || DEFAULT_PROMPTS.global,
+      inlineSystemPrompt: settings?.inlineSystemPrompt || DEFAULT_PROMPTS.inline,
+      modelProvider: environment.endpoint.includes("zhizengzeng") ? "智增增" : settings?.modelProvider || "OpenAI",
+      modelEndpoint: environment.endpoint,
+      modelName: environment.model,
+      apiKeyEncrypted: await encryptApiKey(environment.apiKey),
+      updatedAt: new Date().toISOString(),
+    };
+    await db.insert(userSettings).values(imported).onConflictDoUpdate({ target: userSettings.userId, set: imported });
+    [settings] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
+  }
   const hasSavedModelConfig = Boolean(settings?.apiKeyEncrypted) || Boolean(settings?.modelEndpoint && settings.modelEndpoint !== "https://api.openai.com/v1");
   return Response.json({
     prompts: {

@@ -1,5 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
+import { env } from "cloudflare:workers";
+import { eq } from "drizzle-orm";
+import { getDb } from "../../../db";
+import { userSettings } from "../../../db/schema";
 import { DEFAULT_PROMPTS, renderSystemPrompt } from "../../chat-prompts";
+import { decryptApiKey } from "../../model-config-crypto";
 import { requireAppUser } from "../../server-user";
 
 const MAX_REFERENCE_CHARS = 24000;
@@ -31,19 +36,32 @@ function cleanHistory(history: unknown, limit: number) {
     .map((item) => ({ role: item.role, content: item.content.slice(0, 12000) }));
 }
 
+function chatCompletionsUrl(input: string) {
+  const target = new URL(input);
+  if (target.protocol !== "https:") throw new Error("API 地址必须使用 HTTPS");
+  const path = target.pathname.replace(/\/+$/, "");
+  if (!path.endsWith("/chat/completions")) target.pathname = `${path}/chat/completions`;
+  return target;
+}
+
 export async function POST(request: NextRequest) {
   try {
     const user = await requireAppUser();
     if (!user) return NextResponse.json({ error: "需要登录" }, { status: 401 });
     const body = await request.json();
     const { endpoint, apiKey, model, paperTitle, question, paperContext = "", selectedText = "", surroundingContext = "", mode = "global", history = [], systemPrompts = {} } = body;
-    if (!endpoint || !apiKey || !model || !question) return NextResponse.json({ error: "模型配置不完整" }, { status: 400 });
-    const target = new URL(endpoint);
-    if (target.protocol !== "https:") return NextResponse.json({ error: "API 地址必须使用 HTTPS" }, { status: 400 });
+    const db = getDb();
+    const [savedSettings] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
+    const runtime = env as any;
+    const resolvedEndpoint = String(endpoint || savedSettings?.modelEndpoint || runtime.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "").trim();
+    const resolvedModel = String(model || savedSettings?.modelName || runtime.OPENAI_MODEL || process.env.OPENAI_MODEL || "").trim();
+    const resolvedApiKey = String(apiKey || (savedSettings?.apiKeyEncrypted ? await decryptApiKey(savedSettings.apiKeyEncrypted) : "") || runtime.OPENAI_API_KEY || process.env.OPENAI_API_KEY || "").trim();
+    if (!resolvedEndpoint || !resolvedApiKey || !resolvedModel || !question) return NextResponse.json({ error: "模型配置不完整，请先在 AI 设置中保存" }, { status: 400 });
+    const target = chatCompletionsUrl(resolvedEndpoint);
     const isInline = mode === "inline";
     const title = String(paperTitle || "研究论文").slice(0, 300);
-    const globalPrompt = String(systemPrompts?.global || DEFAULT_PROMPTS.global).trim().slice(0, 12000) || DEFAULT_PROMPTS.global;
-    const inlinePrompt = String(systemPrompts?.inline || DEFAULT_PROMPTS.inline).trim().slice(0, 12000) || DEFAULT_PROMPTS.inline;
+    const globalPrompt = String(systemPrompts?.global || savedSettings?.globalSystemPrompt || DEFAULT_PROMPTS.global).trim().slice(0, 12000) || DEFAULT_PROMPTS.global;
+    const inlinePrompt = String(systemPrompts?.inline || savedSettings?.inlineSystemPrompt || DEFAULT_PROMPTS.inline).trim().slice(0, 12000) || DEFAULT_PROMPTS.inline;
     const retrievedContext = isInline ? "" : selectRelevantContext(String(paperContext), String(question));
     const messages = isInline ? [
       {
@@ -66,7 +84,7 @@ export async function POST(request: NextRequest) {
         content: `下面是从论文中找到的参考内容：\n\n<paper_reference>\n${retrievedContext}\n</paper_reference>\n\n我的问题是：\n${question}`,
       },
     ];
-    const response = await fetch(target.toString(), { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` }, body: JSON.stringify({ model, messages, temperature: 0.3 }) });
+    const response = await fetch(target.toString(), { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${resolvedApiKey}` }, body: JSON.stringify({ model: resolvedModel, messages, temperature: 0.3 }) });
     const payload: any = await response.json().catch(() => ({}));
     if (!response.ok) return NextResponse.json({ error: payload?.error?.message || `模型接口返回 ${response.status}` }, { status: 502 });
     const content = payload?.choices?.[0]?.message?.content;

@@ -50,5 +50,9 @@ export const userSettings = sqliteTable("user_settings", {
   userId: text("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
   globalSystemPrompt: text("global_system_prompt").notNull().default(""),
   inlineSystemPrompt: text("inline_system_prompt").notNull().default(""),
+  modelProvider: text("model_provider").notNull().default("OpenAI"),
+  modelEndpoint: text("model_endpoint").notNull().default("https://api.openai.com/v1"),
+  modelName: text("model_name").notNull().default("gpt-4.1-mini"),
+  apiKeyEncrypted: text("api_key_encrypted").notNull().default(""),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });

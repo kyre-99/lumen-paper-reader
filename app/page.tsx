@@ -364,27 +364,34 @@ function LibraryModal({ onClose, papers, loading, activePaperId, onOpenPaper, on
   );
 }
 
+const MODEL_PRESETS: Record<string, { endpoint: string; models: string[] }> = {
+  智增增: { endpoint: "https://api.zhizengzeng.com/v1", models: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "deepseek-chat", "deepseek-reasoner", "gemini-2.5-flash"] },
+  OpenAI: { endpoint: "https://api.openai.com/v1", models: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "o4-mini"] },
+  DeepSeek: { endpoint: "https://api.deepseek.com", models: ["deepseek-chat", "deepseek-reasoner"] },
+  OpenRouter: { endpoint: "https://openrouter.ai/api/v1", models: ["openai/gpt-4.1-mini", "anthropic/claude-3.7-sonnet", "google/gemini-2.5-flash"] },
+  Moonshot: { endpoint: "https://api.moonshot.cn/v1", models: ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"] },
+};
+
 function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { onClose: () => void; config: ApiConfig; setConfig: (v: ApiConfig) => void; prompts: PromptConfig; setPrompts: (v: PromptConfig) => void }) {
-  const presets = {
-    OpenAI: { endpoint: "https://api.openai.com/v1/chat/completions", model: "gpt-4.1-mini" },
-    DeepSeek: { endpoint: "https://api.deepseek.com/chat/completions", model: "deepseek-chat" },
-    OpenRouter: { endpoint: "https://openrouter.ai/api/v1/chat/completions", model: "openai/gpt-4.1-mini" },
-    Moonshot: { endpoint: "https://api.moonshot.cn/v1/chat/completions", model: "moonshot-v1-8k" },
-  };
   const [tab, setTab] = useState<"model" | "prompts">("model");
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [saveError, setSaveError] = useState("");
+  const providerModels = MODEL_PRESETS[config.provider]?.models || [];
+  const usesCustomModel = !providerModels.includes(config.model);
   const saveSettings = async () => {
     setSaveState("saving");
+    setSaveError("");
     try {
-      sessionStorage.setItem("lumen-api-key", config.apiKey);
-      localStorage.setItem("lumen-api-config", JSON.stringify({ ...config, apiKey: "" }));
-      const response = await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompts }) });
+      const response = await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompts, modelConfig: config }) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "设置保存失败");
       setPrompts(payload.prompts);
+      setConfig({ ...payload.modelConfig, apiKey: "" });
+      sessionStorage.removeItem("lumen-api-key");
+      localStorage.removeItem("lumen-api-config");
       setSaveState("saved");
       window.setTimeout(onClose, 650);
-    } catch { setSaveState("error"); }
+    } catch (error: any) { setSaveError(error?.message || "保存失败，请稍后重试"); setSaveState("error"); }
   };
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
@@ -397,14 +404,20 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { on
         </div>
         {tab === "model" ? <div className="settings-pane">
           <div className="preset-row">
-            {Object.entries(presets).map(([name, value]) => (
-              <button key={name} className={config.provider === name ? "selected" : ""} onClick={() => setConfig({ ...config, provider: name, ...value })}>{name}</button>
+            {Object.entries(MODEL_PRESETS).map(([name, value]) => (
+              <button key={name} className={config.provider === name ? "selected" : ""} onClick={() => setConfig({ ...config, provider: name, endpoint: value.endpoint, model: value.models[0] })}>{name}</button>
             ))}
           </div>
-          <label className="field-label">API 地址<input value={config.endpoint} onChange={(e) => setConfig({ ...config, endpoint: e.target.value })} /></label>
-          <label className="field-label">模型名称<input value={config.model} onChange={(e) => setConfig({ ...config, model: e.target.value })} /></label>
-          <label className="field-label">API Key<input type="password" value={config.apiKey} onChange={(e) => setConfig({ ...config, apiKey: e.target.value })} placeholder="sk-••••••••••••" /></label>
-          <div className="settings-note"><Check size={14} />密钥只保存在当前浏览器会话中。</div>
+          <label className="field-label">API Base URL<input value={config.endpoint} onChange={(e) => setConfig({ ...config, endpoint: e.target.value })} placeholder="https://api.example.com/v1" /></label>
+          <label className="field-label">模型
+            <select value={usesCustomModel ? "__custom" : config.model} onChange={(event) => setConfig({ ...config, model: event.target.value === "__custom" ? "" : event.target.value })}>
+              {providerModels.map((model) => <option key={model} value={model}>{model}</option>)}
+              <option value="__custom">自定义模型…</option>
+            </select>
+          </label>
+          {usesCustomModel && <label className="field-label custom-model-field">自定义模型名称<input value={config.model} onChange={(event) => setConfig({ ...config, model: event.target.value })} placeholder="输入接口支持的模型 ID" autoFocus /></label>}
+          <label className="field-label">API Key<input type="password" value={config.apiKey} onChange={(e) => setConfig({ ...config, apiKey: e.target.value })} placeholder={config.hasApiKey ? "已保存；留空表示不修改" : "输入一次，保存后无需重复填写"} /></label>
+          <div className="settings-note"><Check size={14} />{config.hasApiKey ? "密钥已经保存。本次留空不会覆盖原密钥。" : "保存后会加密写入本地 SQL，不再由每次聊天重复提交。"}</div>
         </div> : <div className="settings-pane prompt-pane">
           <div className="prompt-field">
             <div><strong>全文对话</strong><span>对应右侧“全文 AI”的总结、方法分析和连续追问。</span><button onClick={() => setPrompts({ ...prompts, global: DEFAULT_PROMPTS.global })}>恢复默认</button></div>
@@ -416,14 +429,14 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { on
           </div>
           <div className="settings-note">可使用 <code>{"{{paperTitle}}"}</code> 代表当前论文标题；修改后会同步到你的账户。</div>
         </div>}
-        {saveState === "error" && <div className="settings-error">保存失败，请稍后重试。</div>}
-        <button className="primary-button wide" onClick={saveSettings} disabled={saveState === "saving" || !prompts.global.trim() || !prompts.inline.trim()}>{saveState === "saving" ? <><LoaderCircle className="spin" size={16} />正在保存</> : saveState === "saved" ? <><Check size={17} />已保存</> : "保存设置"}</button>
+        {saveState === "error" && <div className="settings-error">{saveError}</div>}
+        <button className="primary-button wide" onClick={saveSettings} disabled={saveState === "saving" || !prompts.global.trim() || !prompts.inline.trim() || !config.endpoint.trim() || !config.model.trim()}>{saveState === "saving" ? <><LoaderCircle className="spin" size={16} />正在保存</> : saveState === "saved" ? <><Check size={17} />已保存</> : "保存设置"}</button>
       </div>
     </div>
   );
 }
 
-type ApiConfig = { provider: string; endpoint: string; model: string; apiKey: string };
+type ApiConfig = { provider: string; endpoint: string; model: string; apiKey: string; hasApiKey: boolean };
 
 export default function Home() {
   const [user, setUser] = useState<SessionUser | null>(null);
@@ -471,19 +484,11 @@ export default function Home() {
   const dragRef = useRef<{ id: number; target: "card" | "pin"; startX: number; startY: number; startLeft: number; startTop: number } | null>(null);
   const lastDraggedPinRef = useRef<number | null>(null);
   const restoringWorkspaceRef = useRef(false);
-  const [config, setConfig] = useState<ApiConfig>({ provider: "OpenAI", endpoint: "https://api.openai.com/v1/chat/completions", model: "gpt-4.1-mini", apiKey: "" });
+  const [config, setConfig] = useState<ApiConfig>({ provider: "OpenAI", endpoint: "https://api.openai.com/v1", model: "gpt-4.1-mini", apiKey: "", hasApiKey: false });
   const [promptConfig, setPromptConfig] = useState<PromptConfig>(DEFAULT_PROMPTS);
   const [messages, setMessages] = useState<ChatMessage[]>([
     { id: 1, role: "assistant", content: "这里是**全文对话**。我会基于整篇论文回答总结、方法、实验与结论问题；局部翻译和解释会留在原文旁边。" },
   ]);
-
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem("lumen-api-config");
-      const apiKey = sessionStorage.getItem("lumen-api-key") || "";
-      if (saved) setConfig({ ...JSON.parse(saved), apiKey });
-    } catch { /* ignore invalid local preferences */ }
-  }, []);
 
   useEffect(() => {
     const error = new URLSearchParams(window.location.search).get("auth_error");
@@ -514,6 +519,7 @@ export default function Home() {
         if (settingsResponse.ok) {
           const settingsPayload = await settingsResponse.json();
           if (settingsPayload?.prompts?.global && settingsPayload?.prompts?.inline) setPromptConfig(settingsPayload.prompts);
+          if (settingsPayload?.modelConfig) setConfig({ ...settingsPayload.modelConfig, apiKey: "" });
         }
         const workspace = workspacePayload.workspace;
         if (workspace?.paper) {
@@ -563,11 +569,11 @@ export default function Home() {
     setSelectionPos(null);
     try {
       let answer = "";
-      if (config.apiKey) {
+      if (config.apiKey || config.hasApiKey) {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey, model: config.model, paperTitle, question: text, paperContext: paperText, mode: "global", history: messages.slice(-10), systemPrompts: promptConfig }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: text, paperContext: paperText, mode: "global", history: messages.slice(-10), systemPrompts: promptConfig }),
         });
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || "模型请求失败");
@@ -665,11 +671,11 @@ export default function Home() {
     updateAnnotation(id, { loading: true, result: "", draft: "", thread: nextThread });
     try {
       let answer = "";
-      if (config.apiKey) {
+      if (config.apiKey || config.hasApiKey) {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline", history: history.slice(-10), systemPrompts: promptConfig }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline", history: history.slice(-10), systemPrompts: promptConfig }),
         });
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || "模型请求失败");
@@ -1043,7 +1049,7 @@ export default function Home() {
           </div>
           <div className="top-actions">
             <div className={`sync-status ${saveStatus}`} title="阅读进度、聊天和批注会自动保存">{saveStatus === "error" ? <CloudOff size={14} /> : <Cloud size={14} />}<span>{saveStatus === "loading" ? "正在载入" : saveStatus === "saving" ? "正在保存" : saveStatus === "error" ? "同步失败" : "已保存"}</span></div>
-            <button className="status-pill" onClick={() => setSettingsOpen(true)}><span className={`status-dot ${config.apiKey ? "online" : ""}`} />{config.apiKey ? config.model : "演示模型"}<ChevronDown size={14} /></button>
+            <button className="status-pill" onClick={() => setSettingsOpen(true)}><span className={`status-dot ${config.apiKey || config.hasApiKey ? "online" : ""}`} />{config.apiKey || config.hasApiKey ? config.model : "演示模型"}<ChevronDown size={14} /></button>
             <button className="secondary-button compact" onClick={() => setOpenModal(true)}><Plus size={16} />打开论文</button>
             <button className="icon-button" aria-label="更多"><MoreHorizontal size={19} /></button>
             <button className="icon-button" aria-label={rightOpen ? "收起 AI" : "展开 AI"} onClick={() => setRightOpen(!rightOpen)}>{rightOpen ? <PanelRightClose size={19} /> : <PanelRightOpen size={19} />}</button>

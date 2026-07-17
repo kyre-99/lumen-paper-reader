@@ -22,6 +22,13 @@
       "when": 1784276669874,
       "tag": "0002_rare_madelyne_pryor",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1784278376268,
+      "tag": "0003_real_wolverine",
+      "breakpoints": true
     }
   ]
 }

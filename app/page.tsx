@@ -51,6 +51,7 @@ type Annotation = {
   surrounding: string;
   top: number;
   left: number;
+  cardTop: number;
   cardLeft: number;
   open: boolean;
   loading: boolean;
@@ -81,6 +82,36 @@ function normalizePaperUrl(raw: string) {
   const arxiv = trimmed.match(/arxiv\.org\/(?:abs|html|pdf)\/([^?#/]+)/i);
   if (arxiv) return `https://arxiv.org/pdf/${arxiv[1]}`;
   return trimmed;
+}
+
+function trimRangeToText(input: Range) {
+  const range = input.cloneRange();
+  const root = range.commonAncestorContainer.nodeType === Node.TEXT_NODE ? range.commonAncestorContainer.parentNode : range.commonAncestorContainer;
+  if (!root) return range;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let first: { node: Text; offset: number } | null = null;
+  let last: { node: Text; offset: number } | null = null;
+  let current = walker.nextNode() as Text | null;
+  while (current) {
+    if (range.intersectsNode(current)) {
+      const value = current.data;
+      const from = current === range.startContainer ? range.startOffset : 0;
+      const to = current === range.endContainer ? range.endOffset : value.length;
+      const part = value.slice(from, to);
+      const firstNonSpace = part.search(/\S/);
+      if (firstNonSpace >= 0) {
+        const trailing = part.match(/\s+$/)?.[0].length || 0;
+        if (!first) first = { node: current, offset: from + firstNonSpace };
+        last = { node: current, offset: Math.max(from + firstNonSpace, to - trailing) };
+      }
+    }
+    current = walker.nextNode() as Text | null;
+  }
+  if (first && last) {
+    range.setStart(first.node, first.offset);
+    range.setEnd(last.node, last.offset);
+  }
+  return range;
 }
 
 function demoAnswer(prompt: string, context?: string) {
@@ -293,7 +324,7 @@ export default function Home() {
   const [selectedText, setSelectedText] = useState("");
   const [selectionContext, setSelectionContext] = useState("");
   const [selectionPos, setSelectionPos] = useState<{ x: number; y: number } | null>(null);
-  const [selectionAnchor, setSelectionAnchor] = useState<{ top: number; left: number; cardLeft: number } | null>(null);
+  const [selectionAnchor, setSelectionAnchor] = useState<{ top: number; left: number; cardTop: number; cardLeft: number } | null>(null);
   const [showColors, setShowColors] = useState(false);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [paperText, setPaperText] = useState(demoParagraphs.map((item) => `${item.heading || ""}\n${item.body}`).join("\n\n"));
@@ -302,9 +333,12 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [toast, setToast] = useState("");
+  const [showReaderTip, setShowReaderTip] = useState(true);
+  const [draggingId, setDraggingId] = useState<number | null>(null);
   const readerRef = useRef<HTMLDivElement>(null);
   const selectionRangeRef = useRef<Range | null>(null);
   const annotationRangesRef = useRef(new Map<number, { range: Range; color: HighlightColor }>());
+  const dragRef = useRef<{ id: number; startX: number; startY: number; startLeft: number; startTop: number } | null>(null);
   const [config, setConfig] = useState<ApiConfig>({ provider: "OpenAI", endpoint: "https://api.openai.com/v1/chat/completions", model: "gpt-4.1-mini", apiKey: "" });
   const [messages, setMessages] = useState<ChatMessage[]>([
     { id: 1, role: "assistant", content: "这里是**全文对话**。我会基于整篇论文回答总结、方法、实验与结论问题；局部翻译和解释会留在原文旁边。" },
@@ -316,6 +350,11 @@ export default function Home() {
       const apiKey = sessionStorage.getItem("lumen-api-key") || "";
       if (saved) setConfig({ ...JSON.parse(saved), apiKey });
     } catch { /* ignore invalid local preferences */ }
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setShowReaderTip(false), 30000);
+    return () => window.clearTimeout(timer);
   }, []);
 
   const sendQuestion = useCallback(async (raw: string) => {
@@ -371,6 +410,34 @@ export default function Home() {
     setAnnotations((items) => items.map((item) => item.id === id ? { ...item, ...patch } : item));
   }, []);
 
+  const startAnnotationDrag = useCallback((event: React.PointerEvent<HTMLElement>, annotation: Annotation) => {
+    if (event.button !== 0 || (event.target as HTMLElement).closest("button, textarea, a")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragRef.current = { id: annotation.id, startX: event.clientX, startY: event.clientY, startLeft: annotation.cardLeft, startTop: annotation.cardTop };
+    setDraggingId(annotation.id);
+  }, []);
+
+  useEffect(() => {
+    const move = (event: PointerEvent) => {
+      const drag = dragRef.current;
+      const reader = readerRef.current;
+      if (!drag || !reader) return;
+      const nextLeft = drag.startLeft + event.clientX - drag.startX;
+      const nextTop = drag.startTop + event.clientY - drag.startY;
+      const minLeft = reader.scrollLeft + 8;
+      const maxLeft = reader.scrollLeft + Math.max(8, reader.clientWidth - 350);
+      const minTop = reader.scrollTop + 8;
+      const maxTop = reader.scrollTop + Math.max(8, reader.clientHeight - 110);
+      updateAnnotation(drag.id, { cardLeft: Math.min(maxLeft, Math.max(minLeft, nextLeft)), cardTop: Math.min(maxTop, Math.max(minTop, nextTop)) });
+    };
+    const end = () => { dragRef.current = null; setDraggingId(null); };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+    return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); window.removeEventListener("pointercancel", end); };
+  }, [updateAnnotation]);
+
   const requestInlineAnswer = useCallback(async (id: number, action: ToolAction, text: string, surrounding: string, customQuestion?: string) => {
     const prompt = customQuestion || (action === "translate" ? "请将选中的内容准确翻译成中文，保留公式与专业术语，并简短标注关键术语。" : "请直观解释选中内容的含义、它在本段中的作用，以及读者容易误解的地方。");
     updateAnnotation(id, { loading: true, result: "" });
@@ -397,27 +464,34 @@ export default function Home() {
 
   const handleSelection = useCallback(() => {
     const selection = window.getSelection();
-    const text = selection?.toString().replace(/\s+/g, " ").trim() || "";
-    if (!text || text.length < 2 || !selection?.rangeCount) return;
-    const range = selection.getRangeAt(0);
+    if (!selection?.rangeCount) return;
+    const range = trimRangeToText(selection.getRangeAt(0));
+    const text = range.toString().replace(/\s+/g, " ").trim();
+    if (!text || text.length < 2) return;
+    selection.removeAllRanges();
+    selection.addRange(range);
     if (!readerRef.current?.contains(range.commonAncestorContainer)) return;
-    const rect = range.getBoundingClientRect();
     const readerRect = readerRef.current.getBoundingClientRect();
     const node = range.commonAncestorContainer.nodeType === Node.TEXT_NODE ? range.commonAncestorContainer.parentElement : range.commonAncestorContainer as HTMLElement;
     const contextRoot = node?.closest?.(".pdf-page, .demo-paper") as HTMLElement | null;
+    const pageRect = contextRoot?.getBoundingClientRect();
+    const rects = Array.from(range.getClientRects()).filter((rect) => rect.width > .5 && rect.height > 2 && (!pageRect || (rect.left >= pageRect.left - 2 && rect.right <= pageRect.right + 2)));
+    const rect = rects[rects.length - 1] || range.getBoundingClientRect();
+    if (!rect.width && !rect.height) return;
     const blockText = (contextRoot?.innerText || node?.parentElement?.innerText || text).replace(/\s+/g, " ").trim();
     const needle = text.slice(0, 90);
     const index = blockText.indexOf(needle);
     const surrounding = index >= 0 ? blockText.slice(Math.max(0, index - 700), Math.min(blockText.length, index + text.length + 700)) : blockText.slice(0, 1600);
-    const anchorLeft = rect.right - readerRect.left + readerRef.current.scrollLeft + 8;
+    const anchorLeft = Math.min(rect.right, pageRect?.right || rect.right) - readerRect.left + readerRef.current.scrollLeft + 7;
     const anchorTop = rect.top - readerRect.top + readerRef.current.scrollTop + Math.min(rect.height / 2, 18);
     const visibleRight = readerRef.current.scrollLeft + readerRef.current.clientWidth;
     setSelectedText(text.slice(0, 1800));
     setSelectionContext(surrounding);
     selectionRangeRef.current = range.cloneRange();
-    setSelectionAnchor({ top: anchorTop, left: anchorLeft, cardLeft: anchorLeft + 358 > visibleRight ? Math.max(readerRef.current.scrollLeft + 14, anchorLeft - 360) : anchorLeft + 15 });
-    setSelectionPos({ x: Math.min(Math.max(rect.left + rect.width / 2, 190), window.innerWidth - 220), y: Math.max(rect.top - 58, 72) });
+    setSelectionAnchor({ top: anchorTop, left: anchorLeft, cardTop: anchorTop + 15, cardLeft: anchorLeft + 358 > visibleRight ? Math.max(readerRef.current.scrollLeft + 14, anchorLeft - 360) : anchorLeft + 15 });
+    setSelectionPos({ x: Math.min(Math.max(rect.left + Math.min(rect.width / 2, 100), 190), window.innerWidth - 220), y: Math.max(rect.top - 58, 72) });
     setShowColors(false);
+    setShowReaderTip(false);
   }, []);
 
   const createAnnotation = useCallback((kind: ToolAction | "highlight", color: HighlightColor = "green") => {
@@ -554,9 +628,10 @@ export default function Home() {
                 {annotation.kind === "translate" ? <Languages size={14} /> : annotation.kind === "explain" ? <Sparkles size={14} /> : annotation.kind === "ask" ? <MessageSquareText size={14} /> : <Highlighter size={14} />}
               </button>
               {annotation.open && (
-                <section className={`inline-card ${annotation.color}`} style={{ top: annotation.top + 15, left: annotation.cardLeft }} onMouseDown={(event) => event.stopPropagation()}>
-                  <header>
+                <section className={`inline-card ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`} style={{ top: annotation.cardTop, left: annotation.cardLeft }} onMouseDown={(event) => event.stopPropagation()}>
+                  <header onPointerDown={(event) => startAnnotationDrag(event, annotation)} title="拖动移动悬浮卡片">
                     <div className="inline-card-title">
+                      <MoreHorizontal className="drag-grip" size={15} />
                       <span>{annotation.kind === "translate" ? <Languages size={15} /> : annotation.kind === "explain" ? <Sparkles size={15} /> : annotation.kind === "ask" ? <MessageSquareText size={15} /> : <Highlighter size={15} />}</span>
                       <div><strong>{annotation.kind === "translate" ? "局部翻译" : annotation.kind === "explain" ? "段落解释" : annotation.kind === "ask" ? "针对这段提问" : "高亮标记"}</strong><small>仅使用选区与相邻段落</small></div>
                     </div>
@@ -577,7 +652,7 @@ export default function Home() {
               )}
             </React.Fragment>
           ))}
-          <div className="reader-tip"><Sparkles size={14} />选中论文中的任何内容，立即翻译或提问</div>
+          {showReaderTip && <div className="reader-tip"><Sparkles size={14} /><span>选中论文中的任何内容，立即翻译或提问</span><button onClick={() => setShowReaderTip(false)} aria-label="关闭提示"><X size={13} /></button></div>}
         </div>
         {!rightOpen && <button className="ai-reopen" onClick={() => setRightOpen(true)}><Sparkles size={16} />全文 AI<PanelRightOpen size={16} /></button>}
       </section>

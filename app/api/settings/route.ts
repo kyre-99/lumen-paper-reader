@@ -16,6 +16,11 @@ function environmentModelConfig() {
   };
 }
 
+function displayProvider(provider: string | null | undefined, endpoint: string) {
+  if (provider === "智增增" || endpoint.includes("zhizengzeng")) return "OpenAI 兼容";
+  return provider || "OpenAI";
+}
+
 export async function GET() {
   const user = await requireAppUser();
   if (!user) return Response.json({ error: "需要登录" }, { status: 401 });
@@ -27,7 +32,7 @@ export async function GET() {
       userId: user.id,
       globalSystemPrompt: settings?.globalSystemPrompt || DEFAULT_PROMPTS.global,
       inlineSystemPrompt: settings?.inlineSystemPrompt || DEFAULT_PROMPTS.inline,
-      modelProvider: environment.endpoint.includes("zhizengzeng") ? "智增增" : settings?.modelProvider || "OpenAI",
+      modelProvider: displayProvider(settings?.modelProvider, environment.endpoint),
       modelEndpoint: environment.endpoint,
       modelName: environment.model,
       apiKeyEncrypted: await encryptApiKey(environment.apiKey),
@@ -43,7 +48,7 @@ export async function GET() {
       inline: settings?.inlineSystemPrompt || DEFAULT_PROMPTS.inline,
     },
     modelConfig: {
-      provider: hasSavedModelConfig ? settings!.modelProvider : environment.endpoint.includes("zhizengzeng") ? "智增增" : "OpenAI",
+      provider: displayProvider(hasSavedModelConfig ? settings!.modelProvider : null, hasSavedModelConfig ? settings!.modelEndpoint : environment.endpoint),
       endpoint: hasSavedModelConfig ? settings!.modelEndpoint : environment.endpoint,
       model: hasSavedModelConfig ? settings!.modelName : environment.model,
       hasApiKey: Boolean(settings?.apiKeyEncrypted) || environment.hasApiKey,
@@ -58,7 +63,8 @@ export async function PUT(request: Request) {
   const globalSystemPrompt = String(payload?.prompts?.global || "").trim().slice(0, 12000);
   const inlineSystemPrompt = String(payload?.prompts?.inline || "").trim().slice(0, 12000);
   if (!globalSystemPrompt || !inlineSystemPrompt) return Response.json({ error: "两处 System Prompt 都不能为空" }, { status: 400 });
-  const modelProvider = String(payload?.modelConfig?.provider || "自定义").trim().slice(0, 80);
+  const requestedProvider = String(payload?.modelConfig?.provider || "自定义").trim().slice(0, 80);
+  const modelProvider = requestedProvider === "智增增" ? "OpenAI 兼容" : requestedProvider;
   const modelEndpoint = String(payload?.modelConfig?.endpoint || "").trim().replace(/\/+$/, "").slice(0, 2000);
   const modelName = String(payload?.modelConfig?.model || "").trim().slice(0, 200);
   const apiKey = String(payload?.modelConfig?.apiKey || "").trim().slice(0, 1000);

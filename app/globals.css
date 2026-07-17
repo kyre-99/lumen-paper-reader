@@ -113,6 +113,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .textLayer span[role="img"] { user-select: none; cursor: default; }
 .textLayer ::selection { background: rgba(82, 151, 126, .3); color: transparent; }
 .textLayer br::selection { background: transparent; }
+.formula-assist { position: absolute; z-index: 7; min-width: 27px; height: 27px; display: flex; align-items: center; gap: 0; padding: 0 7px; overflow: hidden; transform: translateY(-50%); border: 1px solid rgba(117,157,141,.55); border-radius: 14px; background: rgba(255,255,255,.78); color: var(--green); box-shadow: 0 5px 16px rgba(31,50,41,.10); opacity: .28; backdrop-filter: blur(8px); cursor: pointer; transition: opacity .16s ease, min-width .18s ease, gap .18s ease, background .16s ease; }
+.formula-assist span { max-width: 0; overflow: hidden; white-space: nowrap; font-size: 9px; font-weight: 650; transition: max-width .18s ease; }
+.formula-assist:hover, .formula-assist:focus-visible { min-width: 68px; gap: 5px; background: rgba(255,255,255,.96); opacity: 1; }
+.formula-assist:hover span, .formula-assist:focus-visible span { max-width: 46px; }
 .pdf-loading { min-height: 400px; display: flex; align-items: center; justify-content: center; gap: 10px; color: #6e7873; font-size: 12px; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -242,6 +246,30 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .inline-ask textarea:focus { border-color: #87ad9e; }
 .inline-ask button { justify-self: end; height: 29px; display: flex; align-items: center; gap: 5px; padding: 0 10px; border: 0; border-radius: 7px; background: var(--green); color: white; font-size: 9px; cursor: pointer; }.inline-ask button:disabled { opacity: .4; }
 .highlight-saved { display: flex; align-items: center; gap: 6px; color: #64716a; font-size: 10px; }
+.highlight-note { display: grid; gap: 5px; margin-top: 10px; }
+.highlight-note span { color: #68766f; font-size: 9px; font-weight: 700; }
+.highlight-note textarea { width: 100%; resize: vertical; padding: 8px 9px; border: 1px solid #dce3df; border-radius: 8px; outline: 0; background: rgba(250,252,251,.9); color: #34423b; font-size: 10px; line-height: 1.55; }
+.highlight-note textarea:focus { border-color: #91b5a7; box-shadow: 0 0 0 3px rgba(71,128,106,.07); }
+.pdf-context-menu { position: fixed; z-index: 95; width: 196px; padding: 5px; border: 1px solid #dce3df; border-radius: 10px; background: rgba(255,255,255,.96); box-shadow: 0 14px 38px rgba(25,39,32,.18); backdrop-filter: blur(12px); }
+.pdf-context-menu > button { width: 100%; display: flex; align-items: center; gap: 9px; padding: 9px; border: 0; border-radius: 7px; background: transparent; color: var(--green); text-align: left; cursor: pointer; }
+.pdf-context-menu > button:hover { background: #edf4f1; }
+.pdf-context-menu span, .pdf-context-menu strong, .pdf-context-menu small { display: block; }
+.pdf-context-menu strong { color: #34423b; font-size: 10px; }.pdf-context-menu small { margin-top: 2px; color: #89938e; font-size: 8px; font-weight: 400; }
+.pdf-text-note { position: absolute; z-index: 19; width: 210px; padding: 0 8px 8px; border: 1px solid rgba(218,184,116,.45); border-radius: 7px; background: rgba(255,249,216,.72); box-shadow: 0 5px 18px rgba(77,59,25,.10); backdrop-filter: blur(3px); transform: translate(-4px,-4px); }
+.pdf-text-note.dragging { box-shadow: 0 9px 28px rgba(77,59,25,.18); }
+.pdf-text-note > header { height: 25px; display: flex; align-items: center; justify-content: space-between; color: rgba(86,70,42,.68); cursor: grab; touch-action: none; user-select: none; }
+.pdf-text-note.dragging > header { cursor: grabbing; }
+.pdf-text-note > header span { display: flex; align-items: center; gap: 4px; font-size: 8px; font-weight: 700; }
+.pdf-text-note > header button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
+.pdf-text-note > header button:hover { background: rgba(116,80,20,.08); }
+.pdf-text-note > textarea { width: 100%; min-height: 52px; resize: both; padding: 2px 3px; border: 0; outline: 0; background: transparent; font-family: ui-sans-serif, sans-serif; line-height: 1.45; }
+.pdf-text-note > textarea::placeholder { color: rgba(112,91,50,.45); }
+.pdf-text-note > footer { display: flex; align-items: center; justify-content: space-between; gap: 7px; padding-top: 5px; border-top: 1px solid rgba(139,106,43,.12); }
+.pdf-text-note > footer label { display: flex; align-items: center; gap: 4px; color: #837458; font-size: 8px; }
+.pdf-text-note > footer select { height: 23px; border: 1px solid rgba(139,106,43,.18); border-radius: 5px; outline: 0; background: rgba(255,255,255,.45); color: #675c48; font-size: 8px; }
+.note-colors { display: flex; gap: 4px; }
+.note-colors button { width: 13px; height: 13px; padding: 0; border: 2px solid transparent; border-radius: 50%; box-shadow: 0 0 0 1px rgba(62,66,63,.16); cursor: pointer; }
+.note-colors button.active { border-color: white; box-shadow: 0 0 0 1px currentColor; transform: scale(1.08); }
 .inline-card > footer { display: flex; align-items: center; gap: 5px; margin-top: 10px; padding-top: 8px; border-top: 1px solid #eef1ef; }
 .inline-card > footer button { height: 26px; display: flex; align-items: center; gap: 4px; padding: 0 7px; border: 0; border-radius: 6px; background: transparent; color: #78827d; font-size: 9px; cursor: pointer; }.inline-card > footer button:hover { background: #f1f3f2; color: var(--ink); }.inline-card > footer button.delete-note { margin-left: auto; color: #a66a70; }
 
@@ -270,8 +298,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .settings-tabs button.active { background: white; color: var(--green); box-shadow: 0 2px 7px rgba(37,54,45,.08); }
 .settings-pane { max-height: 470px; overflow-y: auto; padding: 2px 2px 4px; }
 .preset-row { display: flex; gap: 6px; margin-bottom: 16px; }
-.preset-row button { flex: 1; height: 31px; border: 1px solid #e0e5e2; border-radius: 8px; background: white; color: #68736d; font-size: 9px; cursor: pointer; }
+.preset-row button { min-width: 0; flex: 1; min-height: 44px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; padding: 4px 2px; border: 1px solid #e0e5e2; border-radius: 8px; background: white; color: #68736d; font-size: 8px; cursor: pointer; }
 .preset-row button.selected { color: var(--green); border-color: #9bc0b1; background: #eff6f3; }
+.preset-row button span:last-child { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.provider-logo { width: 20px; height: 20px; display: grid; place-items: center; border-radius: 6px; background: #edf1ef; color: #29352f; font-size: 13px; font-weight: 750; line-height: 1; }
+.provider-openai { background: #e5f3ee; color: #0b7655; }.provider-deepseek { background: #e9efff; color: #315fce; }.provider-openrouter { background: #eeeafb; color: #6d45ad; }.provider-moonshot { background: #ecebf5; color: #272343; }.provider-openai-兼容 { background: #edf1ef; color: #42675a; }
 .field-label { display: block; margin-bottom: 11px; color: #5a655f; font-size: 10px; font-weight: 600; }
 .field-label input, .field-label select { display: block; width: 100%; height: 40px; margin-top: 5px; padding: 0 11px; border: 1px solid #dce1de; border-radius: 9px; background: white; color: #313d37; outline: 0; font-size: 11px; font-weight: 400; }
 .field-label select { appearance: auto; cursor: pointer; }

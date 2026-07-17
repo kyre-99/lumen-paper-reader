@@ -38,18 +38,18 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { DEFAULT_PROMPTS, type PromptConfig } from "./chat-prompts";
 
 type ChatMessage = { id: number; role: "user" | "assistant"; content: string };
-type ToolAction = "translate" | "explain" | "ask";
+type ToolAction = "translate" | "explain" | "ask" | "formula";
 type HighlightColor = "yellow" | "green" | "blue" | "rose";
 type Annotation = {
   id: number;
-  kind: ToolAction | "highlight";
+  kind: ToolAction | "highlight" | "text-note";
   color: HighlightColor;
   text: string;
   surrounding: string;
@@ -67,7 +67,13 @@ type Annotation = {
   pinOffsetY?: number;
   cardOffsetX?: number;
   cardOffsetY?: number;
+  note?: string;
+  fontSize?: number;
+  textColor?: string;
+  pageX?: number;
+  pageY?: number;
 };
+type FormulaAnchor = { text: string; pageNumber: number; pageX: number; pageY: number };
 type SessionUser = { displayName: string; email: string; fullName: string | null; isGuest: boolean; isLocal?: boolean };
 type PaperSourceKind = "remote" | "upload";
 type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; sourceKind: PaperSourceKind; pageCount: number; createdAt: string; updatedAt: string };
@@ -254,10 +260,11 @@ function DemoPaper() {
   );
 }
 
-function PdfPage({ pdf, pageNumber, zoom }: { pdf: any; pageNumber: number; zoom: number }) {
+function PdfPage({ pdf, pageNumber, zoom, onFormula }: { pdf: any; pageNumber: number; zoom: number; onFormula: (formula: FormulaAnchor) => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 760, height: 980 });
+  const [formulaAnchors, setFormulaAnchors] = useState<Array<FormulaAnchor & { left: number; top: number }>>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -286,6 +293,33 @@ function PdfPage({ pdf, pageNumber, zoom }: { pdf: any; pageNumber: number; zoom
       const pdfjs = await import("pdfjs-dist");
       textLayer = new pdfjs.TextLayer({ textContentSource: textContent, container: textContainer, viewport });
       await textLayer.render();
+      if (cancelled) return;
+      const pageRect = textContainer.getBoundingClientRect();
+      const rows = new Map<number, { texts: string[]; left: number; right: number; top: number; bottom: number; score: number }>();
+      for (const span of Array.from(textContainer.querySelectorAll("span"))) {
+        if (span.children.length) continue;
+        const value = String(span.textContent || "").trim();
+        if (!value) continue;
+        const rect = span.getBoundingClientRect();
+        if (!rect.width || !rect.height) continue;
+        const key = Math.round((rect.top - pageRect.top) / 4);
+        const mathScore = /[=≠≤≥∑∫√∞≈∝∈∉⊂⊆∪∩∂∇±×÷→←↦]|[α-ωΑ-Ω]|\b(?:softmax|argmax|log|exp|sim|Top-?k)\b/i.test(value) ? 1 : 0;
+        const row = rows.get(key) || { texts: [], left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, score: 0 };
+        row.texts.push(value);
+        row.left = Math.min(row.left, rect.left);
+        row.right = Math.max(row.right, rect.right);
+        row.top = Math.min(row.top, rect.top);
+        row.bottom = Math.max(row.bottom, rect.bottom);
+        row.score += mathScore;
+        rows.set(key, row);
+      }
+      const detected = [...rows.values()].filter((row) => row.score > 0).map((row) => {
+        const text = row.texts.join(" ").replace(/\s+/g, " ").trim();
+        const pageX = Math.min(.96, Math.max(.04, (row.right - pageRect.left) / Math.max(1, pageRect.width)));
+        const pageY = Math.min(.98, Math.max(.02, ((row.top + row.bottom) / 2 - pageRect.top) / Math.max(1, pageRect.height)));
+        return { text, pageNumber, pageX, pageY, left: Math.min(viewport.width - 28, row.right - pageRect.left + 7), top: (row.top + row.bottom) / 2 - pageRect.top };
+      }).filter((item) => item.text.length >= 3 && item.text.length <= 240).slice(0, 10);
+      setFormulaAnchors(detected);
     })().catch(() => undefined);
     return () => {
       cancelled = true;
@@ -298,11 +332,12 @@ function PdfPage({ pdf, pageNumber, zoom }: { pdf: any; pageNumber: number; zoom
     <div className="pdf-page" data-page-number={pageNumber} style={{ width: size.width, height: size.height, "--total-scale-factor": 1.25 * zoom } as React.CSSProperties}>
       <canvas ref={canvasRef} />
       <div className="textLayer" ref={textRef} />
+      {formulaAnchors.map((formula, index) => <button key={`${Math.round(formula.top)}-${index}`} className="formula-assist" style={{ left: formula.left, top: formula.top }} onClick={(event) => { event.stopPropagation(); onFormula(formula); }} aria-label={`询问第 ${pageNumber} 页公式`} title="询问 AI 这个公式"><Sparkles size={13} /><span>问公式</span></button>)}
     </div>
   );
 }
 
-function PdfDocument({ source, zoom, onReady, onMetadata, onTextExtracted, onError }: { source: string | Uint8Array; zoom: number; onReady: (pages: number) => void; onMetadata: (title: string) => void; onTextExtracted: (text: string) => void; onError: (message: string) => void }) {
+function PdfDocument({ source, zoom, onReady, onMetadata, onFormula, onTextExtracted, onError }: { source: string | Uint8Array; zoom: number; onReady: (pages: number) => void; onMetadata: (title: string) => void; onFormula: (formula: FormulaAnchor) => void; onTextExtracted: (text: string) => void; onError: (message: string) => void }) {
   const [pdf, setPdf] = useState<any>(null);
 
   useEffect(() => {
@@ -362,7 +397,7 @@ function PdfDocument({ source, zoom, onReady, onMetadata, onTextExtracted, onErr
   if (!pdf) {
     return <div className="pdf-loading"><LoaderCircle className="spin" size={22} /><span>正在解析论文版面…</span></div>;
   }
-  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} />)}</div>;
+  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} onFormula={onFormula} />)}</div>;
 }
 
 function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => void; onOpenUrl: (url: string) => void; onOpenFile: (file: File) => void }) {
@@ -452,12 +487,17 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
 }
 
 const MODEL_PRESETS: Record<string, { endpoint: string; models: string[] }> = {
-  智增增: { endpoint: "https://api.zhizengzeng.com/v1", models: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "deepseek-chat", "deepseek-reasoner", "gemini-2.5-flash"] },
+  "OpenAI 兼容": { endpoint: "https://api.zhizengzeng.com/v1", models: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "deepseek-chat", "deepseek-reasoner", "gemini-2.5-flash"] },
   OpenAI: { endpoint: "https://api.openai.com/v1", models: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "o4-mini"] },
   DeepSeek: { endpoint: "https://api.deepseek.com", models: ["deepseek-chat", "deepseek-reasoner"] },
   OpenRouter: { endpoint: "https://openrouter.ai/api/v1", models: ["openai/gpt-4.1-mini", "anthropic/claude-3.7-sonnet", "google/gemini-2.5-flash"] },
   Moonshot: { endpoint: "https://api.moonshot.cn/v1", models: ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"] },
 };
+
+function ProviderLogo({ name }: { name: string }) {
+  const mark = name === "OpenAI" ? "✺" : name === "DeepSeek" ? "◒" : name === "OpenRouter" ? "⇆" : name === "Moonshot" ? "◐" : "↔";
+  return <span className={`provider-logo provider-${name.toLowerCase().replace(/\s+/g, "-")}`} aria-hidden="true">{mark}</span>;
+}
 
 function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { onClose: () => void; config: ApiConfig; setConfig: (v: ApiConfig) => void; prompts: PromptConfig; setPrompts: (v: PromptConfig) => void }) {
   const [tab, setTab] = useState<"model" | "prompts">("model");
@@ -492,7 +532,7 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { on
         {tab === "model" ? <div className="settings-pane">
           <div className="preset-row">
             {Object.entries(MODEL_PRESETS).map(([name, value]) => (
-              <button key={name} className={config.provider === name ? "selected" : ""} onClick={() => setConfig({ ...config, provider: name, endpoint: value.endpoint, model: value.models[0] })}>{name}</button>
+              <button key={name} className={config.provider === name ? "selected" : ""} onClick={() => setConfig({ ...config, provider: name, endpoint: value.endpoint, model: value.models[0] })}><ProviderLogo name={name} /><span>{name}</span></button>
             ))}
           </div>
           <label className="field-label">API Base URL<input value={config.endpoint} onChange={(e) => setConfig({ ...config, endpoint: e.target.value })} placeholder="https://api.example.com/v1" /></label>
@@ -503,8 +543,8 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { on
             </select>
           </label>
           {usesCustomModel && <label className="field-label custom-model-field">自定义模型名称<input value={config.model} onChange={(event) => setConfig({ ...config, model: event.target.value })} placeholder="输入接口支持的模型 ID" autoFocus /></label>}
-          <label className="field-label">API Key<input type="password" value={config.apiKey} onChange={(e) => setConfig({ ...config, apiKey: e.target.value })} placeholder={config.hasApiKey ? "已保存；留空表示不修改" : "输入一次，保存后无需重复填写"} /></label>
-          <div className="settings-note"><Check size={14} />{config.hasApiKey ? "密钥已经保存。本次留空不会覆盖原密钥。" : "保存后会加密写入本地 SQL，不再由每次聊天重复提交。"}</div>
+          <label className="field-label">API Key<input type="password" value={config.apiKey} onChange={(e) => setConfig({ ...config, apiKey: e.target.value })} placeholder={config.hasApiKey ? "************" : "输入 API Key"} /></label>
+          {!config.hasApiKey && <div className="settings-note"><Check size={14} />密钥会加密保存在本机，之后无需重复填写。</div>}
         </div> : <div className="settings-pane prompt-pane">
           <div className="prompt-field">
             <div><strong>全文对话</strong><span>对应右侧“全文 AI”的总结、方法分析和连续追问。</span><button onClick={() => setPrompts({ ...prompts, global: DEFAULT_PROMPTS.global })}>恢复默认</button></div>
@@ -552,6 +592,7 @@ export default function Home() {
   const [selectedText, setSelectedText] = useState("");
   const [selectionContext, setSelectionContext] = useState("");
   const [selectionPos, setSelectionPos] = useState<{ x: number; y: number } | null>(null);
+  const [pdfContextMenu, setPdfContextMenu] = useState<{ x: number; y: number; pageNumber: number; pageX: number; pageY: number } | null>(null);
   const [selectionAnchor, setSelectionAnchor] = useState<{ top: number; left: number; cardTop: number; cardLeft: number; pageNumber: number } | null>(null);
   const [showColors, setShowColors] = useState(false);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
@@ -577,6 +618,7 @@ export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([
     { id: 1, role: "assistant", content: "这里是**全文对话**。我会基于整篇论文回答总结、方法、实验与结论问题；局部翻译和解释会留在原文旁边。" },
   ]);
+  const persistentAnnotationsJson = useMemo(() => JSON.stringify(annotations.filter(shouldPersistAnnotation).map((annotation) => ({ ...annotation, loading: false, draft: "" }))), [annotations]);
 
   useEffect(() => {
     const error = new URLSearchParams(window.location.search).get("auth_error");
@@ -753,8 +795,8 @@ export default function Home() {
   }, [updateAnnotation]);
 
   const requestInlineAnswer = useCallback(async (id: number, action: ToolAction, text: string, surrounding: string, customQuestion?: string, history: ChatMessage[] = []) => {
-    const prompt = customQuestion || (action === "translate" ? "请将选中的内容准确翻译成中文，保留公式与专业术语，并简短标注关键术语。" : "请直观解释选中内容的含义、它在本段中的作用，以及读者容易误解的地方。");
-    const userMessage: ChatMessage = { id: Date.now(), role: "user", content: customQuestion || (action === "translate" ? "翻译这段内容" : action === "explain" ? "解释这段内容" : prompt) };
+    const prompt = customQuestion || (action === "translate" ? "请将选中的内容准确翻译成中文，保留公式与专业术语，并简短标注关键术语。" : action === "formula" ? "请逐项解释这个公式：说明每个符号、公式的直觉含义、它在论文中的作用，以及阅读时应注意的假设。" : "请直观解释选中内容的含义、它在本段中的作用，以及读者容易误解的地方。");
+    const userMessage: ChatMessage = { id: Date.now(), role: "user", content: customQuestion || (action === "translate" ? "翻译这段内容" : action === "formula" ? "解释这个公式" : action === "explain" ? "解释这段内容" : prompt) };
     const nextThread = [...history, userMessage];
     updateAnnotation(id, { loading: true, result: "", draft: "", thread: nextThread });
     try {
@@ -829,6 +871,50 @@ export default function Home() {
     selectionRangeRef.current = null;
   }, [addAnnotationRange, flashAnnotationRange, requestInlineAnswer, selectedText, selectionAnchor, selectionContext]);
 
+  const createFormulaAnnotation = useCallback((formula: FormulaAnchor) => {
+    const reader = readerRef.current;
+    const page = reader?.querySelector(`[data-page-number="${formula.pageNumber}"]`) as HTMLElement | null;
+    if (!reader || !page) return;
+    const readerRect = reader.getBoundingClientRect();
+    const pageRect = page.getBoundingClientRect();
+    const left = pageRect.left - readerRect.left + reader.scrollLeft + formula.pageX * pageRect.width;
+    const top = pageRect.top - readerRect.top + reader.scrollTop + formula.pageY * pageRect.height;
+    const visibleRight = reader.scrollLeft + reader.clientWidth;
+    const id = Date.now() + Math.floor(Math.random() * 1000);
+    const cardLeft = left + 358 > visibleRight ? Math.max(reader.scrollLeft + 14, left - 360) : left + 15;
+    const cardTop = Math.max(reader.scrollTop + 8, Math.min(reader.scrollTop + reader.clientHeight - 110, top + 15));
+    const surrounding = String(page.innerText || formula.text).replace(/\s+/g, " ").slice(0, 2000);
+    const annotation: Annotation = { id, kind: "formula", color: "blue", text: formula.text, surrounding, top, left, cardTop, cardLeft, open: true, loading: false, result: "", draft: "", thread: [], pageNumber: formula.pageNumber, pageX: formula.pageX, pageY: formula.pageY, pinOffsetX: 0, pinOffsetY: 0, cardOffsetX: cardLeft - left, cardOffsetY: cardTop - top };
+    annotationAnchorsRef.current.set(id, { top, left });
+    setAnnotations((items) => [...items, annotation]);
+    void requestInlineAnswer(id, "formula", formula.text, surrounding);
+  }, [requestInlineAnswer]);
+
+  const handlePdfContextMenu = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const page = (event.target as HTMLElement).closest(".pdf-page") as HTMLElement | null;
+    if (!page) return;
+    event.preventDefault();
+    const rect = page.getBoundingClientRect();
+    setPdfContextMenu({ x: Math.min(event.clientX, window.innerWidth - 210), y: Math.min(event.clientY, window.innerHeight - 110), pageNumber: Number(page.dataset.pageNumber || 1), pageX: Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)), pageY: Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)) });
+    setSelectionPos(null);
+  }, []);
+
+  const createPdfTextNote = useCallback(() => {
+    const reader = readerRef.current;
+    const context = pdfContextMenu;
+    const page = reader?.querySelector(`[data-page-number="${context?.pageNumber || 1}"]`) as HTMLElement | null;
+    if (!reader || !page || !context) return;
+    const readerRect = reader.getBoundingClientRect();
+    const pageRect = page.getBoundingClientRect();
+    const left = pageRect.left - readerRect.left + reader.scrollLeft + context.pageX * pageRect.width;
+    const top = pageRect.top - readerRect.top + reader.scrollTop + context.pageY * pageRect.height;
+    const id = Date.now() + Math.floor(Math.random() * 1000);
+    const annotation: Annotation = { id, kind: "text-note", color: "yellow", text: "", surrounding: "", top, left, cardTop: top, cardLeft: left, open: true, loading: false, result: "", draft: "", thread: [], note: "", fontSize: 14, textColor: "#9a5a16", pageNumber: context.pageNumber, pageX: context.pageX, pageY: context.pageY, cardOffsetX: 0, cardOffsetY: 0 };
+    annotationAnchorsRef.current.set(id, { top, left });
+    setAnnotations((items) => [...items, annotation]);
+    setPdfContextMenu(null);
+  }, [pdfContextMenu]);
+
   const removeAnnotation = useCallback((id: number) => {
     const stored = annotationRangesRef.current.get(id);
     const timer = flashTimersRef.current.get(id);
@@ -881,6 +967,23 @@ export default function Home() {
     setAnnotations((items) => {
       let changed = false;
       const next = items.map((annotation) => {
+        if ((annotation.kind === "text-note" || annotation.kind === "formula") && annotation.pageX !== undefined && annotation.pageY !== undefined) {
+          const page = reader.querySelector(`[data-page-number="${annotation.pageNumber || 1}"]`) as HTMLElement | null;
+          if (!page) return annotation;
+          const pageRect = page.getBoundingClientRect();
+          const anchor = { left: pageRect.left - readerRect.left + reader.scrollLeft + annotation.pageX * pageRect.width, top: pageRect.top - readerRect.top + reader.scrollTop + annotation.pageY * pageRect.height };
+          const previousAnchor = annotationAnchorsRef.current.get(annotation.id);
+          const cardOffsetX = annotation.cardOffsetX ?? (previousAnchor ? annotation.cardLeft - previousAnchor.left : 0);
+          const cardOffsetY = annotation.cardOffsetY ?? (previousAnchor ? annotation.cardTop - previousAnchor.top : 0);
+          const left = anchor.left + (annotation.pinOffsetX || 0);
+          const top = anchor.top + (annotation.pinOffsetY || 0);
+          const cardLeft = anchor.left + cardOffsetX;
+          const cardTop = anchor.top + cardOffsetY;
+          annotationAnchorsRef.current.set(annotation.id, anchor);
+          if (Math.abs(left - annotation.left) < .5 && Math.abs(top - annotation.top) < .5 && Math.abs(cardLeft - annotation.cardLeft) < .5 && Math.abs(cardTop - annotation.cardTop) < .5) return annotation;
+          changed = true;
+          return { ...annotation, left, top, cardLeft, cardTop };
+        }
         const stored = annotationRangesRef.current.get(annotation.id);
         if (!stored || !stored.range.commonAncestorContainer.isConnected) return annotation;
         const rangeRects = Array.from(stored.range.getClientRects()).filter((rect) => rect.width > .5 && rect.height > 2);
@@ -930,6 +1033,7 @@ export default function Home() {
     if (!reader || !annotations.length) return;
     const restoreRanges = () => {
       for (const annotation of annotations) {
+        if (annotation.kind === "text-note" || annotation.kind === "formula") continue;
         const existing = annotationRangesRef.current.get(annotation.id);
         if (existing?.range.commonAncestorContainer.isConnected) continue;
         if (existing) annotationRangesRef.current.delete(annotation.id);
@@ -950,9 +1054,9 @@ export default function Home() {
 
   useEffect(() => {
     if (!hydrated || !user || !paperId || !paperSourceKind) return;
-    setSaveStatus("saving");
     const timer = window.setTimeout(async () => {
       try {
+        setSaveStatus("saving");
         const response = await fetch("/api/workspace", {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
@@ -970,7 +1074,7 @@ export default function Home() {
             zoom,
             rightOpen,
             messages,
-            annotations: annotations.filter(shouldPersistAnnotation).map((annotation) => ({ ...annotation, loading: false, draft: "" })),
+            annotations: JSON.parse(persistentAnnotationsJson),
           }),
         });
         if (!response.ok) throw new Error("save failed");
@@ -980,7 +1084,7 @@ export default function Home() {
       }
     }, 900);
     return () => window.clearTimeout(timer);
-  }, [annotations, currentPage, hydrated, messages, pageCount, paperId, paperMeta, paperSourceKind, paperSourceUrl, paperText, paperTitle, rightOpen, user, zoom]);
+  }, [currentPage, hydrated, messages, pageCount, paperId, paperMeta, paperSourceKind, paperSourceUrl, paperText, paperTitle, persistentAnnotationsJson, rightOpen, user, zoom]);
 
   const showLibrary = useCallback(async () => {
     setLibraryOpen(true);
@@ -1179,7 +1283,7 @@ export default function Home() {
             <div><h1>{paperTitle}</h1><p>{paperMeta}</p></div>
           </div>
           <div className="top-actions">
-            <div className={`sync-status ${saveStatus}`} title="阅读进度、聊天和批注会自动保存">{saveStatus === "error" ? <CloudOff size={14} /> : <Cloud size={14} />}<span>{saveStatus === "loading" ? "正在载入" : saveStatus === "saving" ? "正在保存" : saveStatus === "error" ? "同步失败" : "已保存"}</span></div>
+            <div className={`sync-status ${saveStatus}`} title="内容变化后会自动写入本地数据库；只有实际写入时才短暂显示保存中">{saveStatus === "error" ? <CloudOff size={14} /> : <Cloud size={14} />}<span>{saveStatus === "loading" ? "读取中" : saveStatus === "saving" ? "保存中" : saveStatus === "error" ? "保存失败" : "本机已保存"}</span></div>
             <button className="status-pill" onClick={() => setSettingsOpen(true)}><span className={`status-dot ${config.apiKey || config.hasApiKey ? "online" : ""}`} />{config.apiKey || config.hasApiKey ? config.model : "演示模型"}<ChevronDown size={14} /></button>
             <button className="secondary-button compact" onClick={() => setOpenModal(true)}><Plus size={16} />打开论文</button>
             <button className="icon-button" aria-label="更多"><MoreHorizontal size={19} /></button>
@@ -1196,11 +1300,20 @@ export default function Home() {
           <button className="icon-button small" aria-label="全屏"><Maximize2 size={17} /></button>
         </div>
 
-        <div className="reader-viewport" ref={readerRef} onMouseUp={handleSelection} onScroll={() => selectionPos && setSelectionPos(null)}>
+        <div className="reader-viewport" ref={readerRef} onMouseUp={handleSelection} onContextMenu={handlePdfContextMenu} onMouseDown={() => pdfContextMenu && setPdfContextMenu(null)} onScroll={() => { if (selectionPos) setSelectionPos(null); if (pdfContextMenu) setPdfContextMenu(null); }}>
           {source ? (
-            <PdfDocument source={source} zoom={zoom} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onTextExtracted={handleTextExtracted} onError={handlePdfError} />
+            <PdfDocument source={source} zoom={zoom} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextExtracted={handleTextExtracted} onError={handlePdfError} />
           ) : <div style={{ transform: `scale(${zoom})`, transformOrigin: "top center" }}><DemoPaper /></div>}
-          {annotations.map((annotation) => (
+          {annotations.map((annotation) => annotation.kind === "text-note" ? (
+            <section key={annotation.id} className={`pdf-text-note ${draggingId === annotation.id ? "dragging" : ""}`} style={{ top: annotation.cardTop, left: annotation.cardLeft, color: annotation.textColor || "#9a5a16" }} onMouseDown={(event) => event.stopPropagation()}>
+              <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")}><span><MoreHorizontal size={13} />PDF 文字批注</span><button onClick={() => removeAnnotation(annotation.id)} aria-label="删除 PDF 批注"><X size={13} /></button></header>
+              <textarea value={annotation.note || ""} onChange={(event) => updateAnnotation(annotation.id, { note: event.target.value })} placeholder="输入批注…" autoFocus style={{ fontSize: annotation.fontSize || 14, color: annotation.textColor || "#9a5a16" }} />
+              <footer>
+                <label>字号<select value={annotation.fontSize || 14} onChange={(event) => updateAnnotation(annotation.id, { fontSize: Number(event.target.value) })}><option value="12">12</option><option value="14">14</option><option value="16">16</option><option value="20">20</option><option value="24">24</option></select></label>
+                <div className="note-colors" aria-label="文字颜色">{["#9a5a16", "#b4233b", "#2563a7", "#237052", "#333333"].map((color) => <button key={color} className={annotation.textColor === color ? "active" : ""} style={{ background: color }} onClick={() => updateAnnotation(annotation.id, { textColor: color })} aria-label={`设置颜色 ${color}`} />)}</div>
+              </footer>
+            </section>
+          ) : (
             <React.Fragment key={annotation.id}>
               <button
                 className={`annotation-pin ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`}
@@ -1210,20 +1323,20 @@ export default function Home() {
                 aria-label="打开原文旁批注"
                 title="拖动图标；点击定位原文"
               >
-                {annotation.kind === "translate" ? <Languages size={14} /> : annotation.kind === "explain" ? <Sparkles size={14} /> : annotation.kind === "ask" ? <MessageSquareText size={14} /> : <Highlighter size={14} />}
+                {annotation.kind === "translate" ? <Languages size={14} /> : annotation.kind === "formula" || annotation.kind === "explain" ? <Sparkles size={14} /> : annotation.kind === "ask" ? <MessageSquareText size={14} /> : <Highlighter size={14} />}
               </button>
               {annotation.open && (
                 <section className={`inline-card ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`} style={{ top: annotation.cardTop, left: annotation.cardLeft }} onMouseDown={(event) => event.stopPropagation()}>
                   <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")} title="拖动移动悬浮卡片">
                     <div className="inline-card-title">
                       <MoreHorizontal className="drag-grip" size={15} />
-                      <span>{annotation.kind === "translate" ? <Languages size={15} /> : annotation.kind === "explain" ? <Sparkles size={15} /> : annotation.kind === "ask" ? <MessageSquareText size={15} /> : <Highlighter size={15} />}</span>
-                      <div><strong>{annotation.kind === "translate" ? "局部翻译" : annotation.kind === "explain" ? "段落解释" : annotation.kind === "ask" ? "针对这段提问" : "高亮标记"}</strong><small>{annotation.kind === "translate" && !shouldPersistAnnotation(annotation) ? "临时翻译 · 本次阅读显示" : "仅使用选区与相邻段落 · 自动保存"}</small></div>
+                      <span>{annotation.kind === "translate" ? <Languages size={15} /> : annotation.kind === "formula" || annotation.kind === "explain" ? <Sparkles size={15} /> : annotation.kind === "ask" ? <MessageSquareText size={15} /> : <Highlighter size={15} />}</span>
+                      <div><strong>{annotation.kind === "translate" ? "局部翻译" : annotation.kind === "formula" ? "公式解释" : annotation.kind === "explain" ? "段落解释" : annotation.kind === "ask" ? "针对这段提问" : "高亮标记"}</strong><small>{annotation.kind === "translate" && !shouldPersistAnnotation(annotation) ? "临时翻译 · 本次阅读显示" : "仅使用相关原文 · 自动保存"}</small></div>
                     </div>
                     <button onClick={() => closeAnnotation(annotation)} aria-label="收起批注"><X size={15} /></button>
                   </header>
                   <blockquote>{annotation.text}</blockquote>
-                  {annotation.kind === "highlight" && <p className="highlight-saved"><Check size={14} />已保存为{annotation.color === "yellow" ? "黄色" : annotation.color === "green" ? "绿色" : annotation.color === "blue" ? "蓝色" : "玫红色"}高亮</p>}
+                  {annotation.kind === "highlight" && <><p className="highlight-saved"><Check size={14} />已保存为{annotation.color === "yellow" ? "黄色" : annotation.color === "green" ? "绿色" : annotation.color === "blue" ? "蓝色" : "玫红色"}高亮</p><label className="highlight-note"><span>个人批注</span><textarea value={annotation.note || ""} onChange={(event) => updateAnnotation(annotation.id, { note: event.target.value })} placeholder="记录你对这段内容的想法…" rows={3} /></label></>}
                   {annotation.thread.length > 0 && <div className="inline-thread">{annotation.thread.map((message) => <div key={message.id} className={`inline-message ${message.role}`}>{message.role === "assistant" ? <MarkdownContent content={message.content} compact /> : <p>{message.content}</p>}</div>)}</div>}
                   {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />正在结合相邻段落分析…</div>}
                   {annotation.kind !== "highlight" && !annotation.loading && (
@@ -1285,6 +1398,9 @@ export default function Home() {
           {showColors && <div className="color-picker" aria-label="选择高亮颜色">{(["yellow", "green", "blue", "rose"] as HighlightColor[]).map((color) => <button key={color} className={color} aria-label={`${color} 高亮`} onClick={() => createAnnotation("highlight", color)} />)}</div>}
         </div>
       )}
+      {pdfContextMenu && <div className="pdf-context-menu" style={{ left: pdfContextMenu.x, top: pdfContextMenu.y }} onMouseDown={(event) => event.stopPropagation()}>
+        <button onClick={createPdfTextNote}><MessageSquareText size={15} /><span><strong>添加文字批注</strong><small>写在当前 PDF 位置</small></span></button>
+      </div>}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
       {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} />}

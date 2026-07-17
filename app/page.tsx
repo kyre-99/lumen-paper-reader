@@ -164,6 +164,21 @@ function demoAnswer(prompt: string, context?: string) {
   return `### 这段话在说什么？\n\n作者强调的是：传统序列模型需要逐步传递信息，而注意力机制让两个相距很远的位置也能**直接建立联系**。\n\n${context ? `> ${context}\n\n` : ""}这带来两个直接好处：\n\n- 更容易捕捉长距离依赖\n- 计算可以并行执行，训练速度更快\n\n如果你愿意，我还可以用一个具体句子画出 Q、K、V 的计算过程。`;
 }
 
+function MarkdownContent({ content, compact = false }: { content: string; compact?: boolean }) {
+  return (
+    <div className={`markdown-content${compact ? " compact" : ""}`}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function BrandMark() {
   return (
     <div className="brand-mark" aria-label="Lumen Paper">
@@ -892,7 +907,7 @@ export default function Home() {
                   </header>
                   <blockquote>{annotation.text}</blockquote>
                   {annotation.kind === "highlight" && <p className="highlight-saved"><Check size={14} />已保存为{annotation.color === "yellow" ? "黄色" : annotation.color === "green" ? "绿色" : annotation.color === "blue" ? "蓝色" : "玫红色"}高亮</p>}
-                  {annotation.thread.length > 0 && <div className="inline-thread">{annotation.thread.map((message) => <div key={message.id} className={`inline-message ${message.role}`}>{message.role === "assistant" ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : <p>{message.content}</p>}</div>)}</div>}
+                  {annotation.thread.length > 0 && <div className="inline-thread">{annotation.thread.map((message) => <div key={message.id} className={`inline-message ${message.role}`}>{message.role === "assistant" ? <MarkdownContent content={message.content} compact /> : <p>{message.content}</p>}</div>)}</div>}
                   {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />正在结合相邻段落分析…</div>}
                   {annotation.kind !== "highlight" && !annotation.loading && (
                     <div className="inline-ask follow-up">
@@ -925,7 +940,7 @@ export default function Home() {
             <div key={message.id} className={`message ${message.role}`}>
               {message.role === "assistant" && <div className="message-avatar"><Sparkles size={14} /></div>}
               <div className="message-body">
-                {message.role === "assistant" ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : <p>{message.content}</p>}
+                {message.role === "assistant" ? <MarkdownContent content={message.content} /> : <p>{message.content}</p>}
                 {message.role === "assistant" && <div className="message-tools"><button aria-label="复制回答" onClick={() => navigator.clipboard.writeText(message.content)}><Copy size={13} /></button><button aria-label="有帮助"><Check size={13} /></button></div>}
               </div>
             </div>

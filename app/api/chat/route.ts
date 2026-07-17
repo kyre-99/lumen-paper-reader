@@ -34,6 +34,7 @@ export async function POST(request: NextRequest) {
         role: "system",
         content: `你是论文的行间阅读助手。正在阅读《${paperTitle || "研究论文"}》。你的回答会显示在原文旁边，因此必须简洁、局部、准确。只依据“选中文字”和“相邻段落”回答；不要擅自扩展为全文总结。翻译时保留公式、符号和专业术语，解释时说明这句话在相邻段落中的作用。默认使用中文与 Markdown。`,
       },
+      ...history.slice(-8).map((item: any) => ({ role: item.role, content: item.content })),
       {
         role: "user",
         content: `【选中文字】\n${String(selectedText).slice(0, 6000)}\n\n【相邻段落】\n${String(surroundingContext).slice(0, 10000)}\n\n【局部任务】\n${question}`,

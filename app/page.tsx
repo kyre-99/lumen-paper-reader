@@ -57,6 +57,7 @@ type Annotation = {
   loading: boolean;
   result: string;
   draft: string;
+  thread: ChatMessage[];
 };
 
 const demoParagraphs = [
@@ -212,7 +213,7 @@ function PdfPage({ pdf, pageNumber, zoom }: { pdf: any; pageNumber: number; zoom
   }, [pdf, pageNumber, zoom]);
 
   return (
-    <div className="pdf-page" style={{ width: size.width, height: size.height }}>
+    <div className="pdf-page" style={{ width: size.width, height: size.height, "--total-scale-factor": 1.25 * zoom } as React.CSSProperties}>
       <canvas ref={canvasRef} />
       <div className="textLayer" ref={textRef} />
     </div>
@@ -337,8 +338,11 @@ export default function Home() {
   const [draggingId, setDraggingId] = useState<number | null>(null);
   const readerRef = useRef<HTMLDivElement>(null);
   const selectionRangeRef = useRef<Range | null>(null);
-  const annotationRangesRef = useRef(new Map<number, { range: Range; color: HighlightColor }>());
-  const dragRef = useRef<{ id: number; startX: number; startY: number; startLeft: number; startTop: number } | null>(null);
+  const annotationRangesRef = useRef(new Map<number, { range: Range; color: HighlightColor; persistent: boolean }>());
+  const activeRangeIdsRef = useRef(new Set<number>());
+  const flashTimersRef = useRef(new Map<number, number>());
+  const dragRef = useRef<{ id: number; target: "card" | "pin"; startX: number; startY: number; startLeft: number; startTop: number } | null>(null);
+  const lastDraggedPinRef = useRef<number | null>(null);
   const [config, setConfig] = useState<ApiConfig>({ provider: "OpenAI", endpoint: "https://api.openai.com/v1/chat/completions", model: "gpt-4.1-mini", apiKey: "" });
   const [messages, setMessages] = useState<ChatMessage[]>([
     { id: 1, role: "assistant", content: "这里是**全文对话**。我会基于整篇论文回答总结、方法、实验与结论问题；局部翻译和解释会留在原文旁边。" },
@@ -395,26 +399,41 @@ export default function Home() {
       style.textContent = "::highlight(lumen-yellow){background:rgba(244,207,86,.48)}::highlight(lumen-green){background:rgba(100,190,151,.40)}::highlight(lumen-blue){background:rgba(104,168,226,.36)}::highlight(lumen-rose){background:rgba(226,126,151,.34)}";
       document.head.appendChild(style);
     }
-    const ranges = [...annotationRangesRef.current.values()].filter((item) => item.color === color).map((item) => item.range);
+    const ranges = [...annotationRangesRef.current.entries()].filter(([id, item]) => item.color === color && (item.persistent || activeRangeIdsRef.current.has(id))).map(([, item]) => item.range);
     const name = `lumen-${color}`;
     if (ranges.length) (CSS as any).highlights.set(name, new (window as any).Highlight(...ranges));
     else (CSS as any).highlights.delete(name);
   }, []);
 
-  const addPersistentHighlight = useCallback((id: number, range: Range, color: HighlightColor) => {
-    annotationRangesRef.current.set(id, { range: range.cloneRange(), color });
-    refreshHighlights(color);
+  const addAnnotationRange = useCallback((id: number, range: Range, color: HighlightColor, persistent: boolean) => {
+    annotationRangesRef.current.set(id, { range: range.cloneRange(), color, persistent });
+    if (persistent) refreshHighlights(color);
+  }, [refreshHighlights]);
+
+  const flashAnnotationRange = useCallback((id: number, duration = 1500) => {
+    const stored = annotationRangesRef.current.get(id);
+    if (!stored || stored.persistent) return;
+    const existing = flashTimersRef.current.get(id);
+    if (existing) window.clearTimeout(existing);
+    activeRangeIdsRef.current.add(id);
+    refreshHighlights(stored.color);
+    const timer = window.setTimeout(() => {
+      activeRangeIdsRef.current.delete(id);
+      flashTimersRef.current.delete(id);
+      refreshHighlights(stored.color);
+    }, duration);
+    flashTimersRef.current.set(id, timer);
   }, [refreshHighlights]);
 
   const updateAnnotation = useCallback((id: number, patch: Partial<Annotation>) => {
     setAnnotations((items) => items.map((item) => item.id === id ? { ...item, ...patch } : item));
   }, []);
 
-  const startAnnotationDrag = useCallback((event: React.PointerEvent<HTMLElement>, annotation: Annotation) => {
-    if (event.button !== 0 || (event.target as HTMLElement).closest("button, textarea, a")) return;
+  const startAnnotationDrag = useCallback((event: React.PointerEvent<HTMLElement>, annotation: Annotation, target: "card" | "pin") => {
+    if (event.button !== 0 || (target === "card" && (event.target as HTMLElement).closest("button, textarea, a"))) return;
     event.preventDefault();
     event.stopPropagation();
-    dragRef.current = { id: annotation.id, startX: event.clientX, startY: event.clientY, startLeft: annotation.cardLeft, startTop: annotation.cardTop };
+    dragRef.current = { id: annotation.id, target, startX: event.clientX, startY: event.clientY, startLeft: target === "card" ? annotation.cardLeft : annotation.left, startTop: target === "card" ? annotation.cardTop : annotation.top };
     setDraggingId(annotation.id);
   }, []);
 
@@ -425,29 +444,33 @@ export default function Home() {
       if (!drag || !reader) return;
       const nextLeft = drag.startLeft + event.clientX - drag.startX;
       const nextTop = drag.startTop + event.clientY - drag.startY;
+      if (drag.target === "pin" && (Math.abs(event.clientX - drag.startX) > 3 || Math.abs(event.clientY - drag.startY) > 3)) lastDraggedPinRef.current = drag.id;
       const minLeft = reader.scrollLeft + 8;
       const maxLeft = reader.scrollLeft + Math.max(8, reader.clientWidth - 350);
       const minTop = reader.scrollTop + 8;
       const maxTop = reader.scrollTop + Math.max(8, reader.clientHeight - 110);
-      updateAnnotation(drag.id, { cardLeft: Math.min(maxLeft, Math.max(minLeft, nextLeft)), cardTop: Math.min(maxTop, Math.max(minTop, nextTop)) });
+      if (drag.target === "card") updateAnnotation(drag.id, { cardLeft: Math.min(maxLeft, Math.max(minLeft, nextLeft)), cardTop: Math.min(maxTop, Math.max(minTop, nextTop)) });
+      else updateAnnotation(drag.id, { left: Math.min(reader.scrollLeft + reader.clientWidth - 30, Math.max(reader.scrollLeft + 4, nextLeft)), top: Math.min(reader.scrollTop + reader.clientHeight - 20, Math.max(reader.scrollTop + 12, nextTop)) });
     };
-    const end = () => { dragRef.current = null; setDraggingId(null); };
+    const end = () => { dragRef.current = null; setDraggingId(null); window.setTimeout(() => { lastDraggedPinRef.current = null; }, 0); };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", end);
     window.addEventListener("pointercancel", end);
     return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); window.removeEventListener("pointercancel", end); };
   }, [updateAnnotation]);
 
-  const requestInlineAnswer = useCallback(async (id: number, action: ToolAction, text: string, surrounding: string, customQuestion?: string) => {
+  const requestInlineAnswer = useCallback(async (id: number, action: ToolAction, text: string, surrounding: string, customQuestion?: string, history: ChatMessage[] = []) => {
     const prompt = customQuestion || (action === "translate" ? "请将选中的内容准确翻译成中文，保留公式与专业术语，并简短标注关键术语。" : "请直观解释选中内容的含义、它在本段中的作用，以及读者容易误解的地方。");
-    updateAnnotation(id, { loading: true, result: "" });
+    const userMessage: ChatMessage = { id: Date.now(), role: "user", content: customQuestion || (action === "translate" ? "翻译这段内容" : action === "explain" ? "解释这段内容" : prompt) };
+    const nextThread = [...history, userMessage];
+    updateAnnotation(id, { loading: true, result: "", draft: "", thread: nextThread });
     try {
       let answer = "";
       if (config.apiKey) {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline" }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline", history: history.slice(-8) }),
         });
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || "模型请求失败");
@@ -456,9 +479,10 @@ export default function Home() {
         await new Promise((resolve) => setTimeout(resolve, 550));
         answer = demoAnswer(prompt, text);
       }
-      updateAnnotation(id, { loading: false, result: answer, draft: "" });
+      updateAnnotation(id, { loading: false, result: answer, draft: "", thread: [...nextThread, { id: Date.now() + 1, role: "assistant", content: answer }] });
     } catch (error: any) {
-      updateAnnotation(id, { loading: false, result: `连接模型时遇到问题：${error?.message || "请检查 API 设置"}` });
+      const errorText = `连接模型时遇到问题：${error?.message || "请检查 API 设置"}`;
+      updateAnnotation(id, { loading: false, result: errorText, thread: [...nextThread, { id: Date.now() + 1, role: "assistant", content: errorText }] });
     }
   }, [config, paperTitle, updateAnnotation]);
 
@@ -497,26 +521,54 @@ export default function Home() {
   const createAnnotation = useCallback((kind: ToolAction | "highlight", color: HighlightColor = "green") => {
     if (!selectedText || !selectionAnchor || !selectionRangeRef.current) return;
     const id = Date.now() + Math.floor(Math.random() * 1000);
-    const annotation: Annotation = { id, kind, color, text: selectedText, surrounding: selectionContext, ...selectionAnchor, open: kind !== "highlight", loading: false, result: "", draft: "" };
-    addPersistentHighlight(id, selectionRangeRef.current, color);
+    const annotation: Annotation = { id, kind, color, text: selectedText, surrounding: selectionContext, ...selectionAnchor, open: kind !== "highlight", loading: false, result: "", draft: "", thread: [] };
+    addAnnotationRange(id, selectionRangeRef.current, color, kind === "highlight");
     setAnnotations((items) => [...items, annotation]);
     setSelectionPos(null);
     setShowColors(false);
     window.getSelection()?.removeAllRanges();
     if (kind === "translate" || kind === "explain") void requestInlineAnswer(id, kind, selectedText, selectionContext);
+    if (kind !== "highlight") window.setTimeout(() => flashAnnotationRange(id), 0);
     setSelectedText("");
     setSelectionContext("");
     selectionRangeRef.current = null;
-  }, [addPersistentHighlight, requestInlineAnswer, selectedText, selectionAnchor, selectionContext]);
+  }, [addAnnotationRange, flashAnnotationRange, requestInlineAnswer, selectedText, selectionAnchor, selectionContext]);
 
   const removeAnnotation = useCallback((id: number) => {
     const stored = annotationRangesRef.current.get(id);
+    const timer = flashTimersRef.current.get(id);
+    if (timer) window.clearTimeout(timer);
+    flashTimersRef.current.delete(id);
+    activeRangeIdsRef.current.delete(id);
     annotationRangesRef.current.delete(id);
     if (stored) refreshHighlights(stored.color);
     setAnnotations((items) => items.filter((item) => item.id !== id));
   }, [refreshHighlights]);
 
+  const closeAnnotation = useCallback((annotation: Annotation) => {
+    const timer = flashTimersRef.current.get(annotation.id);
+    if (timer) window.clearTimeout(timer);
+    flashTimersRef.current.delete(annotation.id);
+    activeRangeIdsRef.current.delete(annotation.id);
+    refreshHighlights(annotation.color);
+    updateAnnotation(annotation.id, { open: false });
+  }, [refreshHighlights, updateAnnotation]);
+
+  const openAnnotationFromPin = useCallback((annotation: Annotation) => {
+    if (lastDraggedPinRef.current === annotation.id) return;
+    const reader = readerRef.current;
+    if (!reader) return;
+    const visibleRight = reader.scrollLeft + reader.clientWidth;
+    const cardLeft = annotation.left + 358 > visibleRight ? Math.max(reader.scrollLeft + 14, annotation.left - 360) : annotation.left + 15;
+    const cardTop = Math.max(reader.scrollTop + 8, Math.min(reader.scrollTop + reader.clientHeight - 110, annotation.top + 15));
+    updateAnnotation(annotation.id, { open: true, cardLeft, cardTop });
+    flashAnnotationRange(annotation.id);
+  }, [flashAnnotationRange, updateAnnotation]);
+
   const clearPaperAnnotations = useCallback(() => {
+    flashTimersRef.current.forEach((timer) => window.clearTimeout(timer));
+    flashTimersRef.current.clear();
+    activeRangeIdsRef.current.clear();
     annotationRangesRef.current.clear();
     if ((CSS as any).highlights) (["yellow", "green", "blue", "rose"] as HighlightColor[]).forEach((color) => (CSS as any).highlights.delete(`lumen-${color}`));
     setAnnotations([]);
@@ -620,33 +672,35 @@ export default function Home() {
           {annotations.map((annotation) => (
             <React.Fragment key={annotation.id}>
               <button
-                className={`annotation-pin ${annotation.color}`}
+                className={`annotation-pin ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`}
                 style={{ top: annotation.top, left: annotation.left }}
-                onClick={() => updateAnnotation(annotation.id, { open: !annotation.open })}
+                onPointerDown={(event) => startAnnotationDrag(event, annotation, "pin")}
+                onClick={() => annotation.open ? closeAnnotation(annotation) : openAnnotationFromPin(annotation)}
                 aria-label="打开原文旁批注"
+                title="拖动图标；点击定位原文"
               >
                 {annotation.kind === "translate" ? <Languages size={14} /> : annotation.kind === "explain" ? <Sparkles size={14} /> : annotation.kind === "ask" ? <MessageSquareText size={14} /> : <Highlighter size={14} />}
               </button>
               {annotation.open && (
                 <section className={`inline-card ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`} style={{ top: annotation.cardTop, left: annotation.cardLeft }} onMouseDown={(event) => event.stopPropagation()}>
-                  <header onPointerDown={(event) => startAnnotationDrag(event, annotation)} title="拖动移动悬浮卡片">
+                  <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")} title="拖动移动悬浮卡片">
                     <div className="inline-card-title">
                       <MoreHorizontal className="drag-grip" size={15} />
                       <span>{annotation.kind === "translate" ? <Languages size={15} /> : annotation.kind === "explain" ? <Sparkles size={15} /> : annotation.kind === "ask" ? <MessageSquareText size={15} /> : <Highlighter size={15} />}</span>
                       <div><strong>{annotation.kind === "translate" ? "局部翻译" : annotation.kind === "explain" ? "段落解释" : annotation.kind === "ask" ? "针对这段提问" : "高亮标记"}</strong><small>仅使用选区与相邻段落</small></div>
                     </div>
-                    <button onClick={() => updateAnnotation(annotation.id, { open: false })} aria-label="收起批注"><X size={15} /></button>
+                    <button onClick={() => closeAnnotation(annotation)} aria-label="收起批注"><X size={15} /></button>
                   </header>
                   <blockquote>{annotation.text}</blockquote>
                   {annotation.kind === "highlight" && <p className="highlight-saved"><Check size={14} />已保存为{annotation.color === "yellow" ? "黄色" : annotation.color === "green" ? "绿色" : annotation.color === "blue" ? "蓝色" : "玫红色"}高亮</p>}
-                  {annotation.kind === "ask" && !annotation.result && !annotation.loading && (
-                    <div className="inline-ask">
-                      <textarea rows={2} value={annotation.draft} onChange={(event) => updateAnnotation(annotation.id, { draft: event.target.value })} placeholder="针对这段内容提问…" autoFocus />
-                      <button disabled={!annotation.draft.trim()} onClick={() => requestInlineAnswer(annotation.id, "ask", annotation.text, annotation.surrounding, annotation.draft)}><Send size={14} />发送</button>
+                  {annotation.thread.length > 0 && <div className="inline-thread">{annotation.thread.map((message) => <div key={message.id} className={`inline-message ${message.role}`}>{message.role === "assistant" ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : <p>{message.content}</p>}</div>)}</div>}
+                  {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />正在结合相邻段落分析…</div>}
+                  {annotation.kind !== "highlight" && !annotation.loading && (
+                    <div className="inline-ask follow-up">
+                      <textarea rows={2} value={annotation.draft} onChange={(event) => updateAnnotation(annotation.id, { draft: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && annotation.draft.trim()) { event.preventDefault(); requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, annotation.draft, annotation.thread); } }} placeholder={annotation.thread.length ? "继续追问这段内容…" : "针对这段内容提问…"} autoFocus={annotation.kind === "ask" && annotation.thread.length === 0} />
+                      <button disabled={!annotation.draft.trim()} onClick={() => requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, annotation.draft, annotation.thread)}><Send size={14} />发送</button>
                     </div>
                   )}
-                  {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />正在结合相邻段落分析…</div>}
-                  {annotation.result && <div className="inline-result"><ReactMarkdown remarkPlugins={[remarkGfm]}>{annotation.result}</ReactMarkdown></div>}
                   <footer><button onClick={() => navigator.clipboard.writeText(annotation.result || annotation.text)}><Copy size={13} />复制</button><button className="delete-note" onClick={() => removeAnnotation(annotation.id)}>删除标记</button></footer>
                 </section>
               )}
@@ -659,7 +713,7 @@ export default function Home() {
 
       <aside className="ai-panel" aria-hidden={!rightOpen}>
         <header className="ai-header">
-          <div className="ai-title"><div className="ai-glyph"><Sparkles size={17} /></div><div><h2>全文 AI</h2><span>{extractingText ? "正在提取论文文字…" : paperText ? `全文上下文 · ${paperText.length.toLocaleString()} 字符` : "演示论文上下文"}</span></div></div>
+          <div className="ai-title"><div className="ai-glyph"><Sparkles size={17} /></div><div><h2>全文 AI</h2><span>{extractingText ? "正在提取论文文字…" : paperText ? `全文上下文 · 连续对话 · ${paperText.length.toLocaleString()} 字符` : "演示论文上下文 · 连续对话"}</span></div></div>
           <button className="ai-close-button" onClick={() => setRightOpen(false)} aria-label="关闭 AI 面板"><PanelRightClose size={16} />收起</button>
         </header>
         <div className="quick-actions">

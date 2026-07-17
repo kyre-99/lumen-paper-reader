@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getChatGPTUser, chatGPTSignInPath } from "../../chatgpt-auth";
+import { getSupabaseUser } from "../../supabase-auth";
 
 export async function GET(request: NextRequest) {
-  const user = await getChatGPTUser();
-  if (!user) return NextResponse.json({ error: "需要登录", signInUrl: chatGPTSignInPath("/") }, { status: 401 });
+  const user = await getSupabaseUser();
+  if (!user) return NextResponse.json({ error: "需要登录" }, { status: 401 });
   const raw = request.nextUrl.searchParams.get("url");
   if (!raw) return NextResponse.json({ error: "缺少论文地址" }, { status: 400 });
   let url: URL;

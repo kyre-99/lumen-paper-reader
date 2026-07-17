@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
-import { getChatGPTUser, chatGPTSignInPath } from "../../../chatgpt-auth";
+import { requireAppUser } from "../../../server-user";
 import { getDb } from "../../../../db";
-import { papers, users } from "../../../../db/schema";
+import { papers } from "../../../../db/schema";
 
 async function shortUserHash(email: string) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(email));
@@ -9,8 +9,8 @@ async function shortUserHash(email: string) {
 }
 
 export async function POST(request: Request) {
-  const user = await getChatGPTUser();
-  if (!user) return Response.json({ error: "需要登录", signInUrl: chatGPTSignInPath("/") }, { status: 401 });
+  const user = await requireAppUser();
+  if (!user) return Response.json({ error: "需要登录" }, { status: 401 });
 
   const declaredSize = Number(request.headers.get("content-length") || 0);
   if (declaredSize > 60 * 1024 * 1024) return Response.json({ error: "PDF 超过 60MB" }, { status: 413 });
@@ -23,19 +23,15 @@ export async function POST(request: Request) {
   let fileName = "paper.pdf";
   try { fileName = decodeURIComponent(encodedName).replace(/[\\/\r\n]/g, "_").slice(0, 180) || "paper.pdf"; } catch { /* keep fallback */ }
   const id = crypto.randomUUID();
-  const objectKey = `users/${await shortUserHash(user.email)}/papers/${id}.pdf`;
+  const objectKey = `users/${await shortUserHash(user.id)}/papers/${id}.pdf`;
   const bucket = (env as any).FILES as R2Bucket | undefined;
   if (!bucket) return Response.json({ error: "文件存储尚未就绪" }, { status: 503 });
   await bucket.put(objectKey, bytes, { httpMetadata: { contentType: "application/pdf" }, customMetadata: { fileName } });
 
   const db = getDb();
-  await db.insert(users).values({ id: user.email, email: user.email, displayName: user.displayName }).onConflictDoUpdate({
-    target: users.id,
-    set: { displayName: user.displayName, updatedAt: new Date().toISOString() },
-  });
   await db.insert(papers).values({
     id,
-    userId: user.email,
+    userId: user.id,
     title: fileName.replace(/\.pdf$/i, ""),
     meta: `已上传 PDF · ${(bytes.byteLength / 1024 / 1024).toFixed(1)} MB`,
     sourceKind: "upload",

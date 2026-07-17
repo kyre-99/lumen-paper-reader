@@ -21,6 +21,7 @@ import {
   Link2,
   LoaderCircle,
   LogOut,
+  Mail,
   Maximize2,
   MessageSquareText,
   Minus,
@@ -353,6 +354,9 @@ type ApiConfig = { provider: string; endpoint: string; model: string; apiKey: st
 export default function Home() {
   const [user, setUser] = useState<SessionUser | null>(null);
   const [authReady, setAuthReady] = useState(false);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+  const [authSubmitting, setAuthSubmitting] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
   const [saveStatus, setSaveStatus] = useState<"loading" | "saved" | "saving" | "error">("loading");
   const [hydrated, setHydrated] = useState(false);
@@ -401,6 +405,14 @@ export default function Home() {
       const apiKey = sessionStorage.getItem("lumen-api-key") || "";
       if (saved) setConfig({ ...JSON.parse(saved), apiKey });
     } catch { /* ignore invalid local preferences */ }
+  }, []);
+
+  useEffect(() => {
+    const error = new URLSearchParams(window.location.search).get("auth_error");
+    if (error) {
+      setAuthMessage(error);
+      window.history.replaceState({}, "", window.location.pathname);
+    }
   }, []);
 
   useEffect(() => {
@@ -794,6 +806,23 @@ export default function Home() {
     setSource(null);
   }, []);
 
+  const requestMagicLink = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!authEmail.trim() || authSubmitting) return;
+    setAuthSubmitting(true);
+    setAuthMessage("");
+    try {
+      const response = await fetch("/api/auth/email", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: authEmail }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "发送失败");
+      setAuthMessage("登录邮件已发送，请在邮箱中点击链接继续。");
+    } catch (error: any) {
+      setAuthMessage(error?.message || "发送失败，请稍后重试");
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 2200); return () => clearTimeout(timer); }, [toast]);
 
   return (
@@ -810,7 +839,7 @@ export default function Home() {
           <RailButton icon={<CircleHelp size={20} />} label="使用帮助" onClick={() => setToast("提示：先选中文字，再选择翻译或解释")} />
           <RailButton icon={<Settings size={20} />} label="设置" onClick={() => setSettingsOpen(true)} />
           <button className="avatar" aria-label="个人资料" onClick={() => setAccountOpen(!accountOpen)}>{(user?.displayName || user?.email || "W").slice(0, 1).toUpperCase()}</button>
-          {accountOpen && user && <div className="account-popover"><strong>{user.displayName}</strong><span>{user.email}</span><div className={`account-sync ${saveStatus}`}><Cloud size={13} />{saveStatus === "saving" ? "正在同步" : saveStatus === "error" ? "同步遇到问题" : "已同步到云端"}</div><a href="/signout-with-chatgpt?return_to=/"><LogOut size={13} />退出登录</a></div>}
+          {accountOpen && user && <div className="account-popover"><strong>{user.displayName}</strong><span>{user.email}</span><div className={`account-sync ${saveStatus}`}><Cloud size={13} />{saveStatus === "saving" ? "正在同步" : saveStatus === "error" ? "同步遇到问题" : "已同步到云端"}</div><a href="/api/auth/logout"><LogOut size={13} />退出登录</a></div>}
         </div>
       </aside>
 
@@ -932,7 +961,7 @@ export default function Home() {
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} />}
       {toast && <div className="toast"><Check size={15} />{toast}</div>}
       {!authReady && <div className="auth-gate"><div className="auth-card"><BrandMark /><LoaderCircle className="spin" size={22} /><h2>正在确认登录状态</h2><p>正在安全地读取你的论文空间…</p></div></div>}
-      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>登录 Lumen Paper</h2><p>登录后，你的论文、阅读进度、聊天和批注会安全地保存在个人空间中。</p><a className="primary-button wide" href="/signin-with-chatgpt?return_to=/">使用 ChatGPT 登录</a></div></div>}
+      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>登录 Lumen Paper</h2><p>登录后，你的论文、阅读进度、聊天和批注会安全地保存在个人空间中。</p><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a><div className="auth-divider"><span>或使用邮箱</span></div><form className="auth-email-form" onSubmit={requestMagicLink}><label><Mail size={16} /><input type="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="name@example.com" autoComplete="email" required /></label><button className="primary-button wide" disabled={authSubmitting}>{authSubmitting ? <><LoaderCircle className="spin" size={15} />正在发送</> : "发送登录链接"}</button></form>{authMessage && <div className="auth-message">{authMessage}</div>}<small>无需设置密码，登录链接将发送到你的邮箱。</small></div></div>}
     </main>
   );
 }

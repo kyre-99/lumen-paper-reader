@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
-import { getChatGPTUser, chatGPTSignInPath } from "../../chatgpt-auth";
+import { requireAppUser } from "../../server-user";
 import { getDb } from "../../../db";
-import { papers, readerStates, users } from "../../../db/schema";
+import { papers, readerStates } from "../../../db/schema";
 
 function parseArray(value: string) {
   try {
@@ -13,26 +13,19 @@ function parseArray(value: string) {
 }
 
 async function requireApiUser() {
-  const user = await getChatGPTUser();
-  if (!user) return null;
-  const db = getDb();
-  await db.insert(users).values({ id: user.email, email: user.email, displayName: user.displayName }).onConflictDoUpdate({
-    target: users.id,
-    set: { displayName: user.displayName, updatedAt: new Date().toISOString() },
-  });
-  return user;
+  return requireAppUser();
 }
 
 export async function GET() {
   const user = await requireApiUser();
-  if (!user) return Response.json({ error: "需要登录", signInUrl: chatGPTSignInPath("/") }, { status: 401 });
+  if (!user) return Response.json({ error: "需要登录" }, { status: 401 });
 
   const db = getDb();
-  const [state] = await db.select().from(readerStates).where(eq(readerStates.userId, user.email)).limit(1);
+  const [state] = await db.select().from(readerStates).where(eq(readerStates.userId, user.id)).limit(1);
   if (!state) return Response.json({ workspace: null });
 
   const [paper] = state.activePaperId
-    ? await db.select().from(papers).where(and(eq(papers.id, state.activePaperId), eq(papers.userId, user.email))).limit(1)
+    ? await db.select().from(papers).where(and(eq(papers.id, state.activePaperId), eq(papers.userId, user.id))).limit(1)
     : [];
 
   return Response.json({
@@ -58,7 +51,7 @@ export async function GET() {
 
 export async function PUT(request: Request) {
   const user = await requireApiUser();
-  if (!user) return Response.json({ error: "需要登录", signInUrl: chatGPTSignInPath("/") }, { status: 401 });
+  if (!user) return Response.json({ error: "需要登录" }, { status: 401 });
 
   const payload = await request.json() as any;
   const paper = payload.paper && typeof payload.paper === "object" ? payload.paper : null;
@@ -69,11 +62,11 @@ export async function PUT(request: Request) {
     const id = String(paper.id || "").slice(0, 80);
     if (!id) return Response.json({ error: "论文记录缺少 ID" }, { status: 400 });
     const [existing] = await db.select({ userId: papers.userId }).from(papers).where(eq(papers.id, id)).limit(1);
-    if (existing && existing.userId !== user.email) return Response.json({ error: "无权修改该论文" }, { status: 403 });
+    if (existing && existing.userId !== user.id) return Response.json({ error: "无权修改该论文" }, { status: 403 });
 
     const values = {
       id,
-      userId: user.email,
+      userId: user.id,
       title: String(paper.title || "未命名论文").slice(0, 300),
       meta: String(paper.meta || "").slice(0, 500),
       sourceKind: paper.sourceKind === "upload" ? "upload" as const : "remote" as const,
@@ -83,7 +76,7 @@ export async function PUT(request: Request) {
       updatedAt: new Date().toISOString(),
     };
     if (existing) {
-      await db.update(papers).set(values).where(and(eq(papers.id, id), eq(papers.userId, user.email)));
+      await db.update(papers).set(values).where(and(eq(papers.id, id), eq(papers.userId, user.id)));
     } else {
       await db.insert(papers).values(values);
     }
@@ -98,7 +91,7 @@ export async function PUT(request: Request) {
     return Response.json({ error: "同步内容过大，请删除部分历史记录后重试" }, { status: 413 });
   }
   const stateValues = {
-    userId: user.email,
+    userId: user.id,
     activePaperId,
     currentPage: Math.max(1, Math.min(1000, Number(payload.currentPage) || 1)),
     zoom: Math.max(0.4, Math.min(2.5, Number(payload.zoom) || 0.88)),

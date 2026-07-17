@@ -22,6 +22,7 @@ import {
   MessageSquareText,
   Minus,
   MoreHorizontal,
+  Palette,
   PanelRightClose,
   PanelRightOpen,
   Plus,
@@ -34,13 +35,28 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
-type ChatMessage = { id: number; role: "user" | "assistant"; content: string; context?: string };
+type ChatMessage = { id: number; role: "user" | "assistant"; content: string };
 type ToolAction = "translate" | "explain" | "ask";
+type HighlightColor = "yellow" | "green" | "blue" | "rose";
+type Annotation = {
+  id: number;
+  kind: ToolAction | "highlight";
+  color: HighlightColor;
+  text: string;
+  surrounding: string;
+  top: number;
+  left: number;
+  cardLeft: number;
+  open: boolean;
+  loading: boolean;
+  result: string;
+  draft: string;
+};
 
 const demoParagraphs = [
   {
@@ -172,7 +188,7 @@ function PdfPage({ pdf, pageNumber, zoom }: { pdf: any; pageNumber: number; zoom
   );
 }
 
-function PdfDocument({ source, zoom, onReady, onError }: { source: string | Uint8Array; zoom: number; onReady: (pages: number) => void; onError: (message: string) => void }) {
+function PdfDocument({ source, zoom, onReady, onTextExtracted, onError }: { source: string | Uint8Array; zoom: number; onReady: (pages: number) => void; onTextExtracted: (text: string) => void; onError: (message: string) => void }) {
   const [pdf, setPdf] = useState<any>(null);
 
   useEffect(() => {
@@ -181,18 +197,28 @@ function PdfDocument({ source, zoom, onReady, onError }: { source: string | Uint
     (async () => {
       const pdfjs = await import("pdfjs-dist");
       pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-      task = pdfjs.getDocument(typeof source === "string" ? source : { data: source });
+      task = pdfjs.getDocument(typeof source === "string" ? { url: source } : { data: source });
       const loaded = await task.promise;
       if (!cancelled) {
         setPdf(loaded);
         onReady(loaded.numPages);
+        void (async () => {
+          const pageTexts: string[] = [];
+          const limit = Math.min(loaded.numPages, 80);
+          for (let pageNumber = 1; pageNumber <= limit && !cancelled; pageNumber++) {
+            const page = await loaded.getPage(pageNumber);
+            const content = await page.getTextContent();
+            pageTexts.push(`--- PAGE ${pageNumber} ---\n${content.items.map((item: any) => item.str || "").join(" ")}`);
+          }
+          if (!cancelled) onTextExtracted(pageTexts.join("\n\n").slice(0, 120000));
+        })().catch(() => !cancelled && onTextExtracted(""));
       }
     })().catch((error) => !cancelled && onError(error?.message || "PDF 加载失败"));
     return () => {
       cancelled = true;
       task?.destroy?.();
     };
-  }, [source, onReady, onError]);
+  }, [source, onReady, onTextExtracted, onError]);
 
   if (!pdf) {
     return <div className="pdf-loading"><LoaderCircle className="spin" size={22} /><span>正在解析论文版面…</span></div>;
@@ -201,7 +227,7 @@ function PdfDocument({ source, zoom, onReady, onError }: { source: string | Uint
 }
 
 function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => void; onOpenUrl: (url: string) => void; onOpenFile: (file: File) => void }) {
-  const [url, setUrl] = useState("https://arxiv.org/abs/1706.03762");
+  const [url, setUrl] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
@@ -212,7 +238,7 @@ function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => voi
         <p>粘贴 arXiv 链接或任何公开 PDF 地址，也可以从本地上传。</p>
         <label className="url-field">
           <Link2 size={18} />
-          <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://arxiv.org/abs/…" autoFocus />
+          <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="例如 https://arxiv.org/pdf/2507.21892" autoFocus />
         </label>
         <button className="primary-button wide" onClick={() => onOpenUrl(url)} disabled={!url.trim()}><Globe2 size={17} />打开链接</button>
         <div className="modal-or"><span>或</span></div>
@@ -260,20 +286,28 @@ export default function Home() {
   const [rightOpen, setRightOpen] = useState(true);
   const [source, setSource] = useState<string | Uint8Array | null>(null);
   const [paperTitle, setPaperTitle] = useState("Attention Is All You Need");
-  const [paperMeta, setPaperMeta] = useState("Vaswani et al. · NeurIPS 2017");
+  const [paperMeta, setPaperMeta] = useState("交互演示论文 · 打开链接后会替换为真实 PDF");
   const [pageCount, setPageCount] = useState(15);
   const [currentPage, setCurrentPage] = useState(1);
   const [zoom, setZoom] = useState(0.88);
   const [selectedText, setSelectedText] = useState("");
+  const [selectionContext, setSelectionContext] = useState("");
   const [selectionPos, setSelectionPos] = useState<{ x: number; y: number } | null>(null);
+  const [selectionAnchor, setSelectionAnchor] = useState<{ top: number; left: number; cardLeft: number } | null>(null);
+  const [showColors, setShowColors] = useState(false);
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [paperText, setPaperText] = useState(demoParagraphs.map((item) => `${item.heading || ""}\n${item.body}`).join("\n\n"));
+  const [extractingText, setExtractingText] = useState(false);
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [toast, setToast] = useState("");
   const readerRef = useRef<HTMLDivElement>(null);
+  const selectionRangeRef = useRef<Range | null>(null);
+  const annotationRangesRef = useRef(new Map<number, { range: Range; color: HighlightColor }>());
   const [config, setConfig] = useState<ApiConfig>({ provider: "OpenAI", endpoint: "https://api.openai.com/v1/chat/completions", model: "gpt-4.1-mini", apiKey: "" });
   const [messages, setMessages] = useState<ChatMessage[]>([
-    { id: 1, role: "assistant", content: "你好，我已经读过这篇论文。你可以直接提问，也可以在左侧**选中任意段落**让我翻译或解释。" },
+    { id: 1, role: "assistant", content: "这里是**全文对话**。我会基于整篇论文回答总结、方法、实验与结论问题；局部翻译和解释会留在原文旁边。" },
   ]);
 
   useEffect(() => {
@@ -284,10 +318,10 @@ export default function Home() {
     } catch { /* ignore invalid local preferences */ }
   }, []);
 
-  const sendQuestion = useCallback(async (raw: string, context?: string) => {
+  const sendQuestion = useCallback(async (raw: string) => {
     const text = raw.trim();
     if (!text || loading) return;
-    const userMessage: ChatMessage = { id: Date.now(), role: "user", content: text, context };
+    const userMessage: ChatMessage = { id: Date.now(), role: "user", content: text };
     setMessages((old) => [...old, userMessage]);
     setQuestion("");
     setLoading(true);
@@ -299,20 +333,67 @@ export default function Home() {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey, model: config.model, paperTitle, question: text, context, history: messages.slice(-6) }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey, model: config.model, paperTitle, question: text, paperContext: paperText, mode: "global", history: messages.slice(-6) }),
         });
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || "模型请求失败");
         answer = payload.content;
       } else {
         await new Promise((resolve) => setTimeout(resolve, 650));
-        answer = demoAnswer(text, context);
+        answer = demoAnswer(text);
       }
       setMessages((old) => [...old, { id: Date.now() + 1, role: "assistant", content: answer }]);
     } catch (error: any) {
       setMessages((old) => [...old, { id: Date.now() + 1, role: "assistant", content: `连接模型时遇到问题：${error?.message || "请检查 API 设置"}\n\n你可以在右上角的模型设置中检查接口地址与密钥。` }]);
     } finally { setLoading(false); }
-  }, [config, loading, messages, paperTitle]);
+  }, [config, loading, messages, paperText, paperTitle]);
+
+  const refreshHighlights = useCallback((color: HighlightColor) => {
+    if (!(CSS as any).highlights || !(window as any).Highlight) return;
+    if (!document.getElementById("lumen-highlight-styles")) {
+      const style = document.createElement("style");
+      style.id = "lumen-highlight-styles";
+      style.textContent = "::highlight(lumen-yellow){background:rgba(244,207,86,.48)}::highlight(lumen-green){background:rgba(100,190,151,.40)}::highlight(lumen-blue){background:rgba(104,168,226,.36)}::highlight(lumen-rose){background:rgba(226,126,151,.34)}";
+      document.head.appendChild(style);
+    }
+    const ranges = [...annotationRangesRef.current.values()].filter((item) => item.color === color).map((item) => item.range);
+    const name = `lumen-${color}`;
+    if (ranges.length) (CSS as any).highlights.set(name, new (window as any).Highlight(...ranges));
+    else (CSS as any).highlights.delete(name);
+  }, []);
+
+  const addPersistentHighlight = useCallback((id: number, range: Range, color: HighlightColor) => {
+    annotationRangesRef.current.set(id, { range: range.cloneRange(), color });
+    refreshHighlights(color);
+  }, [refreshHighlights]);
+
+  const updateAnnotation = useCallback((id: number, patch: Partial<Annotation>) => {
+    setAnnotations((items) => items.map((item) => item.id === id ? { ...item, ...patch } : item));
+  }, []);
+
+  const requestInlineAnswer = useCallback(async (id: number, action: ToolAction, text: string, surrounding: string, customQuestion?: string) => {
+    const prompt = customQuestion || (action === "translate" ? "请将选中的内容准确翻译成中文，保留公式与专业术语，并简短标注关键术语。" : "请直观解释选中内容的含义、它在本段中的作用，以及读者容易误解的地方。");
+    updateAnnotation(id, { loading: true, result: "" });
+    try {
+      let answer = "";
+      if (config.apiKey) {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline" }),
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || "模型请求失败");
+        answer = payload.content;
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 550));
+        answer = demoAnswer(prompt, text);
+      }
+      updateAnnotation(id, { loading: false, result: answer, draft: "" });
+    } catch (error: any) {
+      updateAnnotation(id, { loading: false, result: `连接模型时遇到问题：${error?.message || "请检查 API 设置"}` });
+    }
+  }, [config, paperTitle, updateAnnotation]);
 
   const handleSelection = useCallback(() => {
     const selection = window.getSelection();
@@ -321,40 +402,101 @@ export default function Home() {
     const range = selection.getRangeAt(0);
     if (!readerRef.current?.contains(range.commonAncestorContainer)) return;
     const rect = range.getBoundingClientRect();
+    const readerRect = readerRef.current.getBoundingClientRect();
+    const node = range.commonAncestorContainer.nodeType === Node.TEXT_NODE ? range.commonAncestorContainer.parentElement : range.commonAncestorContainer as HTMLElement;
+    const contextRoot = node?.closest?.(".pdf-page, .demo-paper") as HTMLElement | null;
+    const blockText = (contextRoot?.innerText || node?.parentElement?.innerText || text).replace(/\s+/g, " ").trim();
+    const needle = text.slice(0, 90);
+    const index = blockText.indexOf(needle);
+    const surrounding = index >= 0 ? blockText.slice(Math.max(0, index - 700), Math.min(blockText.length, index + text.length + 700)) : blockText.slice(0, 1600);
+    const anchorLeft = rect.right - readerRect.left + readerRef.current.scrollLeft + 8;
+    const anchorTop = rect.top - readerRect.top + readerRef.current.scrollTop + Math.min(rect.height / 2, 18);
+    const visibleRight = readerRef.current.scrollLeft + readerRef.current.clientWidth;
     setSelectedText(text.slice(0, 1800));
+    setSelectionContext(surrounding);
+    selectionRangeRef.current = range.cloneRange();
+    setSelectionAnchor({ top: anchorTop, left: anchorLeft, cardLeft: anchorLeft + 358 > visibleRight ? Math.max(readerRef.current.scrollLeft + 14, anchorLeft - 360) : anchorLeft + 15 });
     setSelectionPos({ x: Math.min(Math.max(rect.left + rect.width / 2, 190), window.innerWidth - 220), y: Math.max(rect.top - 58, 72) });
+    setShowColors(false);
   }, []);
 
-  const selectionAction = (action: ToolAction) => {
-    if (!selectedText) return;
-    if (action === "translate") sendQuestion("请将选中的内容准确翻译成中文，并保留专业术语。", selectedText);
-    if (action === "explain") sendQuestion("请用直观、简洁的方式解释选中的内容，并说明它在论文中的作用。", selectedText);
-    if (action === "ask") { setQuestion(`关于这段内容：`); setRightOpen(true); }
-  };
+  const createAnnotation = useCallback((kind: ToolAction | "highlight", color: HighlightColor = "green") => {
+    if (!selectedText || !selectionAnchor || !selectionRangeRef.current) return;
+    const id = Date.now() + Math.floor(Math.random() * 1000);
+    const annotation: Annotation = { id, kind, color, text: selectedText, surrounding: selectionContext, ...selectionAnchor, open: kind !== "highlight", loading: false, result: "", draft: "" };
+    addPersistentHighlight(id, selectionRangeRef.current, color);
+    setAnnotations((items) => [...items, annotation]);
+    setSelectionPos(null);
+    setShowColors(false);
+    window.getSelection()?.removeAllRanges();
+    if (kind === "translate" || kind === "explain") void requestInlineAnswer(id, kind, selectedText, selectionContext);
+    setSelectedText("");
+    setSelectionContext("");
+    selectionRangeRef.current = null;
+  }, [addPersistentHighlight, requestInlineAnswer, selectedText, selectionAnchor, selectionContext]);
+
+  const removeAnnotation = useCallback((id: number) => {
+    const stored = annotationRangesRef.current.get(id);
+    annotationRangesRef.current.delete(id);
+    if (stored) refreshHighlights(stored.color);
+    setAnnotations((items) => items.filter((item) => item.id !== id));
+  }, [refreshHighlights]);
+
+  const clearPaperAnnotations = useCallback(() => {
+    annotationRangesRef.current.clear();
+    if ((CSS as any).highlights) (["yellow", "green", "blue", "rose"] as HighlightColor[]).forEach((color) => (CSS as any).highlights.delete(`lumen-${color}`));
+    setAnnotations([]);
+    setSelectedText("");
+    setSelectionPos(null);
+  }, []);
 
   const openUrl = (raw: string) => {
     const normalized = normalizePaperUrl(raw);
     if (!/^https?:\/\//i.test(normalized)) { setToast("请输入有效的公开链接"); return; }
+    clearPaperAnnotations();
+    setExtractingText(true);
+    setPaperText("");
     setSource(`/api/pdf?url=${encodeURIComponent(normalized)}`);
     const arxivId = normalized.match(/arxiv\.org\/pdf\/([^?#/]+)/i)?.[1];
-    setPaperTitle(arxivId ? `arXiv · ${arxivId}` : "正在读取论文…");
-    setPaperMeta(new URL(normalized).hostname);
+    setPaperTitle(arxivId ? `arXiv ${arxivId}` : "正在读取论文…");
+    setPaperMeta(`${new URL(normalized).hostname} · 真实 PDF`);
+    setMessages([{ id: Date.now(), role: "assistant", content: "论文正在解析。文字提取完成后，我会在这里基于**全文上下文**回答问题。" }]);
     setOpenModal(false);
     setToast("论文已加入阅读区");
   };
 
   const openFile = async (file: File) => {
     const data = new Uint8Array(await file.arrayBuffer());
+    clearPaperAnnotations();
+    setExtractingText(true);
+    setPaperText("");
     setSource(data);
     setPaperTitle(file.name.replace(/\.pdf$/i, ""));
     setPaperMeta(`本地 PDF · ${(file.size / 1024 / 1024).toFixed(1)} MB`);
+    setMessages([{ id: Date.now(), role: "assistant", content: "本地论文正在解析。文字提取完成后，我会在这里基于**全文上下文**回答问题。" }]);
     setOpenModal(false);
     setToast("本地论文已打开");
   };
 
-  useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 2200); return () => clearTimeout(timer); }, [toast]);
+  const handlePdfReady = useCallback((pages: number) => {
+    setPageCount(pages);
+    setPaperTitle((title) => title === "正在读取论文…" ? "已载入的研究论文" : title);
+    setToast(`真实 PDF 已打开 · ${pages} 页`);
+  }, []);
 
-  const contextLabel = useMemo(() => selectedText ? `${selectedText.slice(0, 92)}${selectedText.length > 92 ? "…" : ""}` : "", [selectedText]);
+  const handleTextExtracted = useCallback((text: string) => {
+    setPaperText(text);
+    setExtractingText(false);
+    setMessages([{ id: Date.now(), role: "assistant", content: text ? `全文文字已经准备好（约 **${text.length.toLocaleString()}** 个字符）。现在可以询问整篇论文的方法、实验、结论和局限。` : "PDF 已打开，但没有提取到可搜索文字；它可能是扫描版，需要接入 OCR。" }]);
+  }, []);
+
+  const handlePdfError = useCallback((msg: string) => {
+    setToast(`加载失败：${msg.slice(0, 70)}`);
+    setExtractingText(false);
+    setSource(null);
+  }, []);
+
+  useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 2200); return () => clearTimeout(timer); }, [toast]);
 
   return (
     <main className={`app-shell ${rightOpen ? "right-open" : "right-closed"}`}>
@@ -399,16 +541,51 @@ export default function Home() {
 
         <div className="reader-viewport" ref={readerRef} onMouseUp={handleSelection} onScroll={() => selectionPos && setSelectionPos(null)}>
           {source ? (
-            <PdfDocument source={source} zoom={zoom} onReady={(pages) => { setPageCount(pages); setPaperTitle((title) => title === "正在读取论文…" ? "已载入的研究论文" : title); }} onError={(msg) => { setToast(`加载失败：${msg.slice(0, 70)}`); setSource(null); }} />
+            <PdfDocument source={source} zoom={zoom} onReady={handlePdfReady} onTextExtracted={handleTextExtracted} onError={handlePdfError} />
           ) : <div style={{ transform: `scale(${zoom})`, transformOrigin: "top center" }}><DemoPaper /></div>}
+          {annotations.map((annotation) => (
+            <React.Fragment key={annotation.id}>
+              <button
+                className={`annotation-pin ${annotation.color}`}
+                style={{ top: annotation.top, left: annotation.left }}
+                onClick={() => updateAnnotation(annotation.id, { open: !annotation.open })}
+                aria-label="打开原文旁批注"
+              >
+                {annotation.kind === "translate" ? <Languages size={14} /> : annotation.kind === "explain" ? <Sparkles size={14} /> : annotation.kind === "ask" ? <MessageSquareText size={14} /> : <Highlighter size={14} />}
+              </button>
+              {annotation.open && (
+                <section className={`inline-card ${annotation.color}`} style={{ top: annotation.top + 15, left: annotation.cardLeft }} onMouseDown={(event) => event.stopPropagation()}>
+                  <header>
+                    <div className="inline-card-title">
+                      <span>{annotation.kind === "translate" ? <Languages size={15} /> : annotation.kind === "explain" ? <Sparkles size={15} /> : annotation.kind === "ask" ? <MessageSquareText size={15} /> : <Highlighter size={15} />}</span>
+                      <div><strong>{annotation.kind === "translate" ? "局部翻译" : annotation.kind === "explain" ? "段落解释" : annotation.kind === "ask" ? "针对这段提问" : "高亮标记"}</strong><small>仅使用选区与相邻段落</small></div>
+                    </div>
+                    <button onClick={() => updateAnnotation(annotation.id, { open: false })} aria-label="收起批注"><X size={15} /></button>
+                  </header>
+                  <blockquote>{annotation.text}</blockquote>
+                  {annotation.kind === "highlight" && <p className="highlight-saved"><Check size={14} />已保存为{annotation.color === "yellow" ? "黄色" : annotation.color === "green" ? "绿色" : annotation.color === "blue" ? "蓝色" : "玫红色"}高亮</p>}
+                  {annotation.kind === "ask" && !annotation.result && !annotation.loading && (
+                    <div className="inline-ask">
+                      <textarea rows={2} value={annotation.draft} onChange={(event) => updateAnnotation(annotation.id, { draft: event.target.value })} placeholder="针对这段内容提问…" autoFocus />
+                      <button disabled={!annotation.draft.trim()} onClick={() => requestInlineAnswer(annotation.id, "ask", annotation.text, annotation.surrounding, annotation.draft)}><Send size={14} />发送</button>
+                    </div>
+                  )}
+                  {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />正在结合相邻段落分析…</div>}
+                  {annotation.result && <div className="inline-result"><ReactMarkdown remarkPlugins={[remarkGfm]}>{annotation.result}</ReactMarkdown></div>}
+                  <footer><button onClick={() => navigator.clipboard.writeText(annotation.result || annotation.text)}><Copy size={13} />复制</button><button className="delete-note" onClick={() => removeAnnotation(annotation.id)}>删除标记</button></footer>
+                </section>
+              )}
+            </React.Fragment>
+          ))}
           <div className="reader-tip"><Sparkles size={14} />选中论文中的任何内容，立即翻译或提问</div>
         </div>
+        {!rightOpen && <button className="ai-reopen" onClick={() => setRightOpen(true)}><Sparkles size={16} />全文 AI<PanelRightOpen size={16} /></button>}
       </section>
 
       <aside className="ai-panel" aria-hidden={!rightOpen}>
         <header className="ai-header">
-          <div className="ai-title"><div className="ai-glyph"><Sparkles size={17} /></div><div><h2>Lumen AI</h2><span>已了解全文上下文</span></div></div>
-          <button className="icon-button small" onClick={() => setRightOpen(false)} aria-label="关闭 AI 面板"><X size={17} /></button>
+          <div className="ai-title"><div className="ai-glyph"><Sparkles size={17} /></div><div><h2>全文 AI</h2><span>{extractingText ? "正在提取论文文字…" : paperText ? `全文上下文 · ${paperText.length.toLocaleString()} 字符` : "演示论文上下文"}</span></div></div>
+          <button className="ai-close-button" onClick={() => setRightOpen(false)} aria-label="关闭 AI 面板"><PanelRightClose size={16} />收起</button>
         </header>
         <div className="quick-actions">
           <button onClick={() => sendQuestion("请用三点总结这篇论文的核心贡献。")}>总结全文</button>
@@ -420,7 +597,6 @@ export default function Home() {
             <div key={message.id} className={`message ${message.role}`}>
               {message.role === "assistant" && <div className="message-avatar"><Sparkles size={14} /></div>}
               <div className="message-body">
-                {message.context && <div className="context-quote"><span>引用选区</span>{message.context.slice(0, 180)}{message.context.length > 180 ? "…" : ""}</div>}
                 {message.role === "assistant" ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown> : <p>{message.content}</p>}
                 {message.role === "assistant" && <div className="message-tools"><button aria-label="复制回答" onClick={() => navigator.clipboard.writeText(message.content)}><Copy size={13} /></button><button aria-label="有帮助"><Check size={13} /></button></div>}
               </div>
@@ -429,10 +605,10 @@ export default function Home() {
           {loading && <div className="message assistant"><div className="message-avatar"><Sparkles size={14} /></div><div className="thinking"><span /><span /><span /></div></div>}
         </div>
         <div className="composer-wrap">
-          {selectedText && <div className="composer-context"><span>选中的内容</span><p>{contextLabel}</p><button onClick={() => setSelectedText("")} aria-label="清除选区"><X size={14} /></button></div>}
+          <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? "解析中" : paperText ? "上下文已就绪" : "等待文字"}</small></div>
           <div className="composer">
-            <textarea value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question, selectedText || undefined); } }} placeholder="询问这篇论文…" rows={2} />
-            <div className="composer-bottom"><span>⌘ ↵</span><button onClick={() => sendQuestion(question, selectedText || undefined)} disabled={!question.trim() || loading} aria-label="发送"><Send size={16} /></button></div>
+            <textarea value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question); } }} placeholder="询问整篇论文…" rows={2} />
+            <div className="composer-bottom"><span>⌘ ↵</span><button onClick={() => sendQuestion(question)} disabled={!question.trim() || loading || extractingText} aria-label="发送"><Send size={16} /></button></div>
           </div>
           <p className="ai-disclaimer">AI 可能会出错，请核对重要结论</p>
         </div>
@@ -440,11 +616,13 @@ export default function Home() {
 
       {selectionPos && (
         <div className="selection-menu" style={{ left: selectionPos.x, top: selectionPos.y }}>
-          <button onClick={() => selectionAction("translate")}><Languages size={15} />翻译</button>
-          <button onClick={() => selectionAction("explain")}><Sparkles size={15} />解释</button>
-          <button onClick={() => selectionAction("ask")}><MessageSquareText size={15} />提问</button>
+          <button onClick={() => createAnnotation("translate", "green")}><Languages size={15} />翻译</button>
+          <button onClick={() => createAnnotation("explain", "green")}><Sparkles size={15} />解释</button>
+          <button onClick={() => createAnnotation("ask", "green")}><MessageSquareText size={15} />提问</button>
+          <button onClick={() => setShowColors(!showColors)} className={showColors ? "active" : ""}><Palette size={15} />高亮</button>
           <span />
           <button className="menu-icon" aria-label="复制" onClick={async () => { await navigator.clipboard.writeText(selectedText); setCopied(true); setTimeout(() => setCopied(false), 1000); }}>{copied ? <Check size={15} /> : <Copy size={15} />}</button>
+          {showColors && <div className="color-picker" aria-label="选择高亮颜色">{(["yellow", "green", "blue", "rose"] as HighlightColor[]).map((color) => <button key={color} className={color} aria-label={`${color} 高亮`} onClick={() => createAnnotation("highlight", color)} />)}</div>}
         </div>
       )}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}

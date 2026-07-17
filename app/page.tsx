@@ -68,7 +68,7 @@ type Annotation = {
   cardOffsetX?: number;
   cardOffsetY?: number;
 };
-type SessionUser = { displayName: string; email: string; fullName: string | null; isGuest: boolean };
+type SessionUser = { displayName: string; email: string; fullName: string | null; isGuest: boolean; isLocal?: boolean };
 type PaperSourceKind = "remote" | "upload";
 type LibraryPaper = { id: string; title: string; meta: string; sourceKind: PaperSourceKind; pageCount: number; createdAt: string; updatedAt: string };
 
@@ -1030,7 +1030,7 @@ export default function Home() {
           <RailButton icon={<CircleHelp size={20} />} label="使用帮助" onClick={() => setToast("提示：先选中文字，再选择翻译或解释")} />
           <RailButton icon={<Settings size={20} />} label="设置" onClick={() => setSettingsOpen(true)} />
           <button className="avatar" aria-label="个人资料" onClick={() => setAccountOpen(!accountOpen)}>{(user?.displayName || user?.email || "W").slice(0, 1).toUpperCase()}</button>
-          {accountOpen && user && <div className="account-popover"><strong>{user.displayName}</strong><span>{user.isGuest ? "当前浏览器的游客空间" : user.email}</span><div className={`account-sync ${saveStatus}`}><Cloud size={13} />{saveStatus === "saving" ? "正在同步" : saveStatus === "error" ? "同步遇到问题" : "已同步到云端"}</div><a href="/api/auth/logout"><LogOut size={13} />退出登录</a></div>}
+          {accountOpen && user && <div className="account-popover"><strong>{user.displayName}</strong><span>{user.isLocal ? "本机私人资料库" : user.isGuest ? "当前浏览器的游客空间" : user.email}</span><div className={`account-sync ${saveStatus}`}><Cloud size={13} />{saveStatus === "saving" ? "正在保存" : saveStatus === "error" ? "保存遇到问题" : user.isLocal ? "已保存到本机" : "已同步到云端"}</div>{!user.isLocal && <a href="/api/auth/logout"><LogOut size={13} />退出登录</a>}</div>}
         </div>
       </aside>
 

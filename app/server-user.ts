@@ -1,12 +1,25 @@
+import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
 import { getDb } from "../db";
 import { users } from "../db/schema";
 import { getGuestSessionId } from "./guest-session";
 import { getSupabaseUser } from "./supabase-auth";
 
-export type AppUser = { id: string; email: string; displayName: string; fullName: string | null; isGuest: boolean };
+export type AppUser = { id: string; email: string; displayName: string; fullName: string | null; isGuest: boolean; isLocal?: boolean };
+
+function isLocalOnly() {
+  const runtime = env as any;
+  return String(runtime.LOCAL_ONLY || process.env.LOCAL_ONLY || "").toLowerCase() === "true";
+}
 
 export async function requireAppUser(): Promise<AppUser | null> {
+  if (isLocalOnly()) {
+    const db = getDb();
+    const id = "local:lumen-paper";
+    const email = "local@lumen.paper";
+    await db.insert(users).values({ id, email, displayName: "本地用户" }).onConflictDoNothing();
+    return { id, email, displayName: "本地用户", fullName: null, isGuest: false, isLocal: true };
+  }
   const authUser = await getSupabaseUser();
   const email = authUser?.email?.trim().toLowerCase();
   if (!authUser || !email) {

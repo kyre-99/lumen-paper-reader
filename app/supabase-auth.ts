@@ -30,10 +30,14 @@ export async function createSupabaseServerClient() {
 }
 
 export async function getSupabaseUser() {
-  const supabase = await createSupabaseServerClient();
-  const { data, error } = await supabase.auth.getUser();
-  if (error || !data.user?.email) return null;
-  return data.user;
+  try {
+    const supabase = await createSupabaseServerClient();
+    const { data, error } = await supabase.auth.getUser();
+    if (error || !data.user?.email) return null;
+    return data.user;
+  } catch {
+    return null;
+  }
 }
 
 export function requestOrigin(request: Request) {

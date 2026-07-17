@@ -1,4 +1,27 @@
-# vinext-starter
+# Lumen Paper
+
+## 本地版本
+
+```bash
+npm install
+npm run local
+```
+
+打开终端显示的本地地址即可使用。默认本地模式不需要 Supabase 或第三方账号登录。
+
+- 文库、解析文字、阅读位置、聊天、批注和 Prompt 设置保存在本地 SQLite（D1）中。
+- 上传的 PDF 保存在本地对象存储（R2）中。
+- 所有本地数据都位于项目的 `.wrangler/state/` 目录；该目录不会提交到 Git。
+- 删除 `.wrangler/state/` 会清空本地文库，请在删除或移动项目前先备份该目录。
+
+本地环境使用忽略提交的 `.dev.vars`：
+
+```env
+LOCAL_ONLY=true
+GUEST_SESSION_SECRET=仅供本地开发的至少32位随机字符串
+```
+
+## 技术结构
 
 A clean full-stack starter running on
 [vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and

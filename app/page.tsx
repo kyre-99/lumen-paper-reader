@@ -42,6 +42,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { DEFAULT_PROMPTS, type PromptConfig } from "./chat-prompts";
 
 type ChatMessage = { id: number; role: "user" | "assistant"; content: string };
 type ToolAction = "translate" | "explain" | "ask";
@@ -62,9 +63,14 @@ type Annotation = {
   draft: string;
   thread: ChatMessage[];
   pageNumber: number;
+  pinOffsetX?: number;
+  pinOffsetY?: number;
+  cardOffsetX?: number;
+  cardOffsetY?: number;
 };
 type SessionUser = { displayName: string; email: string; fullName: string | null; isGuest: boolean };
 type PaperSourceKind = "remote" | "upload";
+type LibraryPaper = { id: string; title: string; meta: string; sourceKind: PaperSourceKind; pageCount: number; createdAt: string; updatedAt: string };
 
 const demoParagraphs = [
   {
@@ -335,29 +341,83 @@ function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => voi
   );
 }
 
-function SettingsModal({ onClose, config, setConfig }: { onClose: () => void; config: ApiConfig; setConfig: (v: ApiConfig) => void }) {
+function LibraryModal({ onClose, papers, loading, activePaperId, onOpenPaper, onAddPaper }: { onClose: () => void; papers: LibraryPaper[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void }) {
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="modal-card library-card" role="dialog" aria-modal="true" aria-labelledby="library-title">
+        <button className="icon-button modal-close" onClick={onClose} aria-label="关闭"><X size={18} /></button>
+        <div className="settings-heading"><div className="modal-icon"><Library size={23} /></div><div><h2 id="library-title">我的文库</h2><p>论文、阅读位置、对话和原文批注会分别保存。</p></div></div>
+        {loading ? <div className="library-loading"><LoaderCircle className="spin" size={18} />正在读取文库…</div> : papers.length ? (
+          <div className="library-list">
+            {papers.map((paper) => (
+              <button key={paper.id} className={`library-item ${paper.id === activePaperId ? "active" : ""}`} onClick={() => onOpenPaper(paper.id)}>
+                <span className="library-file"><FileText size={18} /></span>
+                <span className="library-copy"><strong>{paper.title}</strong><small>{paper.meta || `${paper.pageCount} 页`} · {new Date(paper.updatedAt).toLocaleDateString("zh-CN")}</small></span>
+                <span className="library-open">{paper.id === activePaperId ? "正在阅读" : "打开"}</span>
+              </button>
+            ))}
+          </div>
+        ) : <div className="library-empty"><Library size={28} /><strong>文库还是空的</strong><p>打开链接或上传 PDF 后会自动出现在这里。</p></div>}
+        <button className="primary-button wide" onClick={onAddPaper}><Plus size={16} />添加论文</button>
+      </div>
+    </div>
+  );
+}
+
+function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { onClose: () => void; config: ApiConfig; setConfig: (v: ApiConfig) => void; prompts: PromptConfig; setPrompts: (v: PromptConfig) => void }) {
   const presets = {
     OpenAI: { endpoint: "https://api.openai.com/v1/chat/completions", model: "gpt-4.1-mini" },
     DeepSeek: { endpoint: "https://api.deepseek.com/chat/completions", model: "deepseek-chat" },
     OpenRouter: { endpoint: "https://openrouter.ai/api/v1/chat/completions", model: "openai/gpt-4.1-mini" },
     Moonshot: { endpoint: "https://api.moonshot.cn/v1/chat/completions", model: "moonshot-v1-8k" },
   };
-  const [saved, setSaved] = useState(false);
+  const [tab, setTab] = useState<"model" | "prompts">("model");
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const saveSettings = async () => {
+    setSaveState("saving");
+    try {
+      sessionStorage.setItem("lumen-api-key", config.apiKey);
+      localStorage.setItem("lumen-api-config", JSON.stringify({ ...config, apiKey: "" }));
+      const response = await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompts }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "设置保存失败");
+      setPrompts(payload.prompts);
+      setSaveState("saved");
+      window.setTimeout(onClose, 650);
+    } catch { setSaveState("error"); }
+  };
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal-card settings-card" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <button className="icon-button modal-close" onClick={onClose} aria-label="关闭"><X size={18} /></button>
-        <div className="settings-heading"><div className="modal-icon"><Bot size={24} /></div><div><h2 id="settings-title">连接你的模型</h2><p>支持 OpenAI 兼容接口，密钥仅保存在当前会话。</p></div></div>
-        <div className="preset-row">
-          {Object.entries(presets).map(([name, value]) => (
-            <button key={name} className={config.provider === name ? "selected" : ""} onClick={() => setConfig({ ...config, provider: name, ...value })}>{name}</button>
-          ))}
+        <div className="settings-heading"><div className="modal-icon"><Bot size={24} /></div><div><h2 id="settings-title">AI 设置</h2><p>连接模型，并决定两处 AI 怎样回答你。</p></div></div>
+        <div className="settings-tabs">
+          <button className={tab === "model" ? "active" : ""} onClick={() => setTab("model")}>模型连接</button>
+          <button className={tab === "prompts" ? "active" : ""} onClick={() => setTab("prompts")}>回答规则</button>
         </div>
-        <label className="field-label">API 地址<input value={config.endpoint} onChange={(e) => setConfig({ ...config, endpoint: e.target.value })} /></label>
-        <label className="field-label">模型名称<input value={config.model} onChange={(e) => setConfig({ ...config, model: e.target.value })} /></label>
-        <label className="field-label">API Key<input type="password" value={config.apiKey} onChange={(e) => setConfig({ ...config, apiKey: e.target.value })} placeholder="sk-••••••••••••" /></label>
-        <button className="primary-button wide" onClick={() => { sessionStorage.setItem("lumen-api-key", config.apiKey); localStorage.setItem("lumen-api-config", JSON.stringify({ ...config, apiKey: "" })); setSaved(true); setTimeout(onClose, 650); }}>{saved ? <><Check size={17} />已保存</> : "保存连接"}</button>
-        <div className="privacy-note"><Check size={14} />请求直接经安全代理转发，不会记录你的密钥</div>
+        {tab === "model" ? <div className="settings-pane">
+          <div className="preset-row">
+            {Object.entries(presets).map(([name, value]) => (
+              <button key={name} className={config.provider === name ? "selected" : ""} onClick={() => setConfig({ ...config, provider: name, ...value })}>{name}</button>
+            ))}
+          </div>
+          <label className="field-label">API 地址<input value={config.endpoint} onChange={(e) => setConfig({ ...config, endpoint: e.target.value })} /></label>
+          <label className="field-label">模型名称<input value={config.model} onChange={(e) => setConfig({ ...config, model: e.target.value })} /></label>
+          <label className="field-label">API Key<input type="password" value={config.apiKey} onChange={(e) => setConfig({ ...config, apiKey: e.target.value })} placeholder="sk-••••••••••••" /></label>
+          <div className="settings-note"><Check size={14} />密钥只保存在当前浏览器会话中。</div>
+        </div> : <div className="settings-pane prompt-pane">
+          <div className="prompt-field">
+            <div><strong>全文对话</strong><span>对应右侧“全文 AI”的总结、方法分析和连续追问。</span><button onClick={() => setPrompts({ ...prompts, global: DEFAULT_PROMPTS.global })}>恢复默认</button></div>
+            <textarea value={prompts.global} onChange={(event) => setPrompts({ ...prompts, global: event.target.value })} />
+          </div>
+          <div className="prompt-field">
+            <div><strong>划词悬浮</strong><span>对应选中文字后的翻译、解释和悬浮框内追问。</span><button onClick={() => setPrompts({ ...prompts, inline: DEFAULT_PROMPTS.inline })}>恢复默认</button></div>
+            <textarea value={prompts.inline} onChange={(event) => setPrompts({ ...prompts, inline: event.target.value })} />
+          </div>
+          <div className="settings-note">可使用 <code>{"{{paperTitle}}"}</code> 代表当前论文标题；修改后会同步到你的账户。</div>
+        </div>}
+        {saveState === "error" && <div className="settings-error">保存失败，请稍后重试。</div>}
+        <button className="primary-button wide" onClick={saveSettings} disabled={saveState === "saving" || !prompts.global.trim() || !prompts.inline.trim()}>{saveState === "saving" ? <><LoaderCircle className="spin" size={16} />正在保存</> : saveState === "saved" ? <><Check size={17} />已保存</> : "保存设置"}</button>
       </div>
     </div>
   );
@@ -374,6 +434,9 @@ export default function Home() {
   const [saveStatus, setSaveStatus] = useState<"loading" | "saved" | "saving" | "error">("loading");
   const [hydrated, setHydrated] = useState(false);
   const [openModal, setOpenModal] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [libraryPapers, setLibraryPapers] = useState<LibraryPaper[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(true);
   const [source, setSource] = useState<string | Uint8Array | null>(null);
@@ -402,12 +465,14 @@ export default function Home() {
   const readerRef = useRef<HTMLDivElement>(null);
   const selectionRangeRef = useRef<Range | null>(null);
   const annotationRangesRef = useRef(new Map<number, { range: Range; color: HighlightColor; persistent: boolean }>());
+  const annotationAnchorsRef = useRef(new Map<number, { top: number; left: number }>());
   const activeRangeIdsRef = useRef(new Set<number>());
   const flashTimersRef = useRef(new Map<number, number>());
   const dragRef = useRef<{ id: number; target: "card" | "pin"; startX: number; startY: number; startLeft: number; startTop: number } | null>(null);
   const lastDraggedPinRef = useRef<number | null>(null);
   const restoringWorkspaceRef = useRef(false);
   const [config, setConfig] = useState<ApiConfig>({ provider: "OpenAI", endpoint: "https://api.openai.com/v1/chat/completions", model: "gpt-4.1-mini", apiKey: "" });
+  const [promptConfig, setPromptConfig] = useState<PromptConfig>(DEFAULT_PROMPTS);
   const [messages, setMessages] = useState<ChatMessage[]>([
     { id: 1, role: "assistant", content: "这里是**全文对话**。我会基于整篇论文回答总结、方法、实验与结论问题；局部翻译和解释会留在原文旁边。" },
   ]);
@@ -445,6 +510,11 @@ export default function Home() {
         const workspaceResponse = await fetch("/api/workspace", { cache: "no-store" });
         const workspacePayload = await workspaceResponse.json();
         if (!workspaceResponse.ok) throw new Error(workspacePayload.error || "无法读取同步数据");
+        const settingsResponse = await fetch("/api/settings", { cache: "no-store" });
+        if (settingsResponse.ok) {
+          const settingsPayload = await settingsResponse.json();
+          if (settingsPayload?.prompts?.global && settingsPayload?.prompts?.inline) setPromptConfig(settingsPayload.prompts);
+        }
         const workspace = workspacePayload.workspace;
         if (workspace?.paper) {
           restoringWorkspaceRef.current = true;
@@ -497,7 +567,7 @@ export default function Home() {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey, model: config.model, paperTitle, question: text, paperContext: paperText, mode: "global", history: messages.slice(-6) }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey, model: config.model, paperTitle, question: text, paperContext: paperText, mode: "global", history: messages.slice(-10), systemPrompts: promptConfig }),
         });
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || "模型请求失败");
@@ -510,7 +580,7 @@ export default function Home() {
     } catch (error: any) {
       setMessages((old) => [...old, { id: Date.now() + 1, role: "assistant", content: `连接模型时遇到问题：${error?.message || "请检查 API 设置"}\n\n你可以在右上角的模型设置中检查接口地址与密钥。` }]);
     } finally { setLoading(false); }
-  }, [config, loading, messages, paperText, paperTitle]);
+  }, [config, loading, messages, paperText, paperTitle, promptConfig]);
 
   const refreshHighlights = useCallback((color: HighlightColor) => {
     if (!(CSS as any).highlights || !(window as any).Highlight) return;
@@ -570,8 +640,16 @@ export default function Home() {
       const maxLeft = reader.scrollLeft + Math.max(8, reader.clientWidth - 350);
       const minTop = reader.scrollTop + 8;
       const maxTop = reader.scrollTop + Math.max(8, reader.clientHeight - 110);
-      if (drag.target === "card") updateAnnotation(drag.id, { cardLeft: Math.min(maxLeft, Math.max(minLeft, nextLeft)), cardTop: Math.min(maxTop, Math.max(minTop, nextTop)) });
-      else updateAnnotation(drag.id, { left: Math.min(reader.scrollLeft + reader.clientWidth - 30, Math.max(reader.scrollLeft + 4, nextLeft)), top: Math.min(reader.scrollTop + reader.clientHeight - 20, Math.max(reader.scrollTop + 12, nextTop)) });
+      const anchor = annotationAnchorsRef.current.get(drag.id);
+      if (drag.target === "card") {
+        const cardLeft = Math.min(maxLeft, Math.max(minLeft, nextLeft));
+        const cardTop = Math.min(maxTop, Math.max(minTop, nextTop));
+        updateAnnotation(drag.id, { cardLeft, cardTop, ...(anchor ? { cardOffsetX: cardLeft - anchor.left, cardOffsetY: cardTop - anchor.top } : {}) });
+      } else {
+        const left = Math.min(reader.scrollLeft + reader.clientWidth - 30, Math.max(reader.scrollLeft + 4, nextLeft));
+        const top = Math.min(reader.scrollTop + reader.clientHeight - 20, Math.max(reader.scrollTop + 12, nextTop));
+        updateAnnotation(drag.id, { left, top, ...(anchor ? { pinOffsetX: left - anchor.left, pinOffsetY: top - anchor.top } : {}) });
+      }
     };
     const end = () => { dragRef.current = null; setDraggingId(null); window.setTimeout(() => { lastDraggedPinRef.current = null; }, 0); };
     window.addEventListener("pointermove", move);
@@ -591,7 +669,7 @@ export default function Home() {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline", history: history.slice(-8) }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline", history: history.slice(-10), systemPrompts: promptConfig }),
         });
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || "模型请求失败");
@@ -605,7 +683,7 @@ export default function Home() {
       const errorText = `连接模型时遇到问题：${error?.message || "请检查 API 设置"}`;
       updateAnnotation(id, { loading: false, result: errorText, thread: [...nextThread, { id: Date.now() + 1, role: "assistant", content: errorText }] });
     }
-  }, [config, paperTitle, updateAnnotation]);
+  }, [config, paperTitle, promptConfig, updateAnnotation]);
 
   const handleSelection = useCallback(() => {
     const selection = window.getSelection();
@@ -643,7 +721,8 @@ export default function Home() {
   const createAnnotation = useCallback((kind: ToolAction | "highlight", color: HighlightColor = "green") => {
     if (!selectedText || !selectionAnchor || !selectionRangeRef.current) return;
     const id = Date.now() + Math.floor(Math.random() * 1000);
-    const annotation: Annotation = { id, kind, color, text: selectedText, surrounding: selectionContext, ...selectionAnchor, open: kind !== "highlight", loading: false, result: "", draft: "", thread: [] };
+    const annotation: Annotation = { id, kind, color, text: selectedText, surrounding: selectionContext, ...selectionAnchor, pinOffsetX: 0, pinOffsetY: 0, cardOffsetX: selectionAnchor.cardLeft - selectionAnchor.left, cardOffsetY: selectionAnchor.cardTop - selectionAnchor.top, open: kind !== "highlight", loading: false, result: "", draft: "", thread: [] };
+    annotationAnchorsRef.current.set(id, { top: selectionAnchor.top, left: selectionAnchor.left });
     addAnnotationRange(id, selectionRangeRef.current, color, kind === "highlight");
     setAnnotations((items) => [...items, annotation]);
     setSelectionPos(null);
@@ -663,6 +742,7 @@ export default function Home() {
     flashTimersRef.current.delete(id);
     activeRangeIdsRef.current.delete(id);
     annotationRangesRef.current.delete(id);
+    annotationAnchorsRef.current.delete(id);
     if (stored) refreshHighlights(stored.color);
     setAnnotations((items) => items.filter((item) => item.id !== id));
   }, [refreshHighlights]);
@@ -683,7 +763,8 @@ export default function Home() {
     const visibleRight = reader.scrollLeft + reader.clientWidth;
     const cardLeft = annotation.left + 358 > visibleRight ? Math.max(reader.scrollLeft + 14, annotation.left - 360) : annotation.left + 15;
     const cardTop = Math.max(reader.scrollTop + 8, Math.min(reader.scrollTop + reader.clientHeight - 110, annotation.top + 15));
-    updateAnnotation(annotation.id, { open: true, cardLeft, cardTop });
+    const anchor = annotationAnchorsRef.current.get(annotation.id) || { top: annotation.top - (annotation.pinOffsetY || 0), left: annotation.left - (annotation.pinOffsetX || 0) };
+    updateAnnotation(annotation.id, { open: true, cardLeft, cardTop, cardOffsetX: cardLeft - anchor.left, cardOffsetY: cardTop - anchor.top });
     flashAnnotationRange(annotation.id);
   }, [flashAnnotationRange, updateAnnotation]);
 
@@ -692,31 +773,86 @@ export default function Home() {
     flashTimersRef.current.clear();
     activeRangeIdsRef.current.clear();
     annotationRangesRef.current.clear();
+    annotationAnchorsRef.current.clear();
     if ((CSS as any).highlights) (["yellow", "green", "blue", "rose"] as HighlightColor[]).forEach((color) => (CSS as any).highlights.delete(`lumen-${color}`));
     setAnnotations([]);
     setSelectedText("");
     setSelectionPos(null);
   }, []);
 
+  const realignAnnotations = useCallback(() => {
+    const reader = readerRef.current;
+    if (!reader || dragRef.current) return;
+    const readerRect = reader.getBoundingClientRect();
+    setAnnotations((items) => {
+      let changed = false;
+      const next = items.map((annotation) => {
+        const stored = annotationRangesRef.current.get(annotation.id);
+        if (!stored || !stored.range.commonAncestorContainer.isConnected) return annotation;
+        const rangeRects = Array.from(stored.range.getClientRects()).filter((rect) => rect.width > .5 && rect.height > 2);
+        const rect = rangeRects[rangeRects.length - 1] || stored.range.getBoundingClientRect();
+        if (!rect.width && !rect.height) return annotation;
+        const node = stored.range.commonAncestorContainer.nodeType === Node.TEXT_NODE ? stored.range.commonAncestorContainer.parentElement : stored.range.commonAncestorContainer as HTMLElement;
+        const pageRect = node?.closest?.(".pdf-page, .demo-paper")?.getBoundingClientRect();
+        const anchor = {
+          left: Math.min(rect.right, pageRect?.right || rect.right) - readerRect.left + reader.scrollLeft + 7,
+          top: rect.top - readerRect.top + reader.scrollTop + Math.min(rect.height / 2, 18),
+        };
+        const previousAnchor = annotationAnchorsRef.current.get(annotation.id);
+        const pinOffsetX = annotation.pinOffsetX ?? (previousAnchor ? annotation.left - previousAnchor.left : 0);
+        const pinOffsetY = annotation.pinOffsetY ?? (previousAnchor ? annotation.top - previousAnchor.top : 0);
+        const cardOffsetX = annotation.cardOffsetX ?? (previousAnchor ? annotation.cardLeft - previousAnchor.left : annotation.cardLeft - annotation.left);
+        const cardOffsetY = annotation.cardOffsetY ?? (previousAnchor ? annotation.cardTop - previousAnchor.top : annotation.cardTop - annotation.top);
+        const left = anchor.left + pinOffsetX;
+        const top = anchor.top + pinOffsetY;
+        const cardLeft = Math.min(reader.scrollLeft + Math.max(8, reader.clientWidth - 350), Math.max(reader.scrollLeft + 8, anchor.left + cardOffsetX));
+        const cardTop = Math.min(reader.scrollTop + Math.max(8, reader.clientHeight - 110), Math.max(reader.scrollTop + 8, anchor.top + cardOffsetY));
+        annotationAnchorsRef.current.set(annotation.id, anchor);
+        if (Math.abs(left - annotation.left) < .5 && Math.abs(top - annotation.top) < .5 && Math.abs(cardLeft - annotation.cardLeft) < .5 && Math.abs(cardTop - annotation.cardTop) < .5 && annotation.pinOffsetX !== undefined) return annotation;
+        changed = true;
+        return { ...annotation, left, top, cardLeft, cardTop, pinOffsetX, pinOffsetY, cardOffsetX: cardLeft - anchor.left, cardOffsetY: cardTop - anchor.top };
+      });
+      return changed ? next : items;
+    });
+  }, []);
+
+  useEffect(() => {
+    const reader = readerRef.current;
+    if (!reader) return;
+    let frame = 0;
+    const schedule = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(realignAnnotations);
+    };
+    const observer = new ResizeObserver(schedule);
+    observer.observe(reader);
+    window.addEventListener("resize", schedule);
+    schedule();
+    return () => { observer.disconnect(); window.removeEventListener("resize", schedule); window.cancelAnimationFrame(frame); };
+  }, [realignAnnotations, rightOpen, source, zoom]);
+
   useEffect(() => {
     const reader = readerRef.current;
     if (!reader || !annotations.length) return;
     const restoreRanges = () => {
       for (const annotation of annotations) {
-        if (annotationRangesRef.current.has(annotation.id)) continue;
+        const existing = annotationRangesRef.current.get(annotation.id);
+        if (existing?.range.commonAncestorContainer.isConnected) continue;
+        if (existing) annotationRangesRef.current.delete(annotation.id);
         const page = reader.querySelector(`[data-page-number="${annotation.pageNumber || 1}"]`);
         const textRoot = page?.querySelector(".textLayer") || page;
         if (!textRoot) continue;
         const range = findTextRange(textRoot, annotation.text);
         if (range) addAnnotationRange(annotation.id, range, annotation.color, annotation.kind === "highlight");
       }
+      window.requestAnimationFrame(realignAnnotations);
     };
     restoreRanges();
     const observer = new MutationObserver(restoreRanges);
     observer.observe(reader, { childList: true, subtree: true });
     const timer = window.setTimeout(() => observer.disconnect(), 15000);
     return () => { observer.disconnect(); window.clearTimeout(timer); };
-  }, [addAnnotationRange, annotations, source]);
+  }, [addAnnotationRange, annotations, realignAnnotations, source]);
 
   useEffect(() => {
     if (!hydrated || !user || !paperId || !paperSourceKind) return;
@@ -751,6 +887,51 @@ export default function Home() {
     }, 900);
     return () => window.clearTimeout(timer);
   }, [annotations, currentPage, hydrated, messages, pageCount, paperId, paperMeta, paperSourceKind, paperSourceUrl, paperText, paperTitle, rightOpen, user, zoom]);
+
+  const showLibrary = useCallback(async () => {
+    setLibraryOpen(true);
+    setLibraryLoading(true);
+    try {
+      const response = await fetch("/api/papers", { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "无法读取文库");
+      setLibraryPapers(Array.isArray(payload.papers) ? payload.papers : []);
+    } catch (error: any) {
+      setToast(error?.message || "文库载入失败");
+    } finally { setLibraryLoading(false); }
+  }, []);
+
+  const openLibraryPaper = useCallback(async (id: string) => {
+    if (id === paperId) { setLibraryOpen(false); return; }
+    setLibraryLoading(true);
+    try {
+      const response = await fetch(`/api/workspace?paperId=${encodeURIComponent(id)}`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok || !payload.workspace?.paper) throw new Error(payload.error || "论文记录不存在");
+      const workspace = payload.workspace;
+      const paper = workspace.paper;
+      restoringWorkspaceRef.current = true;
+      clearPaperAnnotations();
+      setPaperId(paper.id);
+      setPaperSourceKind(paper.sourceKind);
+      setPaperSourceUrl(paper.sourceUrl || null);
+      setPaperTitle(paper.title);
+      setPaperMeta(paper.meta);
+      setPaperText(paper.paperText || "");
+      setPageCount(paper.pageCount || 1);
+      setCurrentPage(workspace.currentPage || 1);
+      setZoom(workspace.zoom || 0.88);
+      setRightOpen(workspace.rightOpen !== false);
+      setMessages(Array.isArray(workspace.messages) && workspace.messages.length ? workspace.messages : [{ id: Date.now(), role: "assistant", content: "这篇论文已经打开，可以继续提问。" }]);
+      setAnnotations((Array.isArray(workspace.annotations) ? workspace.annotations : []).map((item: Annotation) => ({ ...item, loading: false, draft: "", thread: Array.isArray(item.thread) ? item.thread : [], pageNumber: item.pageNumber || 1 })));
+      setSource(paper.sourceKind === "upload" ? `/api/papers/${paper.id}/file` : `/api/pdf?url=${encodeURIComponent(paper.sourceUrl)}`);
+      setExtractingText(!paper.paperText);
+      setLibraryOpen(false);
+      setToast("已恢复论文的阅读位置、对话和批注");
+    } catch (error: any) {
+      setToast(error?.message || "论文打开失败");
+    } finally { setLibraryLoading(false); }
+  }, [clearPaperAnnotations, paperId]);
 
   const openUrl = (raw: string) => {
     const normalized = normalizePaperUrl(raw);
@@ -842,9 +1023,8 @@ export default function Home() {
         <BrandMark />
         <nav className="rail-nav">
           <RailButton icon={<BookOpen size={20} />} label="阅读器" active />
-          <RailButton icon={<Library size={20} />} label="我的文库" onClick={() => setToast("当前论文、聊天与批注已自动同步")} />
+          <RailButton icon={<Library size={20} />} label="我的文库" onClick={showLibrary} />
           <RailButton icon={<Search size={20} />} label="探索论文" onClick={() => setOpenModal(true)} />
-          <RailButton icon={<Highlighter size={20} />} label="批注" onClick={() => setToast("选中文字即可开始批注")} />
         </nav>
         <div className="rail-bottom">
           <RailButton icon={<CircleHelp size={20} />} label="使用帮助" onClick={() => setToast("提示：先选中文字，再选择翻译或解释")} />
@@ -969,7 +1149,8 @@ export default function Home() {
         </div>
       )}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
-      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} />}
+      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} />}
+      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} />}
       {toast && <div className="toast"><Check size={15} />{toast}</div>}
       {!authReady && <div className="auth-gate"><div className="auth-card"><BrandMark /><LoaderCircle className="spin" size={22} /><h2>正在确认登录状态</h2><p>正在安全地读取你的论文空间…</p></div></div>}
       {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>开始使用 Lumen Paper</h2><p>暂时不配置登录也没关系，可以先用游客身份继续阅读和测试。</p><button className="primary-button wide auth-guest" onClick={startGuestSession} disabled={guestSubmitting}>{guestSubmitting ? <><LoaderCircle className="spin" size={15} />正在创建游客空间</> : "游客试用"}</button><div className="auth-divider"><span>以后再登录</span></div><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a>{authMessage && <div className="auth-message">{authMessage}</div>}<small>游客数据只绑定当前浏览器；清除 Cookie 后无法恢复，也不能跨设备同步。</small></div></div>}

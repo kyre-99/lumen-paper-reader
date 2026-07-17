@@ -34,3 +34,21 @@ export const readerStates = sqliteTable("reader_states", {
   annotationsJson: text("annotations_json").notNull().default("[]"),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
+
+export const paperStates = sqliteTable("paper_states", {
+  paperId: text("paper_id").primaryKey().references(() => papers.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  currentPage: integer("current_page").notNull().default(1),
+  zoom: real("zoom").notNull().default(0.88),
+  rightOpen: integer("right_open", { mode: "boolean" }).notNull().default(true),
+  messagesJson: text("messages_json").notNull().default("[]"),
+  annotationsJson: text("annotations_json").notNull().default("[]"),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});
+
+export const userSettings = sqliteTable("user_settings", {
+  userId: text("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+  globalSystemPrompt: text("global_system_prompt").notNull().default(""),
+  inlineSystemPrompt: text("inline_system_prompt").notNull().default(""),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});

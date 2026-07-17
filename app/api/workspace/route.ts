@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { requireAppUser } from "../../server-user";
 import { getDb } from "../../../db";
-import { papers, readerStates } from "../../../db/schema";
+import { papers, paperStates, readerStates } from "../../../db/schema";
 
 function parseArray(value: string) {
   try {
@@ -16,21 +16,24 @@ async function requireApiUser() {
   return requireAppUser();
 }
 
-export async function GET() {
+export async function GET(request: Request) {
   const user = await requireApiUser();
   if (!user) return Response.json({ error: "需要登录" }, { status: 401 });
 
   const db = getDb();
   const [state] = await db.select().from(readerStates).where(eq(readerStates.userId, user.id)).limit(1);
-  if (!state) return Response.json({ workspace: null });
+  const requestedPaperId = new URL(request.url).searchParams.get("paperId");
+  const activePaperId = requestedPaperId || state?.activePaperId || null;
+  if (!activePaperId) return Response.json({ workspace: null });
 
-  const [paper] = state.activePaperId
-    ? await db.select().from(papers).where(and(eq(papers.id, state.activePaperId), eq(papers.userId, user.id))).limit(1)
-    : [];
+  const [paper] = await db.select().from(papers).where(and(eq(papers.id, activePaperId), eq(papers.userId, user.id))).limit(1);
+  if (!paper) return Response.json({ workspace: null });
+  const [paperState] = await db.select().from(paperStates).where(and(eq(paperStates.paperId, paper.id), eq(paperStates.userId, user.id))).limit(1);
+  const restoredState = paperState || (state?.activePaperId === paper.id ? state : null);
 
   return Response.json({
     workspace: {
-      paper: paper ? {
+      paper: {
         id: paper.id,
         title: paper.title,
         meta: paper.meta,
@@ -38,13 +41,13 @@ export async function GET() {
         sourceUrl: paper.sourceUrl,
         paperText: paper.paperText,
         pageCount: paper.pageCount,
-      } : null,
-      currentPage: state.currentPage,
-      zoom: state.zoom,
-      rightOpen: state.rightOpen,
-      messages: parseArray(state.messagesJson),
-      annotations: parseArray(state.annotationsJson),
-      updatedAt: state.updatedAt,
+      },
+      currentPage: restoredState?.currentPage || 1,
+      zoom: restoredState?.zoom || 0.88,
+      rightOpen: restoredState?.rightOpen !== false,
+      messages: parseArray(restoredState?.messagesJson || "[]"),
+      annotations: parseArray(restoredState?.annotationsJson || "[]"),
+      updatedAt: restoredState?.updatedAt || paper.updatedAt,
     },
   });
 }
@@ -101,5 +104,18 @@ export async function PUT(request: Request) {
     updatedAt: new Date().toISOString(),
   };
   await db.insert(readerStates).values(stateValues).onConflictDoUpdate({ target: readerStates.userId, set: stateValues });
+  if (activePaperId) {
+    const paperStateValues = {
+      paperId: activePaperId,
+      userId: user.id,
+      currentPage: stateValues.currentPage,
+      zoom: stateValues.zoom,
+      rightOpen: stateValues.rightOpen,
+      messagesJson,
+      annotationsJson,
+      updatedAt: stateValues.updatedAt,
+    };
+    await db.insert(paperStates).values(paperStateValues).onConflictDoUpdate({ target: paperStates.paperId, set: paperStateValues });
+  }
   return Response.json({ saved: true, updatedAt: stateValues.updatedAt });
 }

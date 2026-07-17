@@ -15,6 +15,13 @@
       "when": 1784270436325,
       "tag": "0001_public_scorpion",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1784276669874,
+      "tag": "0002_rare_madelyne_pryor",
+      "breakpoints": true
     }
   ]
 }

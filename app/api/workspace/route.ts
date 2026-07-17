@@ -12,6 +12,17 @@ function parseArray(value: string) {
   }
 }
 
+function persistentAnnotations(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item) => {
+    if (!item || typeof item !== "object") return false;
+    const annotation = item as { kind?: unknown; thread?: unknown };
+    if (annotation.kind !== "translate") return true;
+    if (!Array.isArray(annotation.thread)) return false;
+    return annotation.thread.filter((message) => message && typeof message === "object" && (message as { role?: unknown }).role === "user").length > 1;
+  });
+}
+
 async function requireApiUser() {
   return requireAppUser();
 }
@@ -46,7 +57,7 @@ export async function GET(request: Request) {
       zoom: restoredState?.zoom || 0.88,
       rightOpen: restoredState?.rightOpen !== false,
       messages: parseArray(restoredState?.messagesJson || "[]"),
-      annotations: parseArray(restoredState?.annotationsJson || "[]"),
+      annotations: persistentAnnotations(parseArray(restoredState?.annotationsJson || "[]")),
       updatedAt: restoredState?.updatedAt || paper.updatedAt,
     },
   });
@@ -87,7 +98,7 @@ export async function PUT(request: Request) {
   }
 
   const messages = Array.isArray(payload.messages) ? payload.messages.slice(-120) : [];
-  const annotations = Array.isArray(payload.annotations) ? payload.annotations.slice(-300) : [];
+  const annotations = persistentAnnotations(payload.annotations).slice(-300);
   const messagesJson = JSON.stringify(messages);
   const annotationsJson = JSON.stringify(annotations);
   if (messagesJson.length > 500000 || annotationsJson.length > 750000) {

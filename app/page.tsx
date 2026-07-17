@@ -70,7 +70,8 @@ type Annotation = {
 };
 type SessionUser = { displayName: string; email: string; fullName: string | null; isGuest: boolean; isLocal?: boolean };
 type PaperSourceKind = "remote" | "upload";
-type LibraryPaper = { id: string; title: string; meta: string; sourceKind: PaperSourceKind; pageCount: number; createdAt: string; updatedAt: string };
+type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; sourceKind: PaperSourceKind; pageCount: number; createdAt: string; updatedAt: string };
+type LibraryFolder = { id: string; name: string; createdAt?: string; updatedAt: string };
 
 const demoParagraphs = [
   {
@@ -95,6 +96,28 @@ function normalizePaperUrl(raw: string) {
   const arxiv = trimmed.match(/arxiv\.org\/(?:abs|html|pdf)\/([^?#/]+)/i);
   if (arxiv) return `https://arxiv.org/pdf/${arxiv[1]}`;
   return trimmed;
+}
+
+function normalizedDocumentTitle(raw: unknown) {
+  const title = String(raw || "").replace(/[\u0000-\u001f]+/g, " ").replace(/\s+/g, " ").trim();
+  if (title.length < 5 || title.length > 300) return "";
+  if (/^(untitled|document|paper|microsoft word|arxiv:?\s*[\d.]+)$/i.test(title)) return "";
+  return title.replace(/\.pdf$/i, "").trim();
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
+function titleFromFirstPage(text: string) {
+  const firstPage = text.split(/--- PAGE 2 ---/)[0]?.replace(/--- PAGE 1 ---/, "") || "";
+  const lines = firstPage.split("\n").map(normalizedDocumentTitle).filter(Boolean).slice(0, 24);
+  return lines.find((line) => line.length >= 12 && !/^(arxiv|doi|https?:|www\.|abstract|introduction|proceedings|preprint)/i.test(line) && !line.includes("@")) || "";
+}
+
+function shouldPersistAnnotation(annotation: Annotation) {
+  if (annotation.kind !== "translate") return true;
+  return annotation.thread.filter((message) => message.role === "user").length > 1;
 }
 
 function trimRangeToText(input: Range) {
@@ -279,7 +302,7 @@ function PdfPage({ pdf, pageNumber, zoom }: { pdf: any; pageNumber: number; zoom
   );
 }
 
-function PdfDocument({ source, zoom, onReady, onTextExtracted, onError }: { source: string | Uint8Array; zoom: number; onReady: (pages: number) => void; onTextExtracted: (text: string) => void; onError: (message: string) => void }) {
+function PdfDocument({ source, zoom, onReady, onMetadata, onTextExtracted, onError }: { source: string | Uint8Array; zoom: number; onReady: (pages: number) => void; onMetadata: (title: string) => void; onTextExtracted: (text: string) => void; onError: (message: string) => void }) {
   const [pdf, setPdf] = useState<any>(null);
 
   useEffect(() => {
@@ -294,14 +317,39 @@ function PdfDocument({ source, zoom, onReady, onTextExtracted, onError }: { sour
         setPdf(loaded);
         onReady(loaded.numPages);
         void (async () => {
+          const metadata = await loaded.getMetadata().catch(() => null) as { info?: { Title?: unknown }; metadata?: { get?: (key: string) => unknown } } | null;
+          const metadataTitle = normalizedDocumentTitle(metadata?.info?.Title || metadata?.metadata?.get?.("dc:title"));
+          if (metadataTitle && !cancelled) onMetadata(metadataTitle);
           const pageTexts: string[] = [];
           const limit = Math.min(loaded.numPages, 80);
           for (let pageNumber = 1; pageNumber <= limit && !cancelled; pageNumber++) {
             const page = await loaded.getPage(pageNumber);
             const content = await page.getTextContent();
-            pageTexts.push(`--- PAGE ${pageNumber} ---\n${content.items.map((item: any) => item.str || "").join(" ")}`);
+            const lines: string[] = [];
+            let currentLine: string[] = [];
+            let previousY: number | null = null;
+            for (const item of content.items as Array<{ str?: unknown; transform?: ArrayLike<number> }>) {
+              const value = String(item.str || "").trim();
+              if (!value) continue;
+              const y = Number(item.transform?.[5] || 0);
+              if (previousY !== null && Math.abs(y - previousY) > 2 && currentLine.length) {
+                lines.push(currentLine.join(" "));
+                currentLine = [];
+              }
+              currentLine.push(value);
+              previousY = y;
+            }
+            if (currentLine.length) lines.push(currentLine.join(" "));
+            pageTexts.push(`--- PAGE ${pageNumber} ---\n${lines.join("\n")}`);
           }
-          if (!cancelled) onTextExtracted(pageTexts.join("\n\n").slice(0, 120000));
+          if (!cancelled) {
+            const extracted = pageTexts.join("\n\n").slice(0, 120000);
+            if (!metadataTitle) {
+              const extractedTitle = titleFromFirstPage(extracted);
+              if (extractedTitle) onMetadata(extractedTitle);
+            }
+            onTextExtracted(extracted);
+          }
         })().catch(() => !cancelled && onTextExtracted(""));
       }
     })().catch((error) => !cancelled && onError(error?.message || "PDF 加载失败"));
@@ -309,7 +357,7 @@ function PdfDocument({ source, zoom, onReady, onTextExtracted, onError }: { sour
       cancelled = true;
       task?.destroy?.();
     };
-  }, [source, onReady, onTextExtracted, onError]);
+  }, [source, onReady, onMetadata, onTextExtracted, onError]);
 
   if (!pdf) {
     return <div className="pdf-loading"><LoaderCircle className="spin" size={22} /><span>正在解析论文版面…</span></div>;
@@ -341,23 +389,62 @@ function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => voi
   );
 }
 
-function LibraryModal({ onClose, papers, loading, activePaperId, onOpenPaper, onAddPaper }: { onClose: () => void; papers: LibraryPaper[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void }) {
+function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpenPaper, onAddPaper, onCreateFolder, onMovePaper }: { onClose: () => void; papers: LibraryPaper[]; folders: LibraryFolder[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void; onCreateFolder: (name: string) => Promise<LibraryFolder | null>; onMovePaper: (paperId: string, folderId: string | null) => Promise<boolean> }) {
+  const [activeFolder, setActiveFolder] = useState("all");
+  const [creatingFolder, setCreatingFolder] = useState(false);
+  const [folderName, setFolderName] = useState("");
+  const [folderSaving, setFolderSaving] = useState(false);
+  const visiblePapers = activeFolder === "all" ? papers : activeFolder === "unfiled" ? papers.filter((paper) => !paper.folderId) : papers.filter((paper) => paper.folderId === activeFolder);
+  const activeFolderName = activeFolder === "all" ? "全部论文" : activeFolder === "unfiled" ? "未分类" : folders.find((folder) => folder.id === activeFolder)?.name || "文件夹";
+  const createFolder = async () => {
+    const name = folderName.trim();
+    if (!name || folderSaving) return;
+    setFolderSaving(true);
+    const folder = await onCreateFolder(name);
+    setFolderSaving(false);
+    if (folder) {
+      setFolderName("");
+      setCreatingFolder(false);
+      setActiveFolder(folder.id);
+    }
+  };
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div className="modal-card library-card" role="dialog" aria-modal="true" aria-labelledby="library-title">
         <button className="icon-button modal-close" onClick={onClose} aria-label="关闭"><X size={18} /></button>
-        <div className="settings-heading"><div className="modal-icon"><Library size={23} /></div><div><h2 id="library-title">我的文库</h2><p>论文、阅读位置、对话和原文批注会分别保存。</p></div></div>
-        {loading ? <div className="library-loading"><LoaderCircle className="spin" size={18} />正在读取文库…</div> : papers.length ? (
-          <div className="library-list">
-            {papers.map((paper) => (
-              <button key={paper.id} className={`library-item ${paper.id === activePaperId ? "active" : ""}`} onClick={() => onOpenPaper(paper.id)}>
-                <span className="library-file"><FileText size={18} /></span>
-                <span className="library-copy"><strong>{paper.title}</strong><small>{paper.meta || `${paper.pageCount} 页`} · {new Date(paper.updatedAt).toLocaleDateString("zh-CN")}</small></span>
-                <span className="library-open">{paper.id === activePaperId ? "正在阅读" : "打开"}</span>
-              </button>
-            ))}
-          </div>
-        ) : <div className="library-empty"><Library size={28} /><strong>文库还是空的</strong><p>打开链接或上传 PDF 后会自动出现在这里。</p></div>}
+        <div className="settings-heading"><div className="modal-icon"><Library size={23} /></div><div><h2 id="library-title">我的文库</h2><p>每篇论文的阅读位置、全文对话和提问批注都会独立保存。</p></div></div>
+        <div className="library-browser">
+          <aside className="library-folders" aria-label="论文文件夹">
+            <button className={activeFolder === "all" ? "active" : ""} onClick={() => setActiveFolder("all")}><Library size={15} /><span>全部论文</span><small>{papers.length}</small></button>
+            <button className={activeFolder === "unfiled" ? "active" : ""} onClick={() => setActiveFolder("unfiled")}><FolderOpen size={15} /><span>未分类</span><small>{papers.filter((paper) => !paper.folderId).length}</small></button>
+            <div className="folder-divider" />
+            {folders.map((folder) => <button key={folder.id} className={activeFolder === folder.id ? "active" : ""} onClick={() => setActiveFolder(folder.id)}><FolderOpen size={15} /><span>{folder.name}</span><small>{papers.filter((paper) => paper.folderId === folder.id).length}</small></button>)}
+            {creatingFolder ? <div className="new-folder-row"><input value={folderName} onChange={(event) => setFolderName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createFolder(); if (event.key === "Escape") setCreatingFolder(false); }} placeholder="文件夹名称" autoFocus /><button onClick={() => void createFolder()} disabled={!folderName.trim() || folderSaving} aria-label="创建文件夹">{folderSaving ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}</button></div> : <button className="new-folder-button" onClick={() => setCreatingFolder(true)}><Plus size={14} /><span>新建文件夹</span></button>}
+          </aside>
+          <section className="library-content">
+            <div className="library-content-title"><strong>{activeFolderName}</strong><span>{visiblePapers.length} 篇</span></div>
+            {loading ? <div className="library-loading"><LoaderCircle className="spin" size={18} />正在读取文库…</div> : visiblePapers.length ? (
+              <div className="library-list">
+                {visiblePapers.map((paper) => (
+                  <div key={paper.id} className={`library-item ${paper.id === activePaperId ? "active" : ""}`}>
+                    <button className="library-paper-button" onClick={() => onOpenPaper(paper.id)}>
+                      <span className="library-file"><FileText size={18} /></span>
+                      <span className="library-copy"><strong>{paper.title}</strong><small>{paper.meta || `${paper.pageCount} 页`} · {new Date(paper.updatedAt).toLocaleDateString("zh-CN")}</small></span>
+                      <span className="library-open">{paper.id === activePaperId ? "正在阅读" : "打开"}</span>
+                    </button>
+                    <label className="library-folder-select" title="移动到文件夹">
+                      <FolderOpen size={12} />
+                      <select aria-label={`移动《${paper.title}》到文件夹`} value={paper.folderId || ""} onChange={(event) => void onMovePaper(paper.id, event.target.value || null)}>
+                        <option value="">未分类</option>
+                        {folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                ))}
+              </div>
+            ) : <div className="library-empty"><FolderOpen size={28} /><strong>{papers.length ? "这个文件夹还是空的" : "文库还是空的"}</strong><p>{papers.length ? "可以从其他文件夹把论文移动到这里。" : "打开链接或上传 PDF 后会自动出现在这里。"}</p></div>}
+          </section>
+        </div>
         <button className="primary-button wide" onClick={onAddPaper}><Plus size={16} />添加论文</button>
       </div>
     </div>
@@ -450,6 +537,7 @@ export default function Home() {
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [libraryPapers, setLibraryPapers] = useState<LibraryPaper[]>([]);
+  const [libraryFolders, setLibraryFolders] = useState<LibraryFolder[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(true);
   const [source, setSource] = useState<string | Uint8Array | null>(null);
@@ -882,7 +970,7 @@ export default function Home() {
             zoom,
             rightOpen,
             messages,
-            annotations: annotations.map((annotation) => ({ ...annotation, loading: false, draft: "" })),
+            annotations: annotations.filter(shouldPersistAnnotation).map((annotation) => ({ ...annotation, loading: false, draft: "" })),
           }),
         });
         if (!response.ok) throw new Error("save failed");
@@ -902,9 +990,40 @@ export default function Home() {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "无法读取文库");
       setLibraryPapers(Array.isArray(payload.papers) ? payload.papers : []);
+      setLibraryFolders(Array.isArray(payload.folders) ? payload.folders : []);
     } catch (error: any) {
       setToast(error?.message || "文库载入失败");
     } finally { setLibraryLoading(false); }
+  }, []);
+
+  const createLibraryFolder = useCallback(async (name: string) => {
+    try {
+      const response = await fetch("/api/folders", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "文件夹创建失败");
+      const folder = payload.folder as LibraryFolder;
+      setLibraryFolders((folders) => [folder, ...folders]);
+      setToast(`已创建文件夹“${folder.name}”`);
+      return folder;
+    } catch (error: unknown) {
+      setToast(errorMessage(error, "文件夹创建失败"));
+      return null;
+    }
+  }, []);
+
+  const moveLibraryPaper = useCallback(async (id: string, folderId: string | null) => {
+    try {
+      const response = await fetch(`/api/papers/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ folderId }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "移动论文失败");
+      setLibraryPapers((papers) => papers.map((paper) => paper.id === id ? { ...paper, folderId, updatedAt: payload.paper?.updatedAt || paper.updatedAt } : paper));
+      setToast(folderId ? "论文已移入文件夹" : "论文已移到未分类");
+      return true;
+    } catch (error: unknown) {
+      setLibraryPapers((papers) => [...papers]);
+      setToast(errorMessage(error, "移动论文失败"));
+      return false;
+    }
   }, []);
 
   const openLibraryPaper = useCallback(async (id: string) => {
@@ -942,6 +1061,7 @@ export default function Home() {
   const openUrl = (raw: string) => {
     const normalized = normalizePaperUrl(raw);
     if (!/^https?:\/\//i.test(normalized)) { setToast("请输入有效的公开链接"); return; }
+    restoringWorkspaceRef.current = false;
     clearPaperAnnotations();
     setPaperId(crypto.randomUUID());
     setPaperSourceKind("remote");
@@ -950,7 +1070,8 @@ export default function Home() {
     setPaperText("");
     setSource(`/api/pdf?url=${encodeURIComponent(normalized)}`);
     const arxivId = normalized.match(/arxiv\.org\/pdf\/([^?#/]+)/i)?.[1];
-    setPaperTitle(arxivId ? `arXiv ${arxivId}` : "正在读取论文…");
+    const urlName = decodeURIComponent(new URL(normalized).pathname.split("/").filter(Boolean).pop() || "").replace(/\.pdf$/i, "");
+    setPaperTitle(arxivId ? `arXiv ${arxivId}` : normalizedDocumentTitle(urlName) || "正在读取论文…");
     setPaperMeta(`${new URL(normalized).hostname} · 真实 PDF`);
     setMessages([{ id: Date.now(), role: "assistant", content: "论文正在解析。文字提取完成后，我会在这里基于**全文上下文**回答问题。" }]);
     setOpenModal(false);
@@ -959,6 +1080,7 @@ export default function Home() {
 
   const openFile = async (file: File) => {
     if (!user) { setToast("请先登录再上传 PDF"); return; }
+    restoringWorkspaceRef.current = false;
     setExtractingText(true);
     setToast("正在保存并打开 PDF…");
     try {
@@ -988,8 +1110,17 @@ export default function Home() {
 
   const handlePdfReady = useCallback((pages: number) => {
     setPageCount(pages);
-    setPaperTitle((title) => title === "正在读取论文…" ? "已载入的研究论文" : title);
     setToast(`真实 PDF 已打开 · ${pages} 页`);
+  }, []);
+
+  const handlePaperMetadata = useCallback((title: string) => {
+    const normalized = normalizedDocumentTitle(title);
+    if (!normalized) return;
+    const restoring = restoringWorkspaceRef.current;
+    setPaperTitle((current) => {
+      const placeholder = /^arXiv\s+[\d.]+(?:v\d+)?$/i.test(current) || /^(正在读取论文|已载入的研究论文|未命名论文)/.test(current);
+      return !restoring || placeholder ? normalized : current;
+    });
   }, []);
 
   const handleTextExtracted = useCallback((text: string) => {
@@ -1067,7 +1198,7 @@ export default function Home() {
 
         <div className="reader-viewport" ref={readerRef} onMouseUp={handleSelection} onScroll={() => selectionPos && setSelectionPos(null)}>
           {source ? (
-            <PdfDocument source={source} zoom={zoom} onReady={handlePdfReady} onTextExtracted={handleTextExtracted} onError={handlePdfError} />
+            <PdfDocument source={source} zoom={zoom} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onTextExtracted={handleTextExtracted} onError={handlePdfError} />
           ) : <div style={{ transform: `scale(${zoom})`, transformOrigin: "top center" }}><DemoPaper /></div>}
           {annotations.map((annotation) => (
             <React.Fragment key={annotation.id}>
@@ -1087,7 +1218,7 @@ export default function Home() {
                     <div className="inline-card-title">
                       <MoreHorizontal className="drag-grip" size={15} />
                       <span>{annotation.kind === "translate" ? <Languages size={15} /> : annotation.kind === "explain" ? <Sparkles size={15} /> : annotation.kind === "ask" ? <MessageSquareText size={15} /> : <Highlighter size={15} />}</span>
-                      <div><strong>{annotation.kind === "translate" ? "局部翻译" : annotation.kind === "explain" ? "段落解释" : annotation.kind === "ask" ? "针对这段提问" : "高亮标记"}</strong><small>仅使用选区与相邻段落</small></div>
+                      <div><strong>{annotation.kind === "translate" ? "局部翻译" : annotation.kind === "explain" ? "段落解释" : annotation.kind === "ask" ? "针对这段提问" : "高亮标记"}</strong><small>{annotation.kind === "translate" && !shouldPersistAnnotation(annotation) ? "临时翻译 · 本次阅读显示" : "仅使用选区与相邻段落 · 自动保存"}</small></div>
                     </div>
                     <button onClick={() => closeAnnotation(annotation)} aria-label="收起批注"><X size={15} /></button>
                   </header>
@@ -1155,7 +1286,7 @@ export default function Home() {
         </div>
       )}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
-      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} />}
+      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} />}
       {toast && <div className="toast"><Check size={15} />{toast}</div>}
       {!authReady && <div className="auth-gate"><div className="auth-card"><BrandMark /><LoaderCircle className="spin" size={22} /><h2>正在确认登录状态</h2><p>正在安全地读取你的论文空间…</p></div></div>}

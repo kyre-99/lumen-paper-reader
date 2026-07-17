@@ -10,9 +10,18 @@ export const users = sqliteTable("users", {
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
 
+export const paperFolders = sqliteTable("paper_folders", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});
+
 export const papers = sqliteTable("papers", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  folderId: text("folder_id").references(() => paperFolders.id, { onDelete: "set null" }),
   title: text("title").notNull(),
   meta: text("meta").notNull().default(""),
   sourceKind: text("source_kind", { enum: ["remote", "upload"] }).notNull(),

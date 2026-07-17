@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getSupabaseUser } from "../../supabase-auth";
+import { requireAppUser } from "../../server-user";
 
 function selectRelevantContext(fullText: string, question: string) {
   const text = String(fullText || "");
@@ -23,7 +23,7 @@ function selectRelevantContext(fullText: string, question: string) {
 
 export async function POST(request: NextRequest) {
   try {
-    const user = await getSupabaseUser();
+    const user = await requireAppUser();
     if (!user) return NextResponse.json({ error: "需要登录" }, { status: 401 });
     const body = await request.json();
     const { endpoint, apiKey, model, paperTitle, question, paperContext = "", selectedText = "", surroundingContext = "", mode = "global", history = [] } = body;

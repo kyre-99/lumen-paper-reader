@@ -21,7 +21,6 @@ import {
   Link2,
   LoaderCircle,
   LogOut,
-  Mail,
   Maximize2,
   MessageSquareText,
   Minus,
@@ -64,7 +63,7 @@ type Annotation = {
   thread: ChatMessage[];
   pageNumber: number;
 };
-type SessionUser = { displayName: string; email: string; fullName: string | null };
+type SessionUser = { displayName: string; email: string; fullName: string | null; isGuest: boolean };
 type PaperSourceKind = "remote" | "upload";
 
 const demoParagraphs = [
@@ -354,11 +353,8 @@ type ApiConfig = { provider: string; endpoint: string; model: string; apiKey: st
 export default function Home() {
   const [user, setUser] = useState<SessionUser | null>(null);
   const [authReady, setAuthReady] = useState(false);
-  const [authEmail, setAuthEmail] = useState("");
-  const [authCode, setAuthCode] = useState("");
-  const [authStep, setAuthStep] = useState<"email" | "code">("email");
   const [authMessage, setAuthMessage] = useState("");
-  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [guestSubmitting, setGuestSubmitting] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
   const [saveStatus, setSaveStatus] = useState<"loading" | "saved" | "saving" | "error">("loading");
   const [hydrated, setHydrated] = useState(false);
@@ -808,37 +804,18 @@ export default function Home() {
     setSource(null);
   }, []);
 
-  const requestMagicLink = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (!authEmail.trim() || authSubmitting) return;
-    setAuthSubmitting(true);
+  const startGuestSession = async () => {
+    if (guestSubmitting) return;
+    setGuestSubmitting(true);
     setAuthMessage("");
     try {
-      const response = await fetch("/api/auth/email", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: authEmail }) });
+      const response = await fetch("/api/auth/guest", { method: "POST" });
       const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "发送失败");
-      setAuthStep("code");
-      setAuthMessage("验证码已发送，请查看邮箱。若未收到，请稍后再试，避免连续发送触发限额。");
-    } catch (error: any) {
-      setAuthMessage(error?.message || "发送失败，请稍后重试");
-    } finally {
-      setAuthSubmitting(false);
-    }
-  };
-
-  const verifyEmailCode = async (event: React.FormEvent) => {
-    event.preventDefault();
-    if (authCode.replace(/\D/g, "").length < 6 || authSubmitting) return;
-    setAuthSubmitting(true);
-    setAuthMessage("");
-    try {
-      const response = await fetch("/api/auth/email/verify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: authEmail, token: authCode }) });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "验证码无效");
+      if (!response.ok) throw new Error(payload.error || "暂时无法进入游客模式");
       window.location.assign("/");
     } catch (error: any) {
-      setAuthMessage(error?.message || "验证码无效或已过期");
-      setAuthSubmitting(false);
+      setAuthMessage(error?.message || "暂时无法进入游客模式");
+      setGuestSubmitting(false);
     }
   };
 
@@ -858,7 +835,7 @@ export default function Home() {
           <RailButton icon={<CircleHelp size={20} />} label="使用帮助" onClick={() => setToast("提示：先选中文字，再选择翻译或解释")} />
           <RailButton icon={<Settings size={20} />} label="设置" onClick={() => setSettingsOpen(true)} />
           <button className="avatar" aria-label="个人资料" onClick={() => setAccountOpen(!accountOpen)}>{(user?.displayName || user?.email || "W").slice(0, 1).toUpperCase()}</button>
-          {accountOpen && user && <div className="account-popover"><strong>{user.displayName}</strong><span>{user.email}</span><div className={`account-sync ${saveStatus}`}><Cloud size={13} />{saveStatus === "saving" ? "正在同步" : saveStatus === "error" ? "同步遇到问题" : "已同步到云端"}</div><a href="/api/auth/logout"><LogOut size={13} />退出登录</a></div>}
+          {accountOpen && user && <div className="account-popover"><strong>{user.displayName}</strong><span>{user.isGuest ? "当前浏览器的游客空间" : user.email}</span><div className={`account-sync ${saveStatus}`}><Cloud size={13} />{saveStatus === "saving" ? "正在同步" : saveStatus === "error" ? "同步遇到问题" : "已同步到云端"}</div><a href="/api/auth/logout"><LogOut size={13} />退出登录</a></div>}
         </div>
       </aside>
 
@@ -980,7 +957,7 @@ export default function Home() {
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} />}
       {toast && <div className="toast"><Check size={15} />{toast}</div>}
       {!authReady && <div className="auth-gate"><div className="auth-card"><BrandMark /><LoaderCircle className="spin" size={22} /><h2>正在确认登录状态</h2><p>正在安全地读取你的论文空间…</p></div></div>}
-      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>{authStep === "code" ? "输入邮箱验证码" : "登录 Lumen Paper"}</h2><p>{authStep === "code" ? <>我们已向 <strong>{authEmail}</strong> 发送验证码，请在当前页面完成验证。</> : "登录后，你的论文、阅读进度、聊天和批注会安全地保存在个人空间中。"}</p>{authStep === "email" ? <><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a><div className="auth-divider"><span>或使用邮箱</span></div><form className="auth-email-form" onSubmit={requestMagicLink}><label><Mail size={16} /><input type="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="name@example.com" autoComplete="email" required /></label><button className="primary-button wide" disabled={authSubmitting}>{authSubmitting ? <><LoaderCircle className="spin" size={15} />正在发送</> : "发送验证码"}</button></form></> : <form className="auth-email-form auth-code-form" onSubmit={verifyEmailCode}><label><input inputMode="numeric" pattern="[0-9]*" value={authCode} onChange={(event) => setAuthCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="输入邮件中的验证码" autoComplete="one-time-code" autoFocus required /></label><button className="primary-button wide" disabled={authSubmitting || authCode.length < 6}>{authSubmitting ? <><LoaderCircle className="spin" size={15} />正在验证</> : "验证并登录"}</button><button type="button" className="auth-back" onClick={() => { setAuthStep("email"); setAuthCode(""); setAuthMessage(""); }}>更换邮箱</button></form>}{authMessage && <div className="auth-message">{authMessage}</div>}<small>{authStep === "code" ? "验证码短时间内有效，请勿转发给他人。" : "无需设置密码；Google 登录不会读取 Gmail 内容。"}</small></div></div>}
+      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>开始使用 Lumen Paper</h2><p>暂时不配置登录也没关系，可以先用游客身份继续阅读和测试。</p><button className="primary-button wide auth-guest" onClick={startGuestSession} disabled={guestSubmitting}>{guestSubmitting ? <><LoaderCircle className="spin" size={15} />正在创建游客空间</> : "游客试用"}</button><div className="auth-divider"><span>以后再登录</span></div><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a>{authMessage && <div className="auth-message">{authMessage}</div>}<small>游客数据只绑定当前浏览器；清除 Cookie 后无法恢复，也不能跨设备同步。</small></div></div>}
     </main>
   );
 }

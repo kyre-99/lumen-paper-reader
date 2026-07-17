@@ -1,0 +1,112 @@
+import { and, eq } from "drizzle-orm";
+import { getChatGPTUser, chatGPTSignInPath } from "../../chatgpt-auth";
+import { getDb } from "../../../db";
+import { papers, readerStates, users } from "../../../db/schema";
+
+function parseArray(value: string) {
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function requireApiUser() {
+  const user = await getChatGPTUser();
+  if (!user) return null;
+  const db = getDb();
+  await db.insert(users).values({ id: user.email, email: user.email, displayName: user.displayName }).onConflictDoUpdate({
+    target: users.id,
+    set: { displayName: user.displayName, updatedAt: new Date().toISOString() },
+  });
+  return user;
+}
+
+export async function GET() {
+  const user = await requireApiUser();
+  if (!user) return Response.json({ error: "需要登录", signInUrl: chatGPTSignInPath("/") }, { status: 401 });
+
+  const db = getDb();
+  const [state] = await db.select().from(readerStates).where(eq(readerStates.userId, user.email)).limit(1);
+  if (!state) return Response.json({ workspace: null });
+
+  const [paper] = state.activePaperId
+    ? await db.select().from(papers).where(and(eq(papers.id, state.activePaperId), eq(papers.userId, user.email))).limit(1)
+    : [];
+
+  return Response.json({
+    workspace: {
+      paper: paper ? {
+        id: paper.id,
+        title: paper.title,
+        meta: paper.meta,
+        sourceKind: paper.sourceKind,
+        sourceUrl: paper.sourceUrl,
+        paperText: paper.paperText,
+        pageCount: paper.pageCount,
+      } : null,
+      currentPage: state.currentPage,
+      zoom: state.zoom,
+      rightOpen: state.rightOpen,
+      messages: parseArray(state.messagesJson),
+      annotations: parseArray(state.annotationsJson),
+      updatedAt: state.updatedAt,
+    },
+  });
+}
+
+export async function PUT(request: Request) {
+  const user = await requireApiUser();
+  if (!user) return Response.json({ error: "需要登录", signInUrl: chatGPTSignInPath("/") }, { status: 401 });
+
+  const payload = await request.json() as any;
+  const paper = payload.paper && typeof payload.paper === "object" ? payload.paper : null;
+  const db = getDb();
+  let activePaperId: string | null = null;
+
+  if (paper) {
+    const id = String(paper.id || "").slice(0, 80);
+    if (!id) return Response.json({ error: "论文记录缺少 ID" }, { status: 400 });
+    const [existing] = await db.select({ userId: papers.userId }).from(papers).where(eq(papers.id, id)).limit(1);
+    if (existing && existing.userId !== user.email) return Response.json({ error: "无权修改该论文" }, { status: 403 });
+
+    const values = {
+      id,
+      userId: user.email,
+      title: String(paper.title || "未命名论文").slice(0, 300),
+      meta: String(paper.meta || "").slice(0, 500),
+      sourceKind: paper.sourceKind === "upload" ? "upload" as const : "remote" as const,
+      sourceUrl: paper.sourceKind === "remote" ? String(paper.sourceUrl || "").slice(0, 2000) : null,
+      paperText: String(paper.paperText || "").slice(0, 180000),
+      pageCount: Math.max(1, Math.min(1000, Number(paper.pageCount) || 1)),
+      updatedAt: new Date().toISOString(),
+    };
+    if (existing) {
+      await db.update(papers).set(values).where(and(eq(papers.id, id), eq(papers.userId, user.email)));
+    } else {
+      await db.insert(papers).values(values);
+    }
+    activePaperId = id;
+  }
+
+  const messages = Array.isArray(payload.messages) ? payload.messages.slice(-120) : [];
+  const annotations = Array.isArray(payload.annotations) ? payload.annotations.slice(-300) : [];
+  const messagesJson = JSON.stringify(messages);
+  const annotationsJson = JSON.stringify(annotations);
+  if (messagesJson.length > 500000 || annotationsJson.length > 750000) {
+    return Response.json({ error: "同步内容过大，请删除部分历史记录后重试" }, { status: 413 });
+  }
+  const stateValues = {
+    userId: user.email,
+    activePaperId,
+    currentPage: Math.max(1, Math.min(1000, Number(payload.currentPage) || 1)),
+    zoom: Math.max(0.4, Math.min(2.5, Number(payload.zoom) || 0.88)),
+    rightOpen: payload.rightOpen !== false,
+    messagesJson,
+    annotationsJson,
+    updatedAt: new Date().toISOString(),
+  };
+  await db.insert(readerStates).values(stateValues).onConflictDoUpdate({ target: readerStates.userId, set: stateValues });
+  return Response.json({ saved: true, updatedAt: stateValues.updatedAt });
+}

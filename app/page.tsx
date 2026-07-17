@@ -9,6 +9,8 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleHelp,
+  Cloud,
+  CloudOff,
   Copy,
   FileText,
   FolderOpen,
@@ -18,6 +20,7 @@ import {
   Library,
   Link2,
   LoaderCircle,
+  LogOut,
   Maximize2,
   MessageSquareText,
   Minus,
@@ -58,7 +61,10 @@ type Annotation = {
   result: string;
   draft: string;
   thread: ChatMessage[];
+  pageNumber: number;
 };
+type SessionUser = { displayName: string; email: string; fullName: string | null };
+type PaperSourceKind = "remote" | "upload";
 
 const demoParagraphs = [
   {
@@ -115,6 +121,38 @@ function trimRangeToText(input: Range) {
   return range;
 }
 
+function findTextRange(root: Element, target: string) {
+  const wanted = target.replace(/\s+/g, " ").trim();
+  if (!wanted) return null;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const positions: Array<{ node: Text; offset: number }> = [];
+  let normalized = "";
+  let node = walker.nextNode() as Text | null;
+  while (node) {
+    for (let offset = 0; offset < node.data.length; offset++) {
+      const char = node.data[offset];
+      if (/\s/.test(char)) {
+        if (normalized && normalized[normalized.length - 1] !== " ") {
+          normalized += " ";
+          positions.push({ node, offset });
+        }
+      } else {
+        normalized += char;
+        positions.push({ node, offset });
+      }
+    }
+    node = walker.nextNode() as Text | null;
+  }
+  const index = normalized.indexOf(wanted);
+  if (index < 0 || !positions[index] || !positions[index + wanted.length - 1]) return null;
+  const start = positions[index];
+  const end = positions[index + wanted.length - 1];
+  const range = document.createRange();
+  range.setStart(start.node, start.offset);
+  range.setEnd(end.node, end.offset + 1);
+  return range;
+}
+
 function demoAnswer(prompt: string, context?: string) {
   const lower = prompt.toLowerCase();
   if (lower.includes("翻译") || lower.includes("translate")) {
@@ -146,7 +184,7 @@ function RailButton({ icon, label, active, onClick }: { icon: React.ReactNode; l
 
 function DemoPaper() {
   return (
-    <article className="paper-page demo-paper" data-testid="demo-paper">
+    <article className="paper-page demo-paper" data-testid="demo-paper" data-page-number="1">
       <header className="paper-head">
         <div className="paper-kicker">Neural Information Processing Systems · 2017</div>
         <h1>Attention Is All You Need</h1>
@@ -213,7 +251,7 @@ function PdfPage({ pdf, pageNumber, zoom }: { pdf: any; pageNumber: number; zoom
   }, [pdf, pageNumber, zoom]);
 
   return (
-    <div className="pdf-page" style={{ width: size.width, height: size.height, "--total-scale-factor": 1.25 * zoom } as React.CSSProperties}>
+    <div className="pdf-page" data-page-number={pageNumber} style={{ width: size.width, height: size.height, "--total-scale-factor": 1.25 * zoom } as React.CSSProperties}>
       <canvas ref={canvasRef} />
       <div className="textLayer" ref={textRef} />
     </div>
@@ -276,7 +314,7 @@ function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => voi
         <div className="modal-or"><span>或</span></div>
         <input ref={inputRef} type="file" accept="application/pdf,.pdf" hidden onChange={(e) => e.target.files?.[0] && onOpenFile(e.target.files[0])} />
         <button className="secondary-button wide" onClick={() => inputRef.current?.click()}><Upload size={17} />上传 PDF</button>
-        <div className="privacy-note"><Check size={14} />本地文件仅在当前浏览器中解析</div>
+        <div className="privacy-note"><Check size={14} />上传文件会保存到你的私人账户空间</div>
       </div>
     </div>
   );
@@ -313,10 +351,18 @@ function SettingsModal({ onClose, config, setConfig }: { onClose: () => void; co
 type ApiConfig = { provider: string; endpoint: string; model: string; apiKey: string };
 
 export default function Home() {
+  const [user, setUser] = useState<SessionUser | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<"loading" | "saved" | "saving" | "error">("loading");
+  const [hydrated, setHydrated] = useState(false);
   const [openModal, setOpenModal] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(true);
   const [source, setSource] = useState<string | Uint8Array | null>(null);
+  const [paperId, setPaperId] = useState<string | null>(null);
+  const [paperSourceKind, setPaperSourceKind] = useState<PaperSourceKind | null>(null);
+  const [paperSourceUrl, setPaperSourceUrl] = useState<string | null>(null);
   const [paperTitle, setPaperTitle] = useState("Attention Is All You Need");
   const [paperMeta, setPaperMeta] = useState("交互演示论文 · 打开链接后会替换为真实 PDF");
   const [pageCount, setPageCount] = useState(15);
@@ -325,7 +371,7 @@ export default function Home() {
   const [selectedText, setSelectedText] = useState("");
   const [selectionContext, setSelectionContext] = useState("");
   const [selectionPos, setSelectionPos] = useState<{ x: number; y: number } | null>(null);
-  const [selectionAnchor, setSelectionAnchor] = useState<{ top: number; left: number; cardTop: number; cardLeft: number } | null>(null);
+  const [selectionAnchor, setSelectionAnchor] = useState<{ top: number; left: number; cardTop: number; cardLeft: number; pageNumber: number } | null>(null);
   const [showColors, setShowColors] = useState(false);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [paperText, setPaperText] = useState(demoParagraphs.map((item) => `${item.heading || ""}\n${item.body}`).join("\n\n"));
@@ -343,6 +389,7 @@ export default function Home() {
   const flashTimersRef = useRef(new Map<number, number>());
   const dragRef = useRef<{ id: number; target: "card" | "pin"; startX: number; startY: number; startLeft: number; startTop: number } | null>(null);
   const lastDraggedPinRef = useRef<number | null>(null);
+  const restoringWorkspaceRef = useRef(false);
   const [config, setConfig] = useState<ApiConfig>({ provider: "OpenAI", endpoint: "https://api.openai.com/v1/chat/completions", model: "gpt-4.1-mini", apiKey: "" });
   const [messages, setMessages] = useState<ChatMessage[]>([
     { id: 1, role: "assistant", content: "这里是**全文对话**。我会基于整篇论文回答总结、方法、实验与结论问题；局部翻译和解释会留在原文旁边。" },
@@ -354,6 +401,55 @@ export default function Home() {
       const apiKey = sessionStorage.getItem("lumen-api-key") || "";
       if (saved) setConfig({ ...JSON.parse(saved), apiKey });
     } catch { /* ignore invalid local preferences */ }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const sessionResponse = await fetch("/api/session", { cache: "no-store" });
+        const sessionPayload = await sessionResponse.json();
+        if (!sessionResponse.ok) {
+          if (!cancelled) { setUser(null); setAuthReady(true); setHydrated(true); setSaveStatus("error"); }
+          return;
+        }
+        if (cancelled) return;
+        setUser(sessionPayload.user);
+        setAuthReady(true);
+
+        const workspaceResponse = await fetch("/api/workspace", { cache: "no-store" });
+        const workspacePayload = await workspaceResponse.json();
+        if (!workspaceResponse.ok) throw new Error(workspacePayload.error || "无法读取同步数据");
+        const workspace = workspacePayload.workspace;
+        if (workspace?.paper) {
+          restoringWorkspaceRef.current = true;
+          clearPaperAnnotations();
+          const paper = workspace.paper;
+          setPaperId(paper.id);
+          setPaperSourceKind(paper.sourceKind);
+          setPaperSourceUrl(paper.sourceUrl || null);
+          setPaperTitle(paper.title);
+          setPaperMeta(paper.meta);
+          setPaperText(paper.paperText || "");
+          setPageCount(paper.pageCount || 1);
+          setCurrentPage(workspace.currentPage || 1);
+          setZoom(workspace.zoom || 0.88);
+          setRightOpen(workspace.rightOpen !== false);
+          setMessages(Array.isArray(workspace.messages) && workspace.messages.length ? workspace.messages : [{ id: Date.now(), role: "assistant", content: "已恢复这篇论文的阅读记录。" }]);
+          setAnnotations((Array.isArray(workspace.annotations) ? workspace.annotations : []).map((item: Annotation) => ({ ...item, loading: false, draft: "", thread: Array.isArray(item.thread) ? item.thread : [], pageNumber: item.pageNumber || 1 })));
+          setSource(paper.sourceKind === "upload" ? `/api/papers/${paper.id}/file` : `/api/pdf?url=${encodeURIComponent(paper.sourceUrl)}`);
+          setExtractingText(!paper.paperText);
+        }
+        setSaveStatus("saved");
+      } catch {
+        if (!cancelled) setSaveStatus("error");
+      } finally {
+        if (!cancelled) setHydrated(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  // Initial account/workspace hydration only; subsequent changes are handled by autosave.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -509,10 +605,11 @@ export default function Home() {
     const anchorLeft = Math.min(rect.right, pageRect?.right || rect.right) - readerRect.left + readerRef.current.scrollLeft + 7;
     const anchorTop = rect.top - readerRect.top + readerRef.current.scrollTop + Math.min(rect.height / 2, 18);
     const visibleRight = readerRef.current.scrollLeft + readerRef.current.clientWidth;
+    const pageNumber = Number(contextRoot?.dataset.pageNumber || 1);
     setSelectedText(text.slice(0, 1800));
     setSelectionContext(surrounding);
     selectionRangeRef.current = range.cloneRange();
-    setSelectionAnchor({ top: anchorTop, left: anchorLeft, cardTop: anchorTop + 15, cardLeft: anchorLeft + 358 > visibleRight ? Math.max(readerRef.current.scrollLeft + 14, anchorLeft - 360) : anchorLeft + 15 });
+    setSelectionAnchor({ top: anchorTop, left: anchorLeft, cardTop: anchorTop + 15, cardLeft: anchorLeft + 358 > visibleRight ? Math.max(readerRef.current.scrollLeft + 14, anchorLeft - 360) : anchorLeft + 15, pageNumber });
     setSelectionPos({ x: Math.min(Math.max(rect.left + Math.min(rect.width / 2, 100), 190), window.innerWidth - 220), y: Math.max(rect.top - 58, 72) });
     setShowColors(false);
     setShowReaderTip(false);
@@ -576,10 +673,67 @@ export default function Home() {
     setSelectionPos(null);
   }, []);
 
+  useEffect(() => {
+    const reader = readerRef.current;
+    if (!reader || !annotations.length) return;
+    const restoreRanges = () => {
+      for (const annotation of annotations) {
+        if (annotationRangesRef.current.has(annotation.id)) continue;
+        const page = reader.querySelector(`[data-page-number="${annotation.pageNumber || 1}"]`);
+        const textRoot = page?.querySelector(".textLayer") || page;
+        if (!textRoot) continue;
+        const range = findTextRange(textRoot, annotation.text);
+        if (range) addAnnotationRange(annotation.id, range, annotation.color, annotation.kind === "highlight");
+      }
+    };
+    restoreRanges();
+    const observer = new MutationObserver(restoreRanges);
+    observer.observe(reader, { childList: true, subtree: true });
+    const timer = window.setTimeout(() => observer.disconnect(), 15000);
+    return () => { observer.disconnect(); window.clearTimeout(timer); };
+  }, [addAnnotationRange, annotations, source]);
+
+  useEffect(() => {
+    if (!hydrated || !user || !paperId || !paperSourceKind) return;
+    setSaveStatus("saving");
+    const timer = window.setTimeout(async () => {
+      try {
+        const response = await fetch("/api/workspace", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            paper: {
+              id: paperId,
+              title: paperTitle,
+              meta: paperMeta,
+              sourceKind: paperSourceKind,
+              sourceUrl: paperSourceUrl,
+              paperText,
+              pageCount,
+            },
+            currentPage,
+            zoom,
+            rightOpen,
+            messages,
+            annotations: annotations.map((annotation) => ({ ...annotation, loading: false, draft: "" })),
+          }),
+        });
+        if (!response.ok) throw new Error("save failed");
+        setSaveStatus("saved");
+      } catch {
+        setSaveStatus("error");
+      }
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [annotations, currentPage, hydrated, messages, pageCount, paperId, paperMeta, paperSourceKind, paperSourceUrl, paperText, paperTitle, rightOpen, user, zoom]);
+
   const openUrl = (raw: string) => {
     const normalized = normalizePaperUrl(raw);
     if (!/^https?:\/\//i.test(normalized)) { setToast("请输入有效的公开链接"); return; }
     clearPaperAnnotations();
+    setPaperId(crypto.randomUUID());
+    setPaperSourceKind("remote");
+    setPaperSourceUrl(normalized);
     setExtractingText(true);
     setPaperText("");
     setSource(`/api/pdf?url=${encodeURIComponent(normalized)}`);
@@ -592,16 +746,32 @@ export default function Home() {
   };
 
   const openFile = async (file: File) => {
-    const data = new Uint8Array(await file.arrayBuffer());
-    clearPaperAnnotations();
+    if (!user) { setToast("请先登录再上传 PDF"); return; }
     setExtractingText(true);
-    setPaperText("");
-    setSource(data);
-    setPaperTitle(file.name.replace(/\.pdf$/i, ""));
-    setPaperMeta(`本地 PDF · ${(file.size / 1024 / 1024).toFixed(1)} MB`);
-    setMessages([{ id: Date.now(), role: "assistant", content: "本地论文正在解析。文字提取完成后，我会在这里基于**全文上下文**回答问题。" }]);
-    setOpenModal(false);
-    setToast("本地论文已打开");
+    setToast("正在保存并打开 PDF…");
+    try {
+      const response = await fetch("/api/papers/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/pdf", "x-file-name": encodeURIComponent(file.name) },
+        body: file,
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "上传失败");
+      clearPaperAnnotations();
+      setPaperId(payload.paper.id);
+      setPaperSourceKind("upload");
+      setPaperSourceUrl(null);
+      setPaperText("");
+      setSource(`/api/papers/${payload.paper.id}/file`);
+      setPaperTitle(payload.paper.title);
+      setPaperMeta(payload.paper.meta);
+      setMessages([{ id: Date.now(), role: "assistant", content: "上传的论文正在解析。完成后，我会在这里基于**全文上下文**回答问题。" }]);
+      setOpenModal(false);
+      setToast("PDF 已保存到你的账户");
+    } catch (error: any) {
+      setExtractingText(false);
+      setToast(`上传失败：${error?.message || "请稍后重试"}`);
+    }
   };
 
   const handlePdfReady = useCallback((pages: number) => {
@@ -611,9 +781,11 @@ export default function Home() {
   }, []);
 
   const handleTextExtracted = useCallback((text: string) => {
+    const restoring = restoringWorkspaceRef.current;
+    restoringWorkspaceRef.current = false;
     setPaperText(text);
     setExtractingText(false);
-    setMessages([{ id: Date.now(), role: "assistant", content: text ? `全文文字已经准备好（约 **${text.length.toLocaleString()}** 个字符）。现在可以询问整篇论文的方法、实验、结论和局限。` : "PDF 已打开，但没有提取到可搜索文字；它可能是扫描版，需要接入 OCR。" }]);
+    if (!restoring) setMessages([{ id: Date.now(), role: "assistant", content: text ? `全文文字已经准备好（约 **${text.length.toLocaleString()}** 个字符）。现在可以询问整篇论文的方法、实验、结论和局限。` : "PDF 已打开，但没有提取到可搜索文字；它可能是扫描版，需要接入 OCR。" }]);
   }, []);
 
   const handlePdfError = useCallback((msg: string) => {
@@ -630,14 +802,15 @@ export default function Home() {
         <BrandMark />
         <nav className="rail-nav">
           <RailButton icon={<BookOpen size={20} />} label="阅读器" active />
-          <RailButton icon={<Library size={20} />} label="我的文库" onClick={() => setToast("文库同步将在账户系统接入后启用")} />
+          <RailButton icon={<Library size={20} />} label="我的文库" onClick={() => setToast("当前论文、聊天与批注已自动同步")} />
           <RailButton icon={<Search size={20} />} label="探索论文" onClick={() => setOpenModal(true)} />
           <RailButton icon={<Highlighter size={20} />} label="批注" onClick={() => setToast("选中文字即可开始批注")} />
         </nav>
         <div className="rail-bottom">
           <RailButton icon={<CircleHelp size={20} />} label="使用帮助" onClick={() => setToast("提示：先选中文字，再选择翻译或解释")} />
           <RailButton icon={<Settings size={20} />} label="设置" onClick={() => setSettingsOpen(true)} />
-          <button className="avatar" aria-label="个人资料">W</button>
+          <button className="avatar" aria-label="个人资料" onClick={() => setAccountOpen(!accountOpen)}>{(user?.displayName || user?.email || "W").slice(0, 1).toUpperCase()}</button>
+          {accountOpen && user && <div className="account-popover"><strong>{user.displayName}</strong><span>{user.email}</span><div className={`account-sync ${saveStatus}`}><Cloud size={13} />{saveStatus === "saving" ? "正在同步" : saveStatus === "error" ? "同步遇到问题" : "已同步到云端"}</div><a href="/signout-with-chatgpt?return_to=/"><LogOut size={13} />退出登录</a></div>}
         </div>
       </aside>
 
@@ -649,6 +822,7 @@ export default function Home() {
             <div><h1>{paperTitle}</h1><p>{paperMeta}</p></div>
           </div>
           <div className="top-actions">
+            <div className={`sync-status ${saveStatus}`} title="阅读进度、聊天和批注会自动保存">{saveStatus === "error" ? <CloudOff size={14} /> : <Cloud size={14} />}<span>{saveStatus === "loading" ? "正在载入" : saveStatus === "saving" ? "正在保存" : saveStatus === "error" ? "同步失败" : "已保存"}</span></div>
             <button className="status-pill" onClick={() => setSettingsOpen(true)}><span className={`status-dot ${config.apiKey ? "online" : ""}`} />{config.apiKey ? config.model : "演示模型"}<ChevronDown size={14} /></button>
             <button className="secondary-button compact" onClick={() => setOpenModal(true)}><Plus size={16} />打开论文</button>
             <button className="icon-button" aria-label="更多"><MoreHorizontal size={19} /></button>
@@ -757,6 +931,8 @@ export default function Home() {
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} />}
       {toast && <div className="toast"><Check size={15} />{toast}</div>}
+      {!authReady && <div className="auth-gate"><div className="auth-card"><BrandMark /><LoaderCircle className="spin" size={22} /><h2>正在确认登录状态</h2><p>正在安全地读取你的论文空间…</p></div></div>}
+      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>登录 Lumen Paper</h2><p>登录后，你的论文、阅读进度、聊天和批注会安全地保存在个人空间中。</p><a className="primary-button wide" href="/signin-with-chatgpt?return_to=/">使用 ChatGPT 登录</a></div></div>}
     </main>
   );
 }

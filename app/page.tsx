@@ -355,6 +355,8 @@ export default function Home() {
   const [user, setUser] = useState<SessionUser | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [authEmail, setAuthEmail] = useState("");
+  const [authCode, setAuthCode] = useState("");
+  const [authStep, setAuthStep] = useState<"email" | "code">("email");
   const [authMessage, setAuthMessage] = useState("");
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
@@ -815,10 +817,27 @@ export default function Home() {
       const response = await fetch("/api/auth/email", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: authEmail }) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "发送失败");
-      setAuthMessage("登录邮件已发送，请在邮箱中点击链接继续。");
+      setAuthStep("code");
+      setAuthMessage("验证码已发送，请查看邮箱。若未收到，请稍后再试，避免连续发送触发限额。");
     } catch (error: any) {
       setAuthMessage(error?.message || "发送失败，请稍后重试");
     } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const verifyEmailCode = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (authCode.replace(/\D/g, "").length < 6 || authSubmitting) return;
+    setAuthSubmitting(true);
+    setAuthMessage("");
+    try {
+      const response = await fetch("/api/auth/email/verify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: authEmail, token: authCode }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "验证码无效");
+      window.location.assign("/");
+    } catch (error: any) {
+      setAuthMessage(error?.message || "验证码无效或已过期");
       setAuthSubmitting(false);
     }
   };
@@ -961,7 +980,7 @@ export default function Home() {
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} />}
       {toast && <div className="toast"><Check size={15} />{toast}</div>}
       {!authReady && <div className="auth-gate"><div className="auth-card"><BrandMark /><LoaderCircle className="spin" size={22} /><h2>正在确认登录状态</h2><p>正在安全地读取你的论文空间…</p></div></div>}
-      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>登录 Lumen Paper</h2><p>登录后，你的论文、阅读进度、聊天和批注会安全地保存在个人空间中。</p><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a><div className="auth-divider"><span>或使用邮箱</span></div><form className="auth-email-form" onSubmit={requestMagicLink}><label><Mail size={16} /><input type="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="name@example.com" autoComplete="email" required /></label><button className="primary-button wide" disabled={authSubmitting}>{authSubmitting ? <><LoaderCircle className="spin" size={15} />正在发送</> : "发送登录链接"}</button></form>{authMessage && <div className="auth-message">{authMessage}</div>}<small>无需设置密码，登录链接将发送到你的邮箱。</small></div></div>}
+      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>{authStep === "code" ? "输入邮箱验证码" : "登录 Lumen Paper"}</h2><p>{authStep === "code" ? <>我们已向 <strong>{authEmail}</strong> 发送验证码，请在当前页面完成验证。</> : "登录后，你的论文、阅读进度、聊天和批注会安全地保存在个人空间中。"}</p>{authStep === "email" ? <><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a><div className="auth-divider"><span>或使用邮箱</span></div><form className="auth-email-form" onSubmit={requestMagicLink}><label><Mail size={16} /><input type="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="name@example.com" autoComplete="email" required /></label><button className="primary-button wide" disabled={authSubmitting}>{authSubmitting ? <><LoaderCircle className="spin" size={15} />正在发送</> : "发送验证码"}</button></form></> : <form className="auth-email-form auth-code-form" onSubmit={verifyEmailCode}><label><input inputMode="numeric" pattern="[0-9]*" value={authCode} onChange={(event) => setAuthCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="输入邮件中的验证码" autoComplete="one-time-code" autoFocus required /></label><button className="primary-button wide" disabled={authSubmitting || authCode.length < 6}>{authSubmitting ? <><LoaderCircle className="spin" size={15} />正在验证</> : "验证并登录"}</button><button type="button" className="auth-back" onClick={() => { setAuthStep("email"); setAuthCode(""); setAuthMessage(""); }}>更换邮箱</button></form>}{authMessage && <div className="auth-message">{authMessage}</div>}<small>{authStep === "code" ? "验证码短时间内有效，请勿转发给他人。" : "无需设置密码；Google 登录不会读取 Gmail 内容。"}</small></div></div>}
     </main>
   );
 }

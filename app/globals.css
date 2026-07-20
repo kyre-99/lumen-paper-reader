@@ -112,11 +112,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .textLayer .markedContent { display: contents; }
 .textLayer span[role="img"] { user-select: none; cursor: default; }
 .textLayer ::selection { background: rgba(82, 151, 126, .3); color: transparent; }
+.reader-viewport.custom-selection-active .textLayer ::selection { background: transparent; }
 .textLayer br::selection { background: transparent; }
+.selection-overlay-rect { position: absolute; z-index: 6; pointer-events: none; box-sizing: border-box; border-radius: 1.5px; background: rgba(82, 151, 126, .28); }
 .formula-assist { position: absolute; z-index: 7; min-width: 27px; height: 27px; display: flex; align-items: center; gap: 0; padding: 0 7px; overflow: hidden; transform: translateY(-50%); border: 1px solid rgba(117,157,141,.55); border-radius: 14px; background: rgba(255,255,255,.78); color: var(--green); box-shadow: 0 5px 16px rgba(31,50,41,.10); opacity: .28; backdrop-filter: blur(8px); cursor: pointer; transition: opacity .16s ease, min-width .18s ease, gap .18s ease, background .16s ease; }
 .formula-assist span { max-width: 0; overflow: hidden; white-space: nowrap; font-size: 9px; font-weight: 650; transition: max-width .18s ease; }
 .formula-assist:hover, .formula-assist:focus-visible { min-width: 68px; gap: 5px; background: rgba(255,255,255,.96); opacity: 1; }
 .formula-assist:hover span, .formula-assist:focus-visible span { max-width: 46px; }
+.formula-annotation-region { position: absolute; z-index: 20; box-sizing: border-box; pointer-events: none; border: 1.5px solid rgba(77,145,201,.72); border-radius: 5px; background: rgba(104,168,226,.16); box-shadow: 0 0 0 3px rgba(104,168,226,.08); animation: formula-region-flash 1.8s ease both; }
+@keyframes formula-region-flash { 0% { opacity: 0; transform: scale(.985); } 12%, 72% { opacity: 1; transform: scale(1); } 100% { opacity: 0; transform: scale(1.01); } }
 .pdf-loading { min-height: 400px; display: flex; align-items: center; justify-content: center; gap: 10px; color: #6e7873; font-size: 12px; }
 .spin { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }

@@ -1,121 +1,96 @@
 # Lumen Paper
 
-## 本地版本
+Lumen Paper 是一个本地优先的 AI 论文阅读器。它可以打开 arXiv 等网站的 PDF 或本地论文，在原文旁完成翻译、解释、追问、高亮和批注，并保存文库、阅读位置与对话记录。
+
+![Lumen Paper 界面](public/og.png)
+
+## 功能
+
+- 打开 arXiv PDF 链接或上传本地 PDF
+- PDF 文本层解析与精确跨行选择
+- 选中文本后翻译、解释、连续追问或多色高亮
+- 原文旁可拖动的 AI 卡片与批注标记
+- 公式区域识别与公式解释入口
+- 全文 AI 多轮对话，支持 Markdown 渲染
+- 文件夹式论文文库
+- 持久化论文、阅读进度、对话、高亮和批注
+- OpenAI 兼容接口，可自定义 Base URL、API Key 和模型
+- 本地 SQLite（Cloudflare D1）与本地对象存储（R2）开发模式
+- 可选 Supabase 邮箱、Google 和游客登录
+
+## 本地运行
+
+需要 Node.js `>=22.13.0`。
 
 ```bash
+git clone https://github.com/kyre-99/lumen-paper-reader.git
+cd lumen-paper-reader
 npm install
+cp .env.example .dev.vars
 npm run local
 ```
 
-打开终端显示的本地地址即可使用。默认本地模式不需要 Supabase 或第三方账号登录。
-
-- 文库、解析文字、阅读位置、聊天、批注和 Prompt 设置保存在本地 SQLite（D1）中。
-- 上传的 PDF 保存在本地对象存储（R2）中。
-- 所有本地数据都位于项目的 `.wrangler/state/` 目录；该目录不会提交到 Git。
-- 删除 `.wrangler/state/` 会清空本地文库，请在删除或移动项目前先备份该目录。
-
-本地环境使用忽略提交的 `.dev.vars`：
+打开终端显示的本地地址即可使用。默认建议在 `.dev.vars` 中设置：
 
 ```env
 LOCAL_ONLY=true
-GUEST_SESSION_SECRET=仅供本地开发的至少32位随机字符串
+GUEST_SESSION_SECRET=请替换为至少32位的随机字符串
+MODEL_CONFIG_SECRET=请替换为至少32位的随机字符串
 ```
 
-## 技术结构
+本地模式不要求 Supabase 或第三方账号登录。文库和结构化数据保存在 `.wrangler/state/` 的本地 D1 中，上传的 PDF 保存在本地 R2 中。该目录不会提交到 Git；删除它会清空本地数据。
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+## 接入模型
 
-## Prerequisites
+可以在应用右上角的 AI 设置中填写 OpenAI 兼容配置，配置只需保存一次。也可以通过 `.dev.vars` 提供默认值：
 
-- Node.js `>=22.13.0`
+```env
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_API_KEY=your_api_key
+OPENAI_MODEL=gpt-4.1-mini
+```
 
-## Quick Start
+第三方兼容服务的 Base URL 通常应包含 `/v1`。请勿提交包含真实密钥的 `.dev.vars`；该文件已加入 `.gitignore`。
+
+## 可选云端登录
+
+如需启用 Supabase 登录和跨设备账户，可在 `.dev.vars` 中配置：
+
+```env
+LOCAL_ONLY=false
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_PUBLISHABLE_KEY=sb_publishable_your_key
+```
+
+Google 登录还需要在 Supabase 和 Google Cloud Console 中配置 OAuth Provider 与回调地址。本地阅读和本地持久化不依赖这些设置。
+
+## 常用命令
 
 ```bash
-npm install
-npm run dev
-npm run build
+npm run local       # 初始化本地数据库并启动开发环境
+npm run dev         # 启动开发环境
+npm run build       # 生产构建
+npm test            # 构建并运行测试
+npm run lint        # ESLint 检查
+npm run db:generate # 根据 schema 生成 Drizzle migration
 ```
 
-This starter does not use `wrangler.jsonc`.
+## 技术栈
 
-## Included Shape
+- React 19、Next.js API Routes、vinext、Vite
+- PDF.js
+- Cloudflare D1、R2、Wrangler
+- Drizzle ORM
+- Supabase Auth（可选）
+- React Markdown 与 GFM
 
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
+## 数据与安全
 
-## Workspace Auth Headers
+- `.dev.vars`、`.env`、`.wrangler/state/`、构建产物和上传文件不会进入 Git。
+- 模型 API Key 不会发送给除所配置模型接口以外的第三方。
+- 对外部署前请使用随机的 `GUEST_SESSION_SECRET` 和 `MODEL_CONFIG_SECRET`。
+- AI 输出可能有误，重要论文结论请回到原文核对。
 
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
+## License
 
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
-```
-
-## Optional Dispatch-Owned ChatGPT Sign-In
-
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
-
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
-
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+[MIT](LICENSE)

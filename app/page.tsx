@@ -72,8 +72,16 @@ type Annotation = {
   textColor?: string;
   pageX?: number;
   pageY?: number;
+  formulaRegionX?: number;
+  formulaRegionY?: number;
+  formulaRegionWidth?: number;
+  formulaRegionHeight?: number;
+  formulaRegionLeft?: number;
+  formulaRegionTop?: number;
+  formulaRegionPixelWidth?: number;
+  formulaRegionPixelHeight?: number;
 };
-type FormulaAnchor = { text: string; pageNumber: number; pageX: number; pageY: number };
+type FormulaAnchor = { text: string; label?: string; pageNumber: number; pageX: number; pageY: number; regionX: number; regionY: number; regionWidth: number; regionHeight: number };
 type SessionUser = { displayName: string; email: string; fullName: string | null; isGuest: boolean; isLocal?: boolean };
 type PaperSourceKind = "remote" | "upload";
 type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; sourceKind: PaperSourceKind; pageCount: number; createdAt: string; updatedAt: string };
@@ -153,6 +161,170 @@ function trimRangeToText(input: Range) {
     range.setStart(first.node, first.offset);
     range.setEnd(last.node, last.offset);
   }
+  return range;
+}
+
+type TextCaret = { node: Text; offset: number };
+type SelectionOverlayRect = { left: number; top: number; width: number; height: number };
+
+type ClientRectShape = { left: number; top: number; right: number; bottom: number; width: number; height: number };
+
+function tightRangeClientRects(range: Range, contextRoot: Element | null): ClientRectShape[] {
+  const textLayer = contextRoot?.matches(".textLayer")
+    ? contextRoot
+    : contextRoot?.querySelector(".textLayer");
+  if (!textLayer) {
+    return Array.from(range.getClientRects())
+      .filter((rect) => rect.width > .5 && rect.height > 2)
+      .map((rect) => ({ left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom, width: rect.width, height: rect.height }));
+  }
+
+  const pageRect = textLayer.closest(".pdf-page")?.getBoundingClientRect();
+  const fragments: ClientRectShape[] = [];
+  for (const span of Array.from(textLayer.querySelectorAll("span"))) {
+    if (span.getAttribute("role") === "img") continue;
+    const spanRect = span.getBoundingClientRect();
+    if (!spanRect.width || !spanRect.height) continue;
+    for (const child of Array.from(span.childNodes)) {
+      if (child.nodeType !== Node.TEXT_NODE || !child.textContent) continue;
+      const textNode = child as Text;
+      try {
+        if (!range.intersectsNode(textNode)) continue;
+      } catch {
+        continue;
+      }
+      const from = textNode === range.startContainer ? range.startOffset : 0;
+      const to = textNode === range.endContainer ? range.endOffset : textNode.data.length;
+      if (to <= from || !textNode.data.slice(from, to).trim()) continue;
+      const fragmentRange = document.createRange();
+      fragmentRange.setStart(textNode, Math.max(0, Math.min(textNode.data.length, from)));
+      fragmentRange.setEnd(textNode, Math.max(0, Math.min(textNode.data.length, to)));
+      for (const fragment of Array.from(fragmentRange.getClientRects())) {
+        const left = Math.max(fragment.left, spanRect.left, pageRect?.left || -Infinity);
+        const right = Math.min(fragment.right, spanRect.right, pageRect?.right || Infinity);
+        const top = Math.max(spanRect.top, pageRect?.top || -Infinity);
+        const bottom = Math.min(spanRect.bottom, pageRect?.bottom || Infinity);
+        if (right - left <= .5 || bottom - top <= 2) continue;
+        fragments.push({ left, top, right, bottom, width: right - left, height: bottom - top });
+      }
+    }
+  }
+
+  const deduped: ClientRectShape[] = [];
+  for (const rect of fragments.sort((a, b) => a.top - b.top || a.left - b.left)) {
+    const duplicate = deduped.some((item) => {
+      const verticalOverlap = Math.max(0, Math.min(item.bottom, rect.bottom) - Math.max(item.top, rect.top));
+      const overlapRatio = verticalOverlap / Math.max(1, Math.min(item.height, rect.height));
+      return overlapRatio > .72 && Math.abs(item.left - rect.left) < .75 && Math.abs(item.right - rect.right) < .75;
+    });
+    if (!duplicate) deduped.push(rect);
+  }
+
+  const merged: ClientRectShape[] = [];
+  for (const rect of deduped) {
+    const row = merged.find((item) => {
+      const centerDistance = Math.abs((item.top + item.bottom - rect.top - rect.bottom) / 2);
+      const gap = rect.left > item.right ? rect.left - item.right : item.left > rect.right ? item.left - rect.right : 0;
+      return centerDistance <= Math.max(2, Math.min(item.height, rect.height) * .35) && gap <= Math.max(3, Math.min(item.height, rect.height) * .55);
+    });
+    if (!row) {
+      merged.push({ ...rect });
+      continue;
+    }
+    row.left = Math.min(row.left, rect.left);
+    row.right = Math.max(row.right, rect.right);
+    row.top = Math.max(row.top, rect.top);
+    row.bottom = Math.min(row.bottom, rect.bottom);
+    if (row.bottom <= row.top) {
+      row.top = Math.min(row.top, rect.top);
+      row.bottom = Math.max(row.bottom, rect.bottom);
+    }
+    row.width = row.right - row.left;
+    row.height = row.bottom - row.top;
+  }
+  return merged.sort((a, b) => a.top - b.top || a.left - b.left);
+}
+
+function overlayRectsForRange(range: Range, contextRoot: Element | null, reader: HTMLElement) {
+  const readerRect = reader.getBoundingClientRect();
+  return tightRangeClientRects(range, contextRoot).map((rect) => ({
+    left: rect.left - readerRect.left + reader.scrollLeft,
+    top: rect.top - readerRect.top + reader.scrollTop,
+    width: rect.width,
+    height: rect.height,
+  }));
+}
+
+function textOffsetAtX(node: Text, x: number) {
+  if (!node.data.length) return 0;
+  const probe = document.createRange();
+  for (let offset = 0; offset < node.data.length; offset++) {
+    probe.setStart(node, offset);
+    probe.setEnd(node, offset + 1);
+    const rect = probe.getBoundingClientRect();
+    if (rect.width && x <= rect.left + rect.width / 2) return offset;
+  }
+  return node.data.length;
+}
+
+function textCaretFromPoint(root: Element, x: number, y: number): TextCaret | null {
+  const caretDocument = document as Document & {
+    caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+    caretRangeFromPoint?: (x: number, y: number) => Range | null;
+  };
+  const position = caretDocument.caretPositionFromPoint?.(x, y);
+  const legacyRange = position ? null : caretDocument.caretRangeFromPoint?.(x, y);
+  const nativeNode = position?.offsetNode || legacyRange?.startContainer;
+  const nativeOffset = position?.offset ?? legacyRange?.startOffset;
+  if (nativeNode?.nodeType === Node.TEXT_NODE && root.contains(nativeNode)) {
+    const textNode = nativeNode as Text;
+    const span = textNode.parentElement;
+    const rootRect = root.getBoundingClientRect();
+    const spanRect = span?.getBoundingClientRect();
+    const pointerSide = x < rootRect.left + rootRect.width / 2 ? -1 : 1;
+    const spanSide = spanRect && spanRect.left + spanRect.width / 2 < rootRect.left + rootRect.width / 2 ? -1 : 1;
+    const isNarrowColumnText = Boolean(spanRect && spanRect.width < rootRect.width * .65);
+    if (!isNarrowColumnText || pointerSide === spanSide || Math.abs(x - (rootRect.left + rootRect.width / 2)) < rootRect.width * .04) {
+      return { node: textNode, offset: Math.min(textNode.data.length, Math.max(0, Number(nativeOffset) || 0)) };
+    }
+  }
+
+  const rootRect = root.getBoundingClientRect();
+  const pointerSide = x < rootRect.left + rootRect.width / 2 ? -1 : 1;
+  let closest: { node: Text; rect: DOMRect; score: number } | null = null;
+  for (const span of Array.from(root.querySelectorAll("span"))) {
+    if (span.getAttribute("role") === "img") continue;
+    const node = Array.from(span.childNodes).find((child): child is Text => child.nodeType === Node.TEXT_NODE && Boolean(child.textContent));
+    if (!node) continue;
+    const rect = span.getBoundingClientRect();
+    if (!rect.width || !rect.height) continue;
+    const spanSide = rect.left + rect.width / 2 < rootRect.left + rootRect.width / 2 ? -1 : 1;
+    if (rect.width < rootRect.width * .65 && spanSide !== pointerSide) continue;
+    const dx = x < rect.left ? rect.left - x : x > rect.right ? x - rect.right : 0;
+    const dy = y < rect.top ? rect.top - y : y > rect.bottom ? y - rect.bottom : 0;
+    const score = dy * 4 + dx;
+    if (!closest || score < closest.score) closest = { node, rect, score };
+  }
+  if (!closest) return null;
+  return { node: closest.node, offset: textOffsetAtX(closest.node, x) };
+}
+
+function rangeFromPointerPoints(root: Element, start: { x: number; y: number }, end: { x: number; y: number }) {
+  const startCaret = textCaretFromPoint(root, start.x, start.y);
+  const endCaret = textCaretFromPoint(root, end.x, end.y);
+  if (!startCaret || !endCaret) return null;
+  const startProbe = document.createRange();
+  const endProbe = document.createRange();
+  startProbe.setStart(startCaret.node, startCaret.offset);
+  startProbe.collapse(true);
+  endProbe.setStart(endCaret.node, endCaret.offset);
+  endProbe.collapse(true);
+  const forward = startProbe.compareBoundaryPoints(Range.START_TO_START, endProbe) <= 0;
+  const range = document.createRange();
+  const first = forward ? startCaret : endCaret;
+  const last = forward ? endCaret : startCaret;
+  range.setStart(first.node, first.offset);
+  range.setEnd(last.node, last.offset);
   return range;
 }
 
@@ -260,7 +432,7 @@ function DemoPaper() {
   );
 }
 
-function PdfPage({ pdf, pageNumber, zoom, onFormula }: { pdf: any; pageNumber: number; zoom: number; onFormula: (formula: FormulaAnchor) => void }) {
+function PdfPage({ pdf, pageNumber, zoom, onFormula, onTextLayerReady }: { pdf: any; pageNumber: number; zoom: number; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 760, height: 980 });
@@ -294,31 +466,76 @@ function PdfPage({ pdf, pageNumber, zoom, onFormula }: { pdf: any; pageNumber: n
       textLayer = new pdfjs.TextLayer({ textContentSource: textContent, container: textContainer, viewport });
       await textLayer.render();
       if (cancelled) return;
+      onTextLayerReady(pageNumber);
       const pageRect = textContainer.getBoundingClientRect();
-      const rows = new Map<number, { texts: string[]; left: number; right: number; top: number; bottom: number; score: number }>();
-      for (const span of Array.from(textContainer.querySelectorAll("span"))) {
-        if (span.children.length) continue;
-        const value = String(span.textContent || "").trim();
-        if (!value) continue;
+      const boxes = Array.from(textContainer.querySelectorAll("span")).map((span, index) => {
+        const text = String(span.textContent || "").trim();
         const rect = span.getBoundingClientRect();
-        if (!rect.width || !rect.height) continue;
-        const key = Math.round((rect.top - pageRect.top) / 4);
-        const mathScore = /[=≠≤≥∑∫√∞≈∝∈∉⊂⊆∪∩∂∇±×÷→←↦]|[α-ωΑ-Ω]|\b(?:softmax|argmax|log|exp|sim|Top-?k)\b/i.test(value) ? 1 : 0;
-        const row = rows.get(key) || { texts: [], left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, score: 0 };
-        row.texts.push(value);
-        row.left = Math.min(row.left, rect.left);
-        row.right = Math.max(row.right, rect.right);
-        row.top = Math.min(row.top, rect.top);
-        row.bottom = Math.max(row.bottom, rect.bottom);
-        row.score += mathScore;
-        rows.set(key, row);
-      }
-      const detected = [...rows.values()].filter((row) => row.score > 0).map((row) => {
-        const text = row.texts.join(" ").replace(/\s+/g, " ").trim();
-        const pageX = Math.min(.96, Math.max(.04, (row.right - pageRect.left) / Math.max(1, pageRect.width)));
-        const pageY = Math.min(.98, Math.max(.02, ((row.top + row.bottom) / 2 - pageRect.top) / Math.max(1, pageRect.height)));
-        return { text, pageNumber, pageX, pageY, left: Math.min(viewport.width - 28, row.right - pageRect.left + 7), top: (row.top + row.bottom) / 2 - pageRect.top };
-      }).filter((item) => item.text.length >= 3 && item.text.length <= 240).slice(0, 10);
+        return { index, text, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height };
+      }).filter((item) => item.text && item.width > 0 && item.height > 0);
+      const equationNumber = /^\(\d{1,3}[a-z]?\)$/i;
+      const strongMath = /[=≠≤≥∑∏∫√∞≈∝∈∉⊂⊆∪∩∂∇±×÷→←↦|]|[α-ωΑ-Ω]|\b(?:arg\s*max|arg\s*min|softmax|log|exp|sim)\b/i;
+      const detected = boxes.map((anchor) => {
+        if (!equationNumber.test(anchor.text)) return null;
+        const centerX = (anchor.left + anchor.right) / 2 - pageRect.left;
+        const normalizedX = centerX / Math.max(1, pageRect.width);
+        const isLeftColumnNumber = normalizedX >= .43 && normalizedX <= .50;
+        const isRightColumnNumber = normalizedX >= .84 && normalizedX <= .94;
+        if (!isLeftColumnNumber && !isRightColumnNumber) return null;
+
+        const columnLeft = pageRect.left + (isRightColumnNumber ? pageRect.width * .50 : pageRect.width * .06);
+        const columnRight = pageRect.left + (isRightColumnNumber ? pageRect.width * .92 : pageRect.width * .50);
+        const anchorCenterY = (anchor.top + anchor.bottom) / 2;
+        const verticalRadius = Math.max(22, anchor.height * 2.35);
+        const nearbyParts = boxes.filter((item) => (
+          item.index !== anchor.index
+          && item.index < anchor.index
+          && !equationNumber.test(item.text)
+          && item.right >= columnLeft
+          && item.left <= columnRight
+          && Math.abs((item.top + item.bottom) / 2 - anchorCenterY) <= verticalRadius
+          && item.text.length <= 90
+        ));
+        const firstMathPart = nearbyParts.findIndex((item) => strongMath.test(item.text));
+        if (firstMathPart < 0) return null;
+        let formulaStart = firstMathPart;
+        while (formulaStart > 0) {
+          const previous = nearbyParts[formulaStart - 1];
+          const wordCount = previous.text.split(/\s+/).filter(Boolean).length;
+          if (wordCount >= 5 && !strongMath.test(previous.text)) break;
+          formulaStart -= 1;
+        }
+        const formulaParts = nearbyParts.slice(formulaStart);
+        const rawFormula = formulaParts.map((item) => item.text).join(" ").replace(/\s+/g, " ").trim();
+        const compactTokens = formulaParts.filter((item) => item.text.length <= 12).length;
+        if (!strongMath.test(rawFormula) || compactTokens < 2 || rawFormula.length < 4 || rawFormula.length > 360) return null;
+        const formulaText = rawFormula
+          .replace(/\s+([,.;:)\]}])/g, "$1")
+          .replace(/([({\[])\s+/g, "$1")
+          .replace(/\s*\|\s*/g, " | ")
+          .replace(/\s+/g, " ")
+          .trim();
+        const regionLeft = Math.max(pageRect.left, Math.min(...formulaParts.map((item) => item.left)) - 4);
+        const regionTop = Math.max(pageRect.top, Math.min(...formulaParts.map((item) => item.top)) - 3);
+        const regionRight = Math.min(pageRect.right, Math.max(...formulaParts.map((item) => item.right)) + 4);
+        const regionBottom = Math.min(pageRect.bottom, Math.max(...formulaParts.map((item) => item.bottom)) + 3);
+        const markerLeft = Math.min(pageRect.width - 30, anchor.right - pageRect.left + 12);
+        const pageX = Math.min(.96, Math.max(.04, markerLeft / Math.max(1, pageRect.width)));
+        const pageY = Math.min(.98, Math.max(.02, (anchorCenterY - pageRect.top) / Math.max(1, pageRect.height)));
+        return {
+          text: `公式 ${anchor.text}：${formulaText}`,
+          label: anchor.text,
+          pageNumber,
+          pageX,
+          pageY,
+          regionX: (regionLeft - pageRect.left) / Math.max(1, pageRect.width),
+          regionY: (regionTop - pageRect.top) / Math.max(1, pageRect.height),
+          regionWidth: (regionRight - regionLeft) / Math.max(1, pageRect.width),
+          regionHeight: (regionBottom - regionTop) / Math.max(1, pageRect.height),
+          left: markerLeft,
+          top: anchorCenterY - pageRect.top,
+        };
+      }).filter((item): item is NonNullable<typeof item> => Boolean(item));
       setFormulaAnchors(detected);
     })().catch(() => undefined);
     return () => {
@@ -326,18 +543,18 @@ function PdfPage({ pdf, pageNumber, zoom, onFormula }: { pdf: any; pageNumber: n
       renderTask?.cancel?.();
       textLayer?.cancel?.();
     };
-  }, [pdf, pageNumber, zoom]);
+  }, [onTextLayerReady, pdf, pageNumber, zoom]);
 
   return (
     <div className="pdf-page" data-page-number={pageNumber} style={{ width: size.width, height: size.height, "--total-scale-factor": 1.25 * zoom } as React.CSSProperties}>
       <canvas ref={canvasRef} />
       <div className="textLayer" ref={textRef} />
-      {formulaAnchors.map((formula, index) => <button key={`${Math.round(formula.top)}-${index}`} className="formula-assist" style={{ left: formula.left, top: formula.top }} onClick={(event) => { event.stopPropagation(); onFormula(formula); }} aria-label={`询问第 ${pageNumber} 页公式`} title="询问 AI 这个公式"><Sparkles size={13} /><span>问公式</span></button>)}
+      {formulaAnchors.map((formula, index) => <button key={`${formula.label || Math.round(formula.top)}-${index}`} className="formula-assist" data-formula-text={formula.text} data-formula-region={`${formula.regionX},${formula.regionY},${formula.regionWidth},${formula.regionHeight}`} style={{ left: formula.left, top: formula.top }} onClick={(event) => { event.stopPropagation(); onFormula(formula); }} aria-label={`询问第 ${pageNumber} 页公式 ${formula.label || ""}`.trim()} title={formula.text}><Sparkles size={13} /><span>问公式</span></button>)}
     </div>
   );
 }
 
-function PdfDocument({ source, zoom, onReady, onMetadata, onFormula, onTextExtracted, onError }: { source: string | Uint8Array; zoom: number; onReady: (pages: number) => void; onMetadata: (title: string) => void; onFormula: (formula: FormulaAnchor) => void; onTextExtracted: (text: string) => void; onError: (message: string) => void }) {
+function PdfDocument({ source, zoom, onReady, onMetadata, onFormula, onTextLayerReady, onTextExtracted, onError }: { source: string | Uint8Array; zoom: number; onReady: (pages: number) => void; onMetadata: (title: string) => void; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onTextExtracted: (text: string) => void; onError: (message: string) => void }) {
   const [pdf, setPdf] = useState<any>(null);
 
   useEffect(() => {
@@ -397,7 +614,7 @@ function PdfDocument({ source, zoom, onReady, onMetadata, onFormula, onTextExtra
   if (!pdf) {
     return <div className="pdf-loading"><LoaderCircle className="spin" size={22} /><span>正在解析论文版面…</span></div>;
   }
-  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} onFormula={onFormula} />)}</div>;
+  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} onFormula={onFormula} onTextLayerReady={onTextLayerReady} />)}</div>;
 }
 
 function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => void; onOpenUrl: (url: string) => void; onOpenFile: (file: File) => void }) {
@@ -589,9 +806,11 @@ export default function Home() {
   const [pageCount, setPageCount] = useState(15);
   const [currentPage, setCurrentPage] = useState(1);
   const [zoom, setZoom] = useState(0.88);
+  const [textLayerVersion, setTextLayerVersion] = useState(0);
   const [selectedText, setSelectedText] = useState("");
   const [selectionContext, setSelectionContext] = useState("");
   const [selectionPos, setSelectionPos] = useState<{ x: number; y: number } | null>(null);
+  const [selectionRects, setSelectionRects] = useState<SelectionOverlayRect[]>([]);
   const [pdfContextMenu, setPdfContextMenu] = useState<{ x: number; y: number; pageNumber: number; pageX: number; pageY: number } | null>(null);
   const [selectionAnchor, setSelectionAnchor] = useState<{ top: number; left: number; cardTop: number; cardLeft: number; pageNumber: number } | null>(null);
   const [showColors, setShowColors] = useState(false);
@@ -604,6 +823,7 @@ export default function Home() {
   const [toast, setToast] = useState("");
   const [showReaderTip, setShowReaderTip] = useState(true);
   const [draggingId, setDraggingId] = useState<number | null>(null);
+  const [flashedFormulaIds, setFlashedFormulaIds] = useState<Set<number>>(() => new Set());
   const readerRef = useRef<HTMLDivElement>(null);
   const selectionRangeRef = useRef<Range | null>(null);
   const annotationRangesRef = useRef(new Map<number, { range: Range; color: HighlightColor; persistent: boolean }>());
@@ -612,6 +832,8 @@ export default function Home() {
   const flashTimersRef = useRef(new Map<number, number>());
   const dragRef = useRef<{ id: number; target: "card" | "pin"; startX: number; startY: number; startLeft: number; startTop: number } | null>(null);
   const lastDraggedPinRef = useRef<number | null>(null);
+  const selectionPointerRef = useRef<{ x: number; y: number; root: Element } | null>(null);
+  const selectionFrameRef = useRef(0);
   const restoringWorkspaceRef = useRef(false);
   const [config, setConfig] = useState<ApiConfig>({ provider: "OpenAI", endpoint: "https://api.openai.com/v1", model: "gpt-4.1-mini", apiKey: "", hasApiKey: false });
   const [promptConfig, setPromptConfig] = useState<PromptConfig>(DEFAULT_PROMPTS);
@@ -619,6 +841,10 @@ export default function Home() {
     { id: 1, role: "assistant", content: "这里是**全文对话**。我会基于整篇论文回答总结、方法、实验与结论问题；局部翻译和解释会留在原文旁边。" },
   ]);
   const persistentAnnotationsJson = useMemo(() => JSON.stringify(annotations.filter(shouldPersistAnnotation).map((annotation) => ({ ...annotation, loading: false, draft: "" }))), [annotations]);
+
+  const handleTextLayerReady = useCallback(() => {
+    setTextLayerVersion((version) => version + 1);
+  }, []);
 
   useEffect(() => {
     const error = new URLSearchParams(window.location.search).get("auth_error");
@@ -734,7 +960,7 @@ export default function Home() {
 
   const addAnnotationRange = useCallback((id: number, range: Range, color: HighlightColor, persistent: boolean) => {
     annotationRangesRef.current.set(id, { range: range.cloneRange(), color, persistent });
-    if (persistent) refreshHighlights(color);
+    if (persistent || activeRangeIdsRef.current.has(id)) refreshHighlights(color);
   }, [refreshHighlights]);
 
   const flashAnnotationRange = useCallback((id: number, duration = 1500) => {
@@ -751,6 +977,21 @@ export default function Home() {
     }, duration);
     flashTimersRef.current.set(id, timer);
   }, [refreshHighlights]);
+
+  const flashFormulaRegion = useCallback((id: number, duration = 1800) => {
+    const existing = flashTimersRef.current.get(id);
+    if (existing) window.clearTimeout(existing);
+    setFlashedFormulaIds((current) => new Set(current).add(id));
+    const timer = window.setTimeout(() => {
+      flashTimersRef.current.delete(id);
+      setFlashedFormulaIds((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
+    }, duration);
+    flashTimersRef.current.set(id, timer);
+  }, []);
 
   const updateAnnotation = useCallback((id: number, patch: Partial<Annotation>) => {
     setAnnotations((items) => items.map((item) => item.id === id ? { ...item, ...patch } : item));
@@ -821,22 +1062,59 @@ export default function Home() {
     }
   }, [config, paperTitle, promptConfig, updateAnnotation]);
 
-  const handleSelection = useCallback(() => {
+  const handleSelectionStart = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    const target = event.target as HTMLElement;
+    const root = target.closest(".textLayer, .demo-paper");
+    selectionPointerRef.current = root ? { x: event.clientX, y: event.clientY, root } : null;
+    setSelectionRects([]);
+    setSelectionPos(null);
+    if (pdfContextMenu) setPdfContextMenu(null);
+  }, [pdfContextMenu]);
+
+  const handleSelectionMove = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const pointerStart = selectionPointerRef.current;
+    const reader = readerRef.current;
+    if (!pointerStart || !reader || !(event.buttons & 1)) return;
+    const endRoot = (event.target as HTMLElement).closest(".textLayer, .demo-paper");
+    if (endRoot !== pointerStart.root) return;
+    const end = { x: event.clientX, y: event.clientY };
+    window.cancelAnimationFrame(selectionFrameRef.current);
+    selectionFrameRef.current = window.requestAnimationFrame(() => {
+      const range = rangeFromPointerPoints(pointerStart.root, { x: pointerStart.x, y: pointerStart.y }, end);
+      if (!range || range.collapsed) {
+        setSelectionRects([]);
+        return;
+      }
+      const contextRoot = pointerStart.root.closest(".pdf-page, .demo-paper");
+      setSelectionRects(overlayRectsForRange(trimRangeToText(range), contextRoot, reader));
+    });
+  }, []);
+
+  const handleSelection = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    window.cancelAnimationFrame(selectionFrameRef.current);
+    const pointerStart = selectionPointerRef.current;
+    selectionPointerRef.current = null;
     const selection = window.getSelection();
-    if (!selection?.rangeCount) return;
-    const range = trimRangeToText(selection.getRangeAt(0));
+    const endRoot = (event.target as HTMLElement).closest(".textLayer, .demo-paper");
+    const pointerRange = pointerStart?.root.isConnected && endRoot === pointerStart.root
+      ? rangeFromPointerPoints(pointerStart.root, { x: pointerStart.x, y: pointerStart.y }, { x: event.clientX, y: event.clientY })
+      : null;
+    if ((!pointerRange || pointerRange.collapsed) && !selection?.rangeCount) { setSelectionRects([]); return; }
+    const range = trimRangeToText(pointerRange && !pointerRange.collapsed ? pointerRange : selection!.getRangeAt(0));
     const text = range.toString().replace(/\s+/g, " ").trim();
-    if (!text || text.length < 2) return;
-    selection.removeAllRanges();
-    selection.addRange(range);
-    if (!readerRef.current?.contains(range.commonAncestorContainer)) return;
+    if (!text || text.length < 2) { setSelectionRects([]); return; }
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    if (!readerRef.current?.contains(range.commonAncestorContainer)) { setSelectionRects([]); return; }
     const readerRect = readerRef.current.getBoundingClientRect();
     const node = range.commonAncestorContainer.nodeType === Node.TEXT_NODE ? range.commonAncestorContainer.parentElement : range.commonAncestorContainer as HTMLElement;
     const contextRoot = node?.closest?.(".pdf-page, .demo-paper") as HTMLElement | null;
     const pageRect = contextRoot?.getBoundingClientRect();
-    const rects = Array.from(range.getClientRects()).filter((rect) => rect.width > .5 && rect.height > 2 && (!pageRect || (rect.left >= pageRect.left - 2 && rect.right <= pageRect.right + 2)));
+    const rects = tightRangeClientRects(range, contextRoot);
     const rect = rects[rects.length - 1] || range.getBoundingClientRect();
-    if (!rect.width && !rect.height) return;
+    if (!rect.width && !rect.height) { setSelectionRects([]); return; }
+    setSelectionRects(overlayRectsForRange(range, contextRoot, readerRef.current));
     const blockText = (contextRoot?.innerText || node?.parentElement?.innerText || text).replace(/\s+/g, " ").trim();
     const needle = text.slice(0, 90);
     const index = blockText.indexOf(needle);
@@ -862,6 +1140,7 @@ export default function Home() {
     addAnnotationRange(id, selectionRangeRef.current, color, kind === "highlight");
     setAnnotations((items) => [...items, annotation]);
     setSelectionPos(null);
+    setSelectionRects([]);
     setShowColors(false);
     window.getSelection()?.removeAllRanges();
     if (kind === "translate" || kind === "explain") void requestInlineAnswer(id, kind, selectedText, selectionContext);
@@ -871,6 +1150,17 @@ export default function Home() {
     selectionRangeRef.current = null;
   }, [addAnnotationRange, flashAnnotationRange, requestInlineAnswer, selectedText, selectionAnchor, selectionContext]);
 
+  useEffect(() => {
+    window.cancelAnimationFrame(selectionFrameRef.current);
+    setSelectionRects([]);
+    setSelectionPos(null);
+    setSelectedText("");
+    setSelectionContext("");
+    selectionRangeRef.current = null;
+    selectionPointerRef.current = null;
+    window.getSelection()?.removeAllRanges();
+  }, [source, zoom]);
+
   const createFormulaAnnotation = useCallback((formula: FormulaAnchor) => {
     const reader = readerRef.current;
     const page = reader?.querySelector(`[data-page-number="${formula.pageNumber}"]`) as HTMLElement | null;
@@ -879,16 +1169,21 @@ export default function Home() {
     const pageRect = page.getBoundingClientRect();
     const left = pageRect.left - readerRect.left + reader.scrollLeft + formula.pageX * pageRect.width;
     const top = pageRect.top - readerRect.top + reader.scrollTop + formula.pageY * pageRect.height;
+    const formulaRegionLeft = pageRect.left - readerRect.left + reader.scrollLeft + formula.regionX * pageRect.width;
+    const formulaRegionTop = pageRect.top - readerRect.top + reader.scrollTop + formula.regionY * pageRect.height;
+    const formulaRegionPixelWidth = formula.regionWidth * pageRect.width;
+    const formulaRegionPixelHeight = formula.regionHeight * pageRect.height;
     const visibleRight = reader.scrollLeft + reader.clientWidth;
     const id = Date.now() + Math.floor(Math.random() * 1000);
     const cardLeft = left + 358 > visibleRight ? Math.max(reader.scrollLeft + 14, left - 360) : left + 15;
     const cardTop = Math.max(reader.scrollTop + 8, Math.min(reader.scrollTop + reader.clientHeight - 110, top + 15));
     const surrounding = String(page.innerText || formula.text).replace(/\s+/g, " ").slice(0, 2000);
-    const annotation: Annotation = { id, kind: "formula", color: "blue", text: formula.text, surrounding, top, left, cardTop, cardLeft, open: true, loading: false, result: "", draft: "", thread: [], pageNumber: formula.pageNumber, pageX: formula.pageX, pageY: formula.pageY, pinOffsetX: 0, pinOffsetY: 0, cardOffsetX: cardLeft - left, cardOffsetY: cardTop - top };
+    const annotation: Annotation = { id, kind: "formula", color: "blue", text: formula.text, surrounding, top, left, cardTop, cardLeft, open: true, loading: false, result: "", draft: "", thread: [], pageNumber: formula.pageNumber, pageX: formula.pageX, pageY: formula.pageY, formulaRegionX: formula.regionX, formulaRegionY: formula.regionY, formulaRegionWidth: formula.regionWidth, formulaRegionHeight: formula.regionHeight, formulaRegionLeft, formulaRegionTop, formulaRegionPixelWidth, formulaRegionPixelHeight, pinOffsetX: 0, pinOffsetY: 0, cardOffsetX: cardLeft - left, cardOffsetY: cardTop - top };
     annotationAnchorsRef.current.set(id, { top, left });
     setAnnotations((items) => [...items, annotation]);
+    window.setTimeout(() => flashFormulaRegion(id), 0);
     void requestInlineAnswer(id, "formula", formula.text, surrounding);
-  }, [requestInlineAnswer]);
+  }, [flashFormulaRegion, requestInlineAnswer]);
 
   const handlePdfContextMenu = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     const page = (event.target as HTMLElement).closest(".pdf-page") as HTMLElement | null;
@@ -921,6 +1216,12 @@ export default function Home() {
     if (timer) window.clearTimeout(timer);
     flashTimersRef.current.delete(id);
     activeRangeIdsRef.current.delete(id);
+    setFlashedFormulaIds((current) => {
+      if (!current.has(id)) return current;
+      const next = new Set(current);
+      next.delete(id);
+      return next;
+    });
     annotationRangesRef.current.delete(id);
     annotationAnchorsRef.current.delete(id);
     if (stored) refreshHighlights(stored.color);
@@ -932,6 +1233,12 @@ export default function Home() {
     if (timer) window.clearTimeout(timer);
     flashTimersRef.current.delete(annotation.id);
     activeRangeIdsRef.current.delete(annotation.id);
+    setFlashedFormulaIds((current) => {
+      if (!current.has(annotation.id)) return current;
+      const next = new Set(current);
+      next.delete(annotation.id);
+      return next;
+    });
     refreshHighlights(annotation.color);
     updateAnnotation(annotation.id, { open: false });
   }, [refreshHighlights, updateAnnotation]);
@@ -945,13 +1252,15 @@ export default function Home() {
     const cardTop = Math.max(reader.scrollTop + 8, Math.min(reader.scrollTop + reader.clientHeight - 110, annotation.top + 15));
     const anchor = annotationAnchorsRef.current.get(annotation.id) || { top: annotation.top - (annotation.pinOffsetY || 0), left: annotation.left - (annotation.pinOffsetX || 0) };
     updateAnnotation(annotation.id, { open: true, cardLeft, cardTop, cardOffsetX: cardLeft - anchor.left, cardOffsetY: cardTop - anchor.top });
-    flashAnnotationRange(annotation.id);
-  }, [flashAnnotationRange, updateAnnotation]);
+    if (annotation.kind === "formula") flashFormulaRegion(annotation.id);
+    else flashAnnotationRange(annotation.id);
+  }, [flashAnnotationRange, flashFormulaRegion, updateAnnotation]);
 
   const clearPaperAnnotations = useCallback(() => {
     flashTimersRef.current.forEach((timer) => window.clearTimeout(timer));
     flashTimersRef.current.clear();
     activeRangeIdsRef.current.clear();
+    setFlashedFormulaIds(new Set());
     annotationRangesRef.current.clear();
     annotationAnchorsRef.current.clear();
     if ((CSS as any).highlights) (["yellow", "green", "blue", "rose"] as HighlightColor[]).forEach((color) => (CSS as any).highlights.delete(`lumen-${color}`));
@@ -979,10 +1288,25 @@ export default function Home() {
           const top = anchor.top + (annotation.pinOffsetY || 0);
           const cardLeft = anchor.left + cardOffsetX;
           const cardTop = anchor.top + cardOffsetY;
+          const hasFormulaRegion = annotation.kind === "formula"
+            && annotation.formulaRegionX !== undefined
+            && annotation.formulaRegionY !== undefined
+            && annotation.formulaRegionWidth !== undefined
+            && annotation.formulaRegionHeight !== undefined;
+          const formulaRegionLeft = hasFormulaRegion ? pageRect.left - readerRect.left + reader.scrollLeft + annotation.formulaRegionX! * pageRect.width : annotation.formulaRegionLeft;
+          const formulaRegionTop = hasFormulaRegion ? pageRect.top - readerRect.top + reader.scrollTop + annotation.formulaRegionY! * pageRect.height : annotation.formulaRegionTop;
+          const formulaRegionPixelWidth = hasFormulaRegion ? annotation.formulaRegionWidth! * pageRect.width : annotation.formulaRegionPixelWidth;
+          const formulaRegionPixelHeight = hasFormulaRegion ? annotation.formulaRegionHeight! * pageRect.height : annotation.formulaRegionPixelHeight;
           annotationAnchorsRef.current.set(annotation.id, anchor);
-          if (Math.abs(left - annotation.left) < .5 && Math.abs(top - annotation.top) < .5 && Math.abs(cardLeft - annotation.cardLeft) < .5 && Math.abs(cardTop - annotation.cardTop) < .5) return annotation;
+          const formulaRegionAligned = !hasFormulaRegion || (
+            Math.abs((formulaRegionLeft || 0) - (annotation.formulaRegionLeft || 0)) < .5
+            && Math.abs((formulaRegionTop || 0) - (annotation.formulaRegionTop || 0)) < .5
+            && Math.abs((formulaRegionPixelWidth || 0) - (annotation.formulaRegionPixelWidth || 0)) < .5
+            && Math.abs((formulaRegionPixelHeight || 0) - (annotation.formulaRegionPixelHeight || 0)) < .5
+          );
+          if (Math.abs(left - annotation.left) < .5 && Math.abs(top - annotation.top) < .5 && Math.abs(cardLeft - annotation.cardLeft) < .5 && Math.abs(cardTop - annotation.cardTop) < .5 && formulaRegionAligned) return annotation;
           changed = true;
-          return { ...annotation, left, top, cardLeft, cardTop };
+          return { ...annotation, left, top, cardLeft, cardTop, formulaRegionLeft, formulaRegionTop, formulaRegionPixelWidth, formulaRegionPixelHeight };
         }
         const stored = annotationRangesRef.current.get(annotation.id);
         if (!stored || !stored.range.commonAncestorContainer.isConnected) return annotation;
@@ -1016,6 +1340,50 @@ export default function Home() {
   useEffect(() => {
     const reader = readerRef.current;
     if (!reader) return;
+    const readerRect = reader.getBoundingClientRect();
+    setAnnotations((items) => {
+      let changed = false;
+      const next = items.map((annotation) => {
+        if (annotation.kind !== "formula" || annotation.formulaRegionX !== undefined) return annotation;
+        const page = reader.querySelector(`[data-page-number="${annotation.pageNumber || 1}"]`) as HTMLElement | null;
+        if (!page) return annotation;
+        const button = Array.from(page.querySelectorAll(".formula-assist")).find((item) => item.getAttribute("data-formula-text") === annotation.text) as HTMLElement | undefined;
+        const region = button?.dataset.formulaRegion?.split(",").map(Number);
+        if (!button || !region || region.length !== 4 || region.some((value) => !Number.isFinite(value))) return annotation;
+        const pageRect = page.getBoundingClientRect();
+        const pageX = Math.min(.96, Math.max(.04, Number.parseFloat(button.style.left) / Math.max(1, pageRect.width)));
+        const pageY = Math.min(.98, Math.max(.02, Number.parseFloat(button.style.top) / Math.max(1, pageRect.height)));
+        const anchor = { left: pageRect.left - readerRect.left + reader.scrollLeft + pageX * pageRect.width, top: pageRect.top - readerRect.top + reader.scrollTop + pageY * pageRect.height };
+        const previousAnchor = annotationAnchorsRef.current.get(annotation.id) || { left: annotation.left - (annotation.pinOffsetX || 0), top: annotation.top - (annotation.pinOffsetY || 0) };
+        const cardOffsetX = annotation.cardOffsetX ?? annotation.cardLeft - previousAnchor.left;
+        const cardOffsetY = annotation.cardOffsetY ?? annotation.cardTop - previousAnchor.top;
+        annotationAnchorsRef.current.set(annotation.id, anchor);
+        changed = true;
+        return {
+          ...annotation,
+          pageX,
+          pageY,
+          left: anchor.left + (annotation.pinOffsetX || 0),
+          top: anchor.top + (annotation.pinOffsetY || 0),
+          cardLeft: anchor.left + cardOffsetX,
+          cardTop: anchor.top + cardOffsetY,
+          formulaRegionX: region[0],
+          formulaRegionY: region[1],
+          formulaRegionWidth: region[2],
+          formulaRegionHeight: region[3],
+          formulaRegionLeft: pageRect.left - readerRect.left + reader.scrollLeft + region[0] * pageRect.width,
+          formulaRegionTop: pageRect.top - readerRect.top + reader.scrollTop + region[1] * pageRect.height,
+          formulaRegionPixelWidth: region[2] * pageRect.width,
+          formulaRegionPixelHeight: region[3] * pageRect.height,
+        };
+      });
+      return changed ? next : items;
+    });
+  }, [textLayerVersion]);
+
+  useEffect(() => {
+    const reader = readerRef.current;
+    if (!reader) return;
     let frame = 0;
     const schedule = () => {
       window.cancelAnimationFrame(frame);
@@ -1026,7 +1394,7 @@ export default function Home() {
     window.addEventListener("resize", schedule);
     schedule();
     return () => { observer.disconnect(); window.removeEventListener("resize", schedule); window.cancelAnimationFrame(frame); };
-  }, [realignAnnotations, rightOpen, source, zoom]);
+  }, [realignAnnotations, rightOpen, source, textLayerVersion, zoom]);
 
   useEffect(() => {
     const reader = readerRef.current;
@@ -1034,12 +1402,21 @@ export default function Home() {
     const restoreRanges = () => {
       for (const annotation of annotations) {
         if (annotation.kind === "text-note" || annotation.kind === "formula") continue;
-        const existing = annotationRangesRef.current.get(annotation.id);
-        if (existing?.range.commonAncestorContainer.isConnected) continue;
-        if (existing) annotationRangesRef.current.delete(annotation.id);
         const page = reader.querySelector(`[data-page-number="${annotation.pageNumber || 1}"]`);
         const textRoot = page?.querySelector(".textLayer") || page;
         if (!textRoot) continue;
+        const existing = annotationRangesRef.current.get(annotation.id);
+        const existingText = existing?.range.toString().replace(/\s+/g, " ").trim();
+        const expectedText = annotation.text.replace(/\s+/g, " ").trim();
+        const existingIsValid = Boolean(
+          existing
+          && !existing.range.collapsed
+          && existing.range.commonAncestorContainer.isConnected
+          && textRoot.contains(existing.range.commonAncestorContainer)
+          && existingText === expectedText
+        );
+        if (existingIsValid) continue;
+        if (existing) annotationRangesRef.current.delete(annotation.id);
         const range = findTextRange(textRoot, annotation.text);
         if (range) addAnnotationRange(annotation.id, range, annotation.color, annotation.kind === "highlight");
       }
@@ -1050,7 +1427,7 @@ export default function Home() {
     observer.observe(reader, { childList: true, subtree: true });
     const timer = window.setTimeout(() => observer.disconnect(), 15000);
     return () => { observer.disconnect(); window.clearTimeout(timer); };
-  }, [addAnnotationRange, annotations, realignAnnotations, source]);
+  }, [addAnnotationRange, annotations, realignAnnotations, source, textLayerVersion]);
 
   useEffect(() => {
     if (!hydrated || !user || !paperId || !paperSourceKind) return;
@@ -1300,10 +1677,14 @@ export default function Home() {
           <button className="icon-button small" aria-label="全屏"><Maximize2 size={17} /></button>
         </div>
 
-        <div className="reader-viewport" ref={readerRef} onMouseUp={handleSelection} onContextMenu={handlePdfContextMenu} onMouseDown={() => pdfContextMenu && setPdfContextMenu(null)} onScroll={() => { if (selectionPos) setSelectionPos(null); if (pdfContextMenu) setPdfContextMenu(null); }}>
+        <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}`} ref={readerRef} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleSelectionStart} onScroll={() => { if (selectionPos) setSelectionPos(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); }}>
           {source ? (
-            <PdfDocument source={source} zoom={zoom} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextExtracted={handleTextExtracted} onError={handlePdfError} />
+            <PdfDocument source={source} zoom={zoom} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextLayerReady={handleTextLayerReady} onTextExtracted={handleTextExtracted} onError={handlePdfError} />
           ) : <div style={{ transform: `scale(${zoom})`, transformOrigin: "top center" }}><DemoPaper /></div>}
+          {selectionRects.map((rect, index) => <div key={`selection-${index}`} className="selection-overlay-rect" style={rect} aria-hidden="true" />)}
+          {annotations.filter((annotation) => annotation.kind === "formula" && flashedFormulaIds.has(annotation.id) && annotation.formulaRegionLeft !== undefined && annotation.formulaRegionTop !== undefined && annotation.formulaRegionPixelWidth !== undefined && annotation.formulaRegionPixelHeight !== undefined).map((annotation) => (
+            <div key={`formula-region-${annotation.id}`} className="formula-annotation-region" style={{ left: annotation.formulaRegionLeft, top: annotation.formulaRegionTop, width: annotation.formulaRegionPixelWidth, height: annotation.formulaRegionPixelHeight }} aria-hidden="true" />
+          ))}
           {annotations.map((annotation) => annotation.kind === "text-note" ? (
             <section key={annotation.id} className={`pdf-text-note ${draggingId === annotation.id ? "dragging" : ""}`} style={{ top: annotation.cardTop, left: annotation.cardLeft, color: annotation.textColor || "#9a5a16" }} onMouseDown={(event) => event.stopPropagation()}>
               <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")}><span><MoreHorizontal size={13} />PDF 文字批注</span><button onClick={() => removeAnnotation(annotation.id)} aria-label="删除 PDF 批注"><X size={13} /></button></header>

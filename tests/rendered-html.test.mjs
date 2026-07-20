@@ -4,7 +4,7 @@ import test from "node:test";
 
 const projectFile = (path) => new URL(`../${path}`, import.meta.url);
 
-test("ships as an MIT-licensed Lumen Paper repository", async () => {
+test("ships as an MIT-licensed Wenshu Paper repository", async () => {
   const [packageText, readme, license] = await Promise.all([
     readFile(projectFile("package.json"), "utf8"),
     readFile(projectFile("README.md"), "utf8"),
@@ -12,10 +12,10 @@ test("ships as an MIT-licensed Lumen Paper repository", async () => {
   ]);
   const packageJson = JSON.parse(packageText);
 
-  assert.equal(packageJson.name, "lumen-paper-reader");
+  assert.equal(packageJson.name, "wenshu-paper-reader");
   assert.equal(packageJson.license, "MIT");
   assert.match(packageJson.repository.url, /github\.com\/kyre-99\/lumen-paper-reader/);
-  assert.match(readme, /^# Lumen Paper/m);
+  assert.match(readme, /^# 文枢 Wenshu/m);
   assert.match(readme, /npm run local/);
   assert.match(license, /^MIT License/m);
 });

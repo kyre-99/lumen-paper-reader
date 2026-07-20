@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  ArrowLeft,
   BookOpen,
   Bot,
   Check,
@@ -29,22 +28,83 @@ import {
   PanelRightClose,
   PanelRightOpen,
   Plus,
-  Search,
   Send,
   Settings,
   Sparkles,
+  Trash2,
   Upload,
   X,
+  Zap,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { DEFAULT_PROMPTS, type PromptConfig } from "./chat-prompts";
 
-type ChatMessage = { id: number; role: "user" | "assistant"; content: string };
+type ChatMessage = { id: number; role: "user" | "assistant"; content: string; steps?: string[] };
+type ChatEffort = "medium" | "high" | "max";
+const UI_FONT_SIZES = ["compact", "standard", "large", "xlarge"] as const;
+const CHAT_EFFORTS = ["medium", "high", "max"] as const;
+
+// 从 localStorage 读取界面偏好：SSR 与水合阶段用 fallback，挂载后自动切换到保存值，避免水合不一致
+function useStoredPref<T extends string>(key: string, fallback: T, valid: readonly T[]): [T, (next: T) => void] {
+  const subscribe = React.useCallback((notify: () => void) => {
+    const handler = (event: Event) => { if ((event as CustomEvent).detail === key) notify(); };
+    window.addEventListener("lumen-pref-change", handler);
+    return () => window.removeEventListener("lumen-pref-change", handler);
+  }, [key]);
+  const value = React.useSyncExternalStore(
+    subscribe,
+    () => {
+      const saved = window.localStorage.getItem(key);
+      return (valid as readonly string[]).includes(saved || "") ? (saved as T) : fallback;
+    },
+    () => fallback,
+  );
+  const setValue = React.useCallback((next: T) => {
+    window.localStorage.setItem(key, next);
+    window.dispatchEvent(new CustomEvent("lumen-pref-change", { detail: key }));
+  }, [key]);
+  return [value, setValue];
+}
+const CHAT_EFFORT_LEVELS: Array<{ value: ChatEffort; label: string; desc: string }> = [
+  { value: "medium", label: "快速", desc: "本地检索，单次回答，零额外调用，最快最省" },
+  { value: "high", label: "深入", desc: "智能改写检索词，从全文补充上下文，更准也更贵" },
+  { value: "max", label: "研究", desc: "Agent 多轮主动检索翻阅论文，最彻底" },
+];
+
+// 解析 /api/chat 的 SSE 流：step 为检索进度，delta 为回答增量
+async function consumeChatStream(response: Response, handlers: { onStep?: (label: string) => void; onDelta?: (text: string) => void }) {
+  if (!response.body) throw new Error("连接中断");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let failed: string | null = null;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop() || "";
+    for (const event of events) {
+      const line = event.split("\n").find((item) => item.startsWith("data:"));
+      if (!line) continue;
+      try {
+        const payload = JSON.parse(line.slice(5).trim());
+        if (payload.type === "step" && payload.label) handlers.onStep?.(String(payload.label));
+        if (payload.type === "delta" && payload.text) handlers.onDelta?.(String(payload.text));
+        if (payload.type === "error") failed = String(payload.message || "模型请求失败");
+      } catch { /* 忽略不完整分片 */ }
+    }
+  }
+  if (failed) throw new Error(failed);
+}
 type ToolAction = "translate" | "explain" | "ask" | "formula";
 type HighlightColor = "yellow" | "green" | "blue" | "rose";
 type Annotation = {
@@ -57,8 +117,11 @@ type Annotation = {
   left: number;
   cardTop: number;
   cardLeft: number;
+  cardWidth?: number;
+  cardHeight?: number;
   open: boolean;
   loading: boolean;
+  loadingLabel?: string;
   result: string;
   draft: string;
   thread: ChatMessage[];
@@ -195,10 +258,16 @@ function tightRangeClientRects(range: Range, contextRoot: Element | null): Clien
       }
       const from = textNode === range.startContainer ? range.startOffset : 0;
       const to = textNode === range.endContainer ? range.endOffset : textNode.data.length;
-      if (to <= from || !textNode.data.slice(from, to).trim()) continue;
+      if (to <= from) continue;
+      const slice = textNode.data.slice(from, to);
+      if (!slice.trim()) continue;
+      // 去掉每个文本片段首尾的空白字符，避免行尾/行首的空格被高亮成多余的空白块
+      const tightFrom = from + (slice.match(/^\s+/)?.[0].length || 0);
+      const tightTo = to - (slice.match(/\s+$/)?.[0].length || 0);
+      if (tightTo <= tightFrom) continue;
       const fragmentRange = document.createRange();
-      fragmentRange.setStart(textNode, Math.max(0, Math.min(textNode.data.length, from)));
-      fragmentRange.setEnd(textNode, Math.max(0, Math.min(textNode.data.length, to)));
+      fragmentRange.setStart(textNode, Math.max(0, Math.min(textNode.data.length, tightFrom)));
+      fragmentRange.setEnd(textNode, Math.max(0, Math.min(textNode.data.length, tightTo)));
       for (const fragment of Array.from(fragmentRange.getClientRects())) {
         const left = Math.max(fragment.left, spanRect.left, pageRect?.left || -Infinity);
         const right = Math.min(fragment.right, spanRect.right, pageRect?.right || Infinity);
@@ -371,16 +440,27 @@ function demoAnswer(prompt: string, context?: string) {
   return `### 这段话在说什么？\n\n作者强调的是：传统序列模型需要逐步传递信息，而注意力机制让两个相距很远的位置也能**直接建立联系**。\n\n${context ? `> ${context}\n\n` : ""}这带来两个直接好处：\n\n- 更容易捕捉长距离依赖\n- 计算可以并行执行，训练速度更快\n\n如果你愿意，我还可以用一个具体句子画出 Q、K、V 的计算过程。`;
 }
 
+// 把模型常用的 \(...\) 和 \[...\] 公式写法统一转成 $...$ / $$...$$，跳过代码块
+function normalizeMathDelimiters(content: string) {
+  return content.split(/(```[\s\S]*?```|`[^`\n]*`)/g).map((part) => {
+    if (part.startsWith("`")) return part;
+    return part
+      .replace(/\\\[([\s\S]*?)\\\]/g, (_match, tex) => `$$${tex}$$`)
+      .replace(/\\\(([\s\S]*?)\\\)/g, (_match, tex) => `$${tex}$`);
+  }).join("");
+}
+
 function MarkdownContent({ content, compact = false }: { content: string; compact?: boolean }) {
   return (
     <div className={`markdown-content${compact ? " compact" : ""}`}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
         components={{
           a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
         }}
       >
-        {content}
+        {normalizeMathDelimiters(content)}
       </ReactMarkdown>
     </div>
   );
@@ -388,9 +468,9 @@ function MarkdownContent({ content, compact = false }: { content: string; compac
 
 function BrandMark() {
   return (
-    <div className="brand-mark" aria-label="Lumen Paper">
-      <span className="brand-core" />
-      <span className="brand-orbit" />
+    <div className="brand-mark" aria-label="文枢 Wenshu">
+      <span className="brand-tile">文</span>
+      <span className="brand-dot" />
     </div>
   );
 }
@@ -401,6 +481,19 @@ function RailButton({ icon, label, active, onClick }: { icon: React.ReactNode; l
       {icon}
       <span className="rail-tooltip">{label}</span>
     </button>
+  );
+}
+
+function EffortControl({ effort, onChange }: { effort: ChatEffort; onChange: (value: ChatEffort) => void }) {
+  const effortIndex = CHAT_EFFORT_LEVELS.findIndex((level) => level.value === effort);
+  const current = CHAT_EFFORT_LEVELS[effortIndex] || CHAT_EFFORT_LEVELS[0];
+  return (
+    <div className={`effort-control level-${effortIndex}`} title={`全文对话 · 思考力度 · ${current.label}：${current.desc}`}>
+      <Zap size={15} className="effort-zap" />
+      <span className="effort-caption">思考力度</span>
+      <input type="range" min={0} max={2} step={1} value={effortIndex} onChange={(event) => onChange(CHAT_EFFORT_LEVELS[Number(event.target.value)].value)} style={{ "--fill": `${effortIndex * 50}%` } as React.CSSProperties} aria-label="AI 思考力度" aria-valuetext={current.label} />
+      <span className="effort-name">{current.label}</span>
+    </div>
   );
 }
 
@@ -716,12 +809,52 @@ function ProviderLogo({ name }: { name: string }) {
   return <span className={`provider-logo provider-${name.toLowerCase().replace(/\s+/g, "-")}`} aria-hidden="true">{mark}</span>;
 }
 
-function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { onClose: () => void; config: ApiConfig; setConfig: (v: ApiConfig) => void; prompts: PromptConfig; setPrompts: (v: PromptConfig) => void }) {
-  const [tab, setTab] = useState<"model" | "prompts">("model");
+type UiFontSize = "compact" | "standard" | "large" | "xlarge";
+
+const UI_FONT_OPTIONS: Array<{ value: UiFontSize; label: string; desc: string; sample: number }> = [
+  { value: "compact", label: "紧凑", desc: "信息密度最高", sample: 13 },
+  { value: "standard", label: "标准", desc: "推荐，舒适易读", sample: 16 },
+  { value: "large", label: "较大", desc: "长时间阅读更轻松", sample: 19 },
+  { value: "xlarge", label: "特大", desc: "最大化可读性", sample: 23 },
+];
+
+function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, uiFontSize, setUiFontSize }: { onClose: () => void; config: ApiConfig; setConfig: (v: ApiConfig) => void; prompts: PromptConfig; setPrompts: (v: PromptConfig) => void; uiFontSize: UiFontSize; setUiFontSize: (v: UiFontSize) => void }) {
+  const [tab, setTab] = useState<"model" | "prompts" | "appearance">("model");
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveError, setSaveError] = useState("");
+  const [testState, setTestState] = useState<"idle" | "testing" | "ok" | "fail">("idle");
+  const [testMessage, setTestMessage] = useState("");
   const providerModels = MODEL_PRESETS[config.provider]?.models || [];
   const usesCustomModel = !providerModels.includes(config.model);
+  const testConnection = async () => {
+    if (testState === "testing") return;
+    setTestState("testing");
+    setTestMessage("");
+    try {
+      const response = await fetch("/api/models/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model }),
+      });
+      const payload = await response.json();
+      if (payload.ok) {
+        setTestState("ok");
+        setTestMessage(`连接成功，模型可用（${payload.latencyMs} ms）`);
+      } else {
+        setTestState("fail");
+        setTestMessage(payload.error || "连接失败，请检查配置");
+      }
+    } catch {
+      setTestState("fail");
+      setTestMessage("网络错误，无法完成测试");
+    }
+  };
+  // 配置一旦修改，之前的测试结果作废
+  const updateConfig = (next: ApiConfig) => {
+    setTestState("idle");
+    setTestMessage("");
+    setConfig(next);
+  };
   const saveSettings = async () => {
     setSaveState("saving");
     setSaveError("");
@@ -741,26 +874,45 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { on
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal-card settings-card" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <button className="icon-button modal-close" onClick={onClose} aria-label="关闭"><X size={18} /></button>
-        <div className="settings-heading"><div className="modal-icon"><Bot size={24} /></div><div><h2 id="settings-title">AI 设置</h2><p>连接模型，并决定两处 AI 怎样回答你。</p></div></div>
+        <div className="settings-heading"><div className="modal-icon"><Bot size={24} /></div><div><h2 id="settings-title">设置</h2><p>连接模型、调整回答规则和界面外观。</p></div></div>
         <div className="settings-tabs">
           <button className={tab === "model" ? "active" : ""} onClick={() => setTab("model")}>模型连接</button>
           <button className={tab === "prompts" ? "active" : ""} onClick={() => setTab("prompts")}>回答规则</button>
+          <button className={tab === "appearance" ? "active" : ""} onClick={() => setTab("appearance")}>界面</button>
         </div>
-        {tab === "model" ? <div className="settings-pane">
-          <div className="preset-row">
-            {Object.entries(MODEL_PRESETS).map(([name, value]) => (
-              <button key={name} className={config.provider === name ? "selected" : ""} onClick={() => setConfig({ ...config, provider: name, endpoint: value.endpoint, model: value.models[0] })}><ProviderLogo name={name} /><span>{name}</span></button>
+        {tab === "appearance" ? <div className="settings-pane">
+          <div className="font-size-grid">
+            {UI_FONT_OPTIONS.map((option) => (
+              <button key={option.value} className={uiFontSize === option.value ? "selected" : ""} onClick={() => setUiFontSize(option.value)}>
+                <span className="font-size-sample" style={{ fontSize: option.sample }}>Aa</span>
+                <strong>{option.label}</strong>
+                <small>{option.desc}</small>
+              </button>
             ))}
           </div>
-          <label className="field-label">API Base URL<input value={config.endpoint} onChange={(e) => setConfig({ ...config, endpoint: e.target.value })} placeholder="https://api.example.com/v1" /></label>
+          <div className="settings-note"><Check size={14} />字号会立即应用到对话、批注和界面文字，选择会自动记住。PDF 正文请用工具栏的缩放调整。</div>
+        </div> : tab === "model" ? <div className="settings-pane">
+          <div className="preset-row">
+            {Object.entries(MODEL_PRESETS).map(([name, value]) => (
+              <button key={name} className={config.provider === name ? "selected" : ""} onClick={() => updateConfig({ ...config, provider: name, endpoint: value.endpoint, model: value.models[0] })}><ProviderLogo name={name} /><span>{name}</span></button>
+            ))}
+          </div>
+          <label className="field-label">API Base URL<input value={config.endpoint} onChange={(e) => updateConfig({ ...config, endpoint: e.target.value })} placeholder="https://api.example.com/v1" /></label>
           <label className="field-label">模型
-            <select value={usesCustomModel ? "__custom" : config.model} onChange={(event) => setConfig({ ...config, model: event.target.value === "__custom" ? "" : event.target.value })}>
+            <select value={usesCustomModel ? "__custom" : config.model} onChange={(event) => updateConfig({ ...config, model: event.target.value === "__custom" ? "" : event.target.value })}>
               {providerModels.map((model) => <option key={model} value={model}>{model}</option>)}
               <option value="__custom">自定义模型…</option>
             </select>
           </label>
-          {usesCustomModel && <label className="field-label custom-model-field">自定义模型名称<input value={config.model} onChange={(event) => setConfig({ ...config, model: event.target.value })} placeholder="输入接口支持的模型 ID" autoFocus /></label>}
-          <label className="field-label">API Key<input type="password" value={config.apiKey} onChange={(e) => setConfig({ ...config, apiKey: e.target.value })} placeholder={config.hasApiKey ? "************" : "输入 API Key"} /></label>
+          {usesCustomModel && <label className="field-label custom-model-field">自定义模型名称<input value={config.model} onChange={(event) => updateConfig({ ...config, model: event.target.value })} placeholder="输入接口支持的模型 ID" autoFocus /></label>}
+          <label className="field-label">API Key<input type="password" value={config.apiKey} onChange={(e) => updateConfig({ ...config, apiKey: e.target.value })} placeholder={config.hasApiKey ? "************" : "输入 API Key"} /></label>
+          <div className="test-row">
+            <button type="button" className="test-button" onClick={testConnection} disabled={testState === "testing" || !config.endpoint.trim() || !config.model.trim()}>
+              {testState === "testing" ? <><LoaderCircle className="spin" size={14} />正在测试连接…</> : <><Zap size={14} />测试连接</>}
+            </button>
+            {testState === "ok" && <span className="test-result ok"><span className="test-dot" />{testMessage}</span>}
+            {testState === "fail" && <span className="test-result fail"><span className="test-dot" />{testMessage}</span>}
+          </div>
           {!config.hasApiKey && <div className="settings-note"><Check size={14} />密钥会加密保存在本机，之后无需重复填写。</div>}
         </div> : <div className="settings-pane prompt-pane">
           <div className="prompt-field">
@@ -774,7 +926,7 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { on
           <div className="settings-note">可使用 <code>{"{{paperTitle}}"}</code> 代表当前论文标题；修改后会同步到你的账户。</div>
         </div>}
         {saveState === "error" && <div className="settings-error">{saveError}</div>}
-        <button className="primary-button wide" onClick={saveSettings} disabled={saveState === "saving" || !prompts.global.trim() || !prompts.inline.trim() || !config.endpoint.trim() || !config.model.trim()}>{saveState === "saving" ? <><LoaderCircle className="spin" size={16} />正在保存</> : saveState === "saved" ? <><Check size={17} />已保存</> : "保存设置"}</button>
+        {tab !== "appearance" && <button className="primary-button wide" onClick={saveSettings} disabled={saveState === "saving" || !prompts.global.trim() || !prompts.inline.trim() || !config.endpoint.trim() || !config.model.trim()}>{saveState === "saving" ? <><LoaderCircle className="spin" size={16} />正在保存</> : saveState === "saved" ? <><Check size={17} />已保存</> : "保存设置"}</button>}
       </div>
     </div>
   );
@@ -796,6 +948,7 @@ export default function Home() {
   const [libraryPapers, setLibraryPapers] = useState<LibraryPaper[]>([]);
   const [libraryFolders, setLibraryFolders] = useState<LibraryFolder[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [uiFontSize, setUiFontSize] = useStoredPref<"compact" | "standard" | "large" | "xlarge">("lumen-ui-font-size", "standard", UI_FONT_SIZES);
   const [rightOpen, setRightOpen] = useState(true);
   const [source, setSource] = useState<string | Uint8Array | null>(null);
   const [paperId, setPaperId] = useState<string | null>(null);
@@ -819,6 +972,10 @@ export default function Home() {
   const [extractingText, setExtractingText] = useState(false);
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
+  const [statusText, setStatusText] = useState("");
+  const [streaming, setStreaming] = useState(false);
+  const [effort, setEffort] = useStoredPref<ChatEffort>("lumen-chat-effort", "medium", CHAT_EFFORTS);
+  const [inlineEffort, setInlineEffort] = useStoredPref<ChatEffort>("lumen-inline-effort", "medium", CHAT_EFFORTS);
   const [copied, setCopied] = useState(false);
   const [toast, setToast] = useState("");
   const [showReaderTip, setShowReaderTip] = useState(true);
@@ -831,10 +988,12 @@ export default function Home() {
   const activeRangeIdsRef = useRef(new Set<number>());
   const flashTimersRef = useRef(new Map<number, number>());
   const dragRef = useRef<{ id: number; target: "card" | "pin"; startX: number; startY: number; startLeft: number; startTop: number } | null>(null);
+  const resizeRef = useRef<{ id: number; startX: number; startY: number; startWidth: number; startHeight: number } | null>(null);
   const lastDraggedPinRef = useRef<number | null>(null);
   const selectionPointerRef = useRef<{ x: number; y: number; root: Element } | null>(null);
   const selectionFrameRef = useRef(0);
   const restoringWorkspaceRef = useRef(false);
+  const pendingScrollPageRef = useRef<number | null>(null);
   const [config, setConfig] = useState<ApiConfig>({ provider: "OpenAI", endpoint: "https://api.openai.com/v1", model: "gpt-4.1-mini", apiKey: "", hasApiKey: false });
   const [promptConfig, setPromptConfig] = useState<PromptConfig>(DEFAULT_PROMPTS);
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -844,6 +1003,33 @@ export default function Home() {
 
   const handleTextLayerReady = useCallback(() => {
     setTextLayerVersion((version) => version + 1);
+  }, []);
+
+  const scrollToPage = useCallback((page: number, behavior: ScrollBehavior = "smooth") => {
+    const reader = readerRef.current;
+    const target = reader?.querySelector(`[data-page-number="${page}"]`) as HTMLElement | null;
+    if (!reader || !target) return;
+    reader.scrollTo({ top: Math.max(0, target.offsetTop - 18), behavior });
+  }, []);
+
+  const goToPage = useCallback((page: number) => {
+    const next = Math.min(pageCount, Math.max(1, Math.floor(page) || 1));
+    setCurrentPage(next);
+    scrollToPage(next);
+  }, [pageCount, scrollToPage]);
+
+  // 打开/恢复论文后，等文本层渲染出来再滚动到上次阅读页
+  useEffect(() => {
+    if (!textLayerVersion || !pendingScrollPageRef.current) return;
+    const page = pendingScrollPageRef.current;
+    pendingScrollPageRef.current = null;
+    const timer = window.setTimeout(() => scrollToPage(page, "auto"), 60);
+    return () => window.clearTimeout(timer);
+  }, [scrollToPage, textLayerVersion]);
+
+  const toggleFullscreen = useCallback(() => {
+    if (document.fullscreenElement) void document.exitFullscreen();
+    else if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -890,6 +1076,7 @@ export default function Home() {
           setPaperText(paper.paperText || "");
           setPageCount(paper.pageCount || 1);
           setCurrentPage(workspace.currentPage || 1);
+          pendingScrollPageRef.current = workspace.currentPage || 1;
           setZoom(workspace.zoom || 0.88);
           setRightOpen(workspace.rightOpen !== false);
           setMessages(Array.isArray(workspace.messages) && workspace.messages.length ? workspace.messages : [{ id: Date.now(), role: "assistant", content: "已恢复这篇论文的阅读记录。" }]);
@@ -923,26 +1110,66 @@ export default function Home() {
     setLoading(true);
     setRightOpen(true);
     setSelectionPos(null);
+    const assistantId = Date.now() + 1;
+    const steps: string[] = [];
+    let created = false;
+    const pushDelta = (delta: string) => {
+      if (!created) {
+        created = true;
+        setStreaming(true);
+        setStatusText("");
+        setMessages((old) => [...old, { id: assistantId, role: "assistant", content: delta, steps: [...steps] }]);
+      } else {
+        setMessages((old) => old.map((message) => message.id === assistantId ? { ...message, content: message.content + delta } : message));
+      }
+    };
     try {
-      let answer = "";
       if (config.apiKey || config.hasApiKey) {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: text, paperContext: paperText, mode: "global", history: messages.slice(-10), systemPrompts: promptConfig }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: text, paperContext: paperText, mode: "global", history: messages.slice(-10), systemPrompts: promptConfig, effort }),
         });
-        const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || "模型请求失败");
-        answer = payload.content;
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          throw new Error(payload.error || "模型请求失败");
+        }
+        await consumeChatStream(response, {
+          onStep: (label) => {
+            steps.push(label);
+            setStatusText(label);
+            if (created) setMessages((old) => old.map((message) => message.id === assistantId ? { ...message, steps: [...steps] } : message));
+          },
+          onDelta: pushDelta,
+        });
+        setLoading(false);
+        setStreaming(false);
+        setStatusText("");
       } else {
-        await new Promise((resolve) => setTimeout(resolve, 650));
-        answer = demoAnswer(text);
+        const demoSteps = effort === "max" ? ["生成检索词（演示）", "Agent 主动检索 2 轮（演示）"] : effort === "high" ? ["生成检索词（演示）", "第 2 轮补充检索（演示）"] : ["检索相关片段（演示）"];
+        for (const label of demoSteps) {
+          steps.push(label);
+          setStatusText(label);
+          await new Promise((resolve) => setTimeout(resolve, 420));
+        }
+        const demoText = demoAnswer(text);
+        for (let index = 0; index < demoText.length; index += 12) {
+          pushDelta(demoText.slice(index, index + 12));
+          await new Promise((resolve) => setTimeout(resolve, 16));
+        }
+        setLoading(false);
+        setStreaming(false);
+        setStatusText("");
       }
-      setMessages((old) => [...old, { id: Date.now() + 1, role: "assistant", content: answer }]);
-    } catch (error: any) {
-      setMessages((old) => [...old, { id: Date.now() + 1, role: "assistant", content: `连接模型时遇到问题：${error?.message || "请检查 API 设置"}\n\n你可以在右上角的模型设置中检查接口地址与密钥。` }]);
-    } finally { setLoading(false); }
-  }, [config, loading, messages, paperText, paperTitle, promptConfig]);
+    } catch (error: unknown) {
+      const errorText = `连接模型时遇到问题：${error instanceof Error && error.message ? error.message : "请检查 API 设置"}\n\n你可以在右上角的模型设置中检查接口地址与密钥。`;
+      if (created) setMessages((old) => old.map((message) => message.id === assistantId ? { ...message, content: `${message.content}\n\n> ${errorText}` } : message));
+      else setMessages((old) => [...old, { id: assistantId, role: "assistant", content: errorText }]);
+      setLoading(false);
+      setStreaming(false);
+      setStatusText("");
+    }
+  }, [config, effort, loading, messages, paperText, paperTitle, promptConfig]);
 
   const refreshHighlights = useCallback((color: HighlightColor) => {
     if (!(CSS as any).highlights || !(window as any).Highlight) return;
@@ -1005,6 +1232,37 @@ export default function Home() {
     setDraggingId(annotation.id);
   }, []);
 
+  const startAnnotationResize = useCallback((event: React.PointerEvent<HTMLElement>, annotation: Annotation) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const card = (event.currentTarget as HTMLElement).closest(".inline-card");
+    const rect = card?.getBoundingClientRect();
+    resizeRef.current = {
+      id: annotation.id,
+      startX: event.clientX,
+      startY: event.clientY,
+      startWidth: annotation.cardWidth || rect?.width || 342,
+      startHeight: annotation.cardHeight || rect?.height || 300,
+    };
+    setDraggingId(annotation.id);
+  }, []);
+
+  useEffect(() => {
+    const move = (event: PointerEvent) => {
+      const resize = resizeRef.current;
+      if (!resize) return;
+      const cardWidth = Math.min(640, Math.max(260, resize.startWidth + event.clientX - resize.startX));
+      const cardHeight = Math.min(680, Math.max(200, resize.startHeight + event.clientY - resize.startY));
+      updateAnnotation(resize.id, { cardWidth, cardHeight });
+    };
+    const end = () => { resizeRef.current = null; setDraggingId(null); };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+    return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); window.removeEventListener("pointercancel", end); };
+  }, [updateAnnotation]);
+
   useEffect(() => {
     const move = (event: PointerEvent) => {
       const drag = dragRef.current;
@@ -1041,26 +1299,38 @@ export default function Home() {
     const nextThread = [...history, userMessage];
     updateAnnotation(id, { loading: true, result: "", draft: "", thread: nextThread });
     try {
-      let answer = "";
       if (config.apiKey || config.hasApiKey) {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline", history: history.slice(-10), systemPrompts: promptConfig }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, paperContext: paperText, mode: "inline", history: history.slice(-10), systemPrompts: promptConfig, effort: inlineEffort }),
         });
-        const payload = await response.json();
-        if (!response.ok) throw new Error(payload.error || "模型请求失败");
-        answer = payload.content;
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          throw new Error(payload.error || "模型请求失败");
+        }
+        let answer = "";
+        let created = false;
+        const assistantMsgId = Date.now() + 1;
+        await consumeChatStream(response, {
+          onStep: (label) => updateAnnotation(id, { loadingLabel: label }),
+          onDelta: (delta) => {
+            answer += delta;
+            if (!created) { created = true; updateAnnotation(id, { loading: false }); }
+            updateAnnotation(id, { thread: [...nextThread, { id: assistantMsgId, role: "assistant", content: answer }] });
+          },
+        });
+        updateAnnotation(id, { loading: false, result: answer, draft: "", thread: [...nextThread, { id: assistantMsgId, role: "assistant", content: answer }] });
       } else {
         await new Promise((resolve) => setTimeout(resolve, 550));
-        answer = demoAnswer(prompt, text);
+        const answer = demoAnswer(prompt, text);
+        updateAnnotation(id, { loading: false, result: answer, draft: "", thread: [...nextThread, { id: Date.now() + 1, role: "assistant", content: answer }] });
       }
-      updateAnnotation(id, { loading: false, result: answer, draft: "", thread: [...nextThread, { id: Date.now() + 1, role: "assistant", content: answer }] });
     } catch (error: any) {
       const errorText = `连接模型时遇到问题：${error?.message || "请检查 API 设置"}`;
       updateAnnotation(id, { loading: false, result: errorText, thread: [...nextThread, { id: Date.now() + 1, role: "assistant", content: errorText }] });
     }
-  }, [config, paperTitle, promptConfig, updateAnnotation]);
+  }, [config, inlineEffort, paperText, paperTitle, promptConfig, updateAnnotation]);
 
   const handleSelectionStart = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -1526,6 +1796,7 @@ export default function Home() {
       setPaperText(paper.paperText || "");
       setPageCount(paper.pageCount || 1);
       setCurrentPage(workspace.currentPage || 1);
+      pendingScrollPageRef.current = workspace.currentPage || 1;
       setZoom(workspace.zoom || 0.88);
       setRightOpen(workspace.rightOpen !== false);
       setMessages(Array.isArray(workspace.messages) && workspace.messages.length ? workspace.messages : [{ id: Date.now(), role: "assistant", content: "这篇论文已经打开，可以继续提问。" }]);
@@ -1547,6 +1818,8 @@ export default function Home() {
     setPaperId(crypto.randomUUID());
     setPaperSourceKind("remote");
     setPaperSourceUrl(normalized);
+    setCurrentPage(1);
+    pendingScrollPageRef.current = 1;
     setExtractingText(true);
     setPaperText("");
     setSource(`/api/pdf?url=${encodeURIComponent(normalized)}`);
@@ -1577,6 +1850,8 @@ export default function Home() {
       setPaperSourceKind("upload");
       setPaperSourceUrl(null);
       setPaperText("");
+      setCurrentPage(1);
+      pendingScrollPageRef.current = 1;
       setSource(`/api/papers/${payload.paper.id}/file`);
       setPaperTitle(payload.paper.title);
       setPaperMeta(payload.paper.meta);
@@ -1636,13 +1911,12 @@ export default function Home() {
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 2200); return () => clearTimeout(timer); }, [toast]);
 
   return (
-    <main className={`app-shell ${rightOpen ? "right-open" : "right-closed"}`}>
+    <main className={`app-shell font-${uiFontSize} ${rightOpen ? "right-open" : "right-closed"}`}>
       <aside className="app-rail">
         <BrandMark />
         <nav className="rail-nav">
           <RailButton icon={<BookOpen size={20} />} label="阅读器" active />
           <RailButton icon={<Library size={20} />} label="我的文库" onClick={showLibrary} />
-          <RailButton icon={<Search size={20} />} label="探索论文" onClick={() => setOpenModal(true)} />
         </nav>
         <div className="rail-bottom">
           <RailButton icon={<CircleHelp size={20} />} label="使用帮助" onClick={() => setToast("提示：先选中文字，再选择翻译或解释")} />
@@ -1655,29 +1929,35 @@ export default function Home() {
       <section className="workspace">
         <header className="topbar">
           <div className="paper-identity">
-            <button className="icon-button" aria-label="返回"><ArrowLeft size={18} /></button>
             <div className="file-badge"><FileText size={17} /></div>
             <div><h1>{paperTitle}</h1><p>{paperMeta}</p></div>
           </div>
           <div className="top-actions">
             <div className={`sync-status ${saveStatus}`} title="内容变化后会自动写入本地数据库；只有实际写入时才短暂显示保存中">{saveStatus === "error" ? <CloudOff size={14} /> : <Cloud size={14} />}<span>{saveStatus === "loading" ? "读取中" : saveStatus === "saving" ? "保存中" : saveStatus === "error" ? "保存失败" : "本机已保存"}</span></div>
-            <button className="status-pill" onClick={() => setSettingsOpen(true)}><span className={`status-dot ${config.apiKey || config.hasApiKey ? "online" : ""}`} />{config.apiKey || config.hasApiKey ? config.model : "演示模型"}<ChevronDown size={14} /></button>
+            <button className={`model-card ${config.apiKey || config.hasApiKey ? "configured" : ""}`} onClick={() => setSettingsOpen(true)} title={config.apiKey || config.hasApiKey ? `当前模型：${config.model}（点击修改）` : "还没有配置模型，点击去设置"}>
+              <span className={`status-dot ${config.apiKey || config.hasApiKey ? "online" : ""}`} />
+              <span className="model-card-text">
+                <small>{config.apiKey || config.hasApiKey ? "当前模型" : "未配置模型"}</small>
+                <strong>{config.apiKey || config.hasApiKey ? config.model : "演示模式 · 点击配置"}</strong>
+              </span>
+              <ChevronDown size={15} />
+            </button>
+            <EffortControl effort={effort} onChange={setEffort} />
             <button className="secondary-button compact" onClick={() => setOpenModal(true)}><Plus size={16} />打开论文</button>
-            <button className="icon-button" aria-label="更多"><MoreHorizontal size={19} /></button>
-            <button className="icon-button" aria-label={rightOpen ? "收起 AI" : "展开 AI"} onClick={() => setRightOpen(!rightOpen)}>{rightOpen ? <PanelRightClose size={19} /> : <PanelRightOpen size={19} />}</button>
+            <button className="icon-button" aria-label={rightOpen ? "收起 AI" : "展开 AI"} title={rightOpen ? "收起 AI 面板" : "展开 AI 面板"} onClick={() => setRightOpen(!rightOpen)}>{rightOpen ? <PanelRightClose size={19} /> : <PanelRightOpen size={19} />}</button>
           </div>
         </header>
 
         <div className="reader-toolbar">
-          <div className="toolbar-group"><button className="icon-button small" aria-label="上一页" onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}><ChevronLeft size={17} /></button><span className="page-indicator"><input aria-label="当前页" value={currentPage} onChange={(e) => setCurrentPage(Math.min(pageCount, Math.max(1, Number(e.target.value) || 1)))} /> / {pageCount}</span><button className="icon-button small" aria-label="下一页" onClick={() => setCurrentPage(Math.min(pageCount, currentPage + 1))}><ChevronRight size={17} /></button></div>
+          <div className="toolbar-group"><button className="icon-button small" aria-label="上一页" title="上一页" onClick={() => goToPage(currentPage - 1)}><ChevronLeft size={17} /></button><span className="page-indicator"><input aria-label="当前页" title="输入页码后回车跳转" value={currentPage} onChange={(e) => setCurrentPage(Math.min(pageCount, Math.max(1, Number(e.target.value) || 1)))} onKeyDown={(e) => { if (e.key === "Enter") scrollToPage(currentPage); }} onBlur={() => scrollToPage(currentPage)} /> / {pageCount}</span><button className="icon-button small" aria-label="下一页" title="下一页" onClick={() => goToPage(currentPage + 1)}><ChevronRight size={17} /></button></div>
           <div className="toolbar-divider" />
-          <div className="toolbar-group"><button className="icon-button small" aria-label="缩小" onClick={() => setZoom(Math.max(.55, zoom - .1))}><ZoomOut size={17} /></button><button className="zoom-label" onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button><button className="icon-button small" aria-label="放大" onClick={() => setZoom(Math.min(1.8, zoom + .1))}><ZoomIn size={17} /></button></div>
+          <div className="toolbar-group"><button className="icon-button small" aria-label="缩小" title="缩小" onClick={() => setZoom(Math.max(.55, zoom - .1))}><ZoomOut size={17} /></button><button className="zoom-label" title="恢复 100% 缩放" onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button><button className="icon-button small" aria-label="放大" title="放大" onClick={() => setZoom(Math.min(1.8, zoom + .1))}><ZoomIn size={17} /></button></div>
           <div className="toolbar-spacer" />
-          <button className="toolbar-text-button" onClick={() => setToast("拖动选择论文文字即可标记")}><Highlighter size={16} />高亮</button>
-          <button className="icon-button small" aria-label="全屏"><Maximize2 size={17} /></button>
+          <button className="toolbar-text-button" title="拖动选中文字即可翻译、解释或高亮" onClick={() => setShowReaderTip(true)}><Highlighter size={16} />高亮</button>
+          <button className="icon-button small" aria-label="全屏" title="切换全屏" onClick={toggleFullscreen}><Maximize2 size={17} /></button>
         </div>
 
-        <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}`} ref={readerRef} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleSelectionStart} onScroll={() => { if (selectionPos) setSelectionPos(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); }}>
+        <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}`} ref={readerRef} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleSelectionStart} onScroll={() => { if (selectionPos) setSelectionPos(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); const reader = readerRef.current; if (reader) { const probe = reader.scrollTop + 42; let visiblePage = 1; for (const el of Array.from(reader.querySelectorAll<HTMLElement>("[data-page-number]"))) { if (el.offsetTop <= probe) visiblePage = Number(el.dataset.pageNumber || 1); else break; } setCurrentPage((prev) => (prev === visiblePage ? prev : visiblePage)); } }}>
           {source ? (
             <PdfDocument source={source} zoom={zoom} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextLayerReady={handleTextLayerReady} onTextExtracted={handleTextExtracted} onError={handlePdfError} />
           ) : <div style={{ transform: `scale(${zoom})`, transformOrigin: "top center" }}><DemoPaper /></div>}
@@ -1707,19 +1987,22 @@ export default function Home() {
                 {annotation.kind === "translate" ? <Languages size={14} /> : annotation.kind === "formula" || annotation.kind === "explain" ? <Sparkles size={14} /> : annotation.kind === "ask" ? <MessageSquareText size={14} /> : <Highlighter size={14} />}
               </button>
               {annotation.open && (
-                <section className={`inline-card ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`} style={{ top: annotation.cardTop, left: annotation.cardLeft }} onMouseDown={(event) => event.stopPropagation()}>
+                <section className={`inline-card ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`} style={{ top: annotation.cardTop, left: annotation.cardLeft, width: annotation.cardWidth, ...(annotation.cardHeight ? { height: annotation.cardHeight, maxHeight: "none" as const } : {}) }} onMouseDown={(event) => event.stopPropagation()}>
                   <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")} title="拖动移动悬浮卡片">
                     <div className="inline-card-title">
                       <MoreHorizontal className="drag-grip" size={15} />
                       <span>{annotation.kind === "translate" ? <Languages size={15} /> : annotation.kind === "formula" || annotation.kind === "explain" ? <Sparkles size={15} /> : annotation.kind === "ask" ? <MessageSquareText size={15} /> : <Highlighter size={15} />}</span>
                       <div><strong>{annotation.kind === "translate" ? "局部翻译" : annotation.kind === "formula" ? "公式解释" : annotation.kind === "explain" ? "段落解释" : annotation.kind === "ask" ? "针对这段提问" : "高亮标记"}</strong><small>{annotation.kind === "translate" && !shouldPersistAnnotation(annotation) ? "临时翻译 · 本次阅读显示" : "仅使用相关原文 · 自动保存"}</small></div>
                     </div>
-                    <button onClick={() => closeAnnotation(annotation)} aria-label="收起批注"><X size={15} /></button>
+                    <div className="inline-card-actions">
+                      <button className="delete-note-head" onClick={() => removeAnnotation(annotation.id)} aria-label="删除标记" title="删除标记"><Trash2 size={14} /></button>
+                      <button onClick={() => closeAnnotation(annotation)} aria-label="收起批注" title="收起批注"><X size={15} /></button>
+                    </div>
                   </header>
                   <blockquote>{annotation.text}</blockquote>
                   {annotation.kind === "highlight" && <><p className="highlight-saved"><Check size={14} />已保存为{annotation.color === "yellow" ? "黄色" : annotation.color === "green" ? "绿色" : annotation.color === "blue" ? "蓝色" : "玫红色"}高亮</p><label className="highlight-note"><span>个人批注</span><textarea value={annotation.note || ""} onChange={(event) => updateAnnotation(annotation.id, { note: event.target.value })} placeholder="记录你对这段内容的想法…" rows={3} /></label></>}
                   {annotation.thread.length > 0 && <div className="inline-thread">{annotation.thread.map((message) => <div key={message.id} className={`inline-message ${message.role}`}>{message.role === "assistant" ? <MarkdownContent content={message.content} compact /> : <p>{message.content}</p>}</div>)}</div>}
-                  {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />正在结合相邻段落分析…</div>}
+                  {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />{annotation.loadingLabel || "正在结合相邻段落分析…"}</div>}
                   {annotation.kind !== "highlight" && !annotation.loading && (
                     <div className="inline-ask follow-up">
                       <textarea rows={2} value={annotation.draft} onChange={(event) => updateAnnotation(annotation.id, { draft: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && annotation.draft.trim()) { event.preventDefault(); requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, annotation.draft, annotation.thread); } }} placeholder={annotation.thread.length ? "继续追问这段内容…" : "针对这段内容提问…"} autoFocus={annotation.kind === "ask" && annotation.thread.length === 0} />
@@ -1727,6 +2010,7 @@ export default function Home() {
                     </div>
                   )}
                   <footer><button onClick={() => navigator.clipboard.writeText(annotation.result || annotation.text)}><Copy size={13} />复制</button><button className="delete-note" onClick={() => removeAnnotation(annotation.id)}>删除标记</button></footer>
+                  <div className="card-resize-strip"><button className="card-resize-handle" onPointerDown={(event) => startAnnotationResize(event, annotation)} aria-label="拖动调整卡片大小" title="拖动调整大小" /></div>
                 </section>
               )}
             </React.Fragment>
@@ -1751,15 +2035,18 @@ export default function Home() {
             <div key={message.id} className={`message ${message.role}`}>
               {message.role === "assistant" && <div className="message-avatar"><Sparkles size={14} /></div>}
               <div className="message-body">
+                {message.role === "assistant" && message.steps && message.steps.length > 0 && <div className="message-steps"><Zap size={11} /><span>{message.steps.join(" → ")}</span></div>}
                 {message.role === "assistant" ? <MarkdownContent content={message.content} /> : <p>{message.content}</p>}
                 {message.role === "assistant" && <div className="message-tools"><button aria-label="复制回答" onClick={() => navigator.clipboard.writeText(message.content)}><Copy size={13} /></button><button aria-label="有帮助"><Check size={13} /></button></div>}
               </div>
             </div>
           ))}
-          {loading && <div className="message assistant"><div className="message-avatar"><Sparkles size={14} /></div><div className="thinking"><span /><span /><span /></div></div>}
+          {loading && !streaming && <div className="message assistant"><div className="message-avatar"><Sparkles size={14} /></div><div className="thinking-wrap"><div className="thinking"><span /><span /><span /></div>{statusText && <div className="thinking-status"><Zap size={11} />{statusText}</div>}</div></div>}
         </div>
         <div className="composer-wrap">
-          <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? "解析中" : paperText ? "上下文已就绪" : "等待文字"}</small></div>
+          <div className="composer-top-row">
+            <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? "解析中" : paperText ? "上下文已就绪" : "等待文字"}</small></div>
+          </div>
           <div className="composer">
             <textarea value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question); } }} placeholder="询问整篇论文…" rows={2} />
             <div className="composer-bottom"><span>⌘ ↵</span><button onClick={() => sendQuestion(question)} disabled={!question.trim() || loading || extractingText} aria-label="发送"><Send size={16} /></button></div>
@@ -1770,6 +2057,17 @@ export default function Home() {
 
       {selectionPos && (
         <div className="selection-menu" style={{ left: selectionPos.x, top: selectionPos.y }}>
+          {(() => {
+            const inlineIndex = CHAT_EFFORT_LEVELS.findIndex((level) => level.value === inlineEffort);
+            const current = CHAT_EFFORT_LEVELS[inlineIndex] || CHAT_EFFORT_LEVELS[0];
+            const cycle = () => setInlineEffort(CHAT_EFFORT_LEVELS[(inlineIndex + 1) % CHAT_EFFORT_LEVELS.length].value);
+            return (
+              <button className={`inline-effort-toggle level-${inlineIndex}`} onClick={cycle} title={`划词力度：${current.label}（点击切换）\n${current.desc}`} aria-label={`划词力度：${current.label}，点击切换`}>
+                <Zap size={14} /><i>{current.label}</i>
+              </button>
+            );
+          })()}
+          <span />
           <button onClick={() => createAnnotation("translate", "green")}><Languages size={15} />翻译</button>
           <button onClick={() => createAnnotation("explain", "green")}><Sparkles size={15} />解释</button>
           <button onClick={() => createAnnotation("ask", "green")}><MessageSquareText size={15} />提问</button>
@@ -1784,10 +2082,10 @@ export default function Home() {
       </div>}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
       {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} />}
-      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} />}
+      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} uiFontSize={uiFontSize} setUiFontSize={setUiFontSize} />}
       {toast && <div className="toast"><Check size={15} />{toast}</div>}
       {!authReady && <div className="auth-gate"><div className="auth-card"><BrandMark /><LoaderCircle className="spin" size={22} /><h2>正在确认登录状态</h2><p>正在安全地读取你的论文空间…</p></div></div>}
-      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>开始使用 Lumen Paper</h2><p>暂时不配置登录也没关系，可以先用游客身份继续阅读和测试。</p><button className="primary-button wide auth-guest" onClick={startGuestSession} disabled={guestSubmitting}>{guestSubmitting ? <><LoaderCircle className="spin" size={15} />正在创建游客空间</> : "游客试用"}</button><div className="auth-divider"><span>以后再登录</span></div><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a>{authMessage && <div className="auth-message">{authMessage}</div>}<small>游客数据只绑定当前浏览器；清除 Cookie 后无法恢复，也不能跨设备同步。</small></div></div>}
+      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>开始使用文枢</h2><p>暂时不配置登录也没关系，可以先用游客身份继续阅读和测试。</p><button className="primary-button wide auth-guest" onClick={startGuestSession} disabled={guestSubmitting}>{guestSubmitting ? <><LoaderCircle className="spin" size={15} />正在创建游客空间</> : "游客试用"}</button><div className="auth-divider"><span>以后再登录</span></div><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a>{authMessage && <div className="auth-message">{authMessage}</div>}<small>游客数据只绑定当前浏览器；清除 Cookie 后无法恢复，也不能跨设备同步。</small></div></div>}
     </main>
   );
 }

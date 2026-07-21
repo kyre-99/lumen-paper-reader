@@ -20,19 +20,41 @@
 - 本地 SQLite（Cloudflare D1）与本地对象存储（R2）开发模式
 - 可选 Supabase 邮箱、Google 和游客登录
 
+## 界面预览
+
+| 阅读器主界面 | 划词即译 / 即问 |
+| --- | --- |
+| ![阅读器主界面](docs/screenshots/01-reader.jpg) | ![划词工具条](docs/screenshots/02-selection.jpg) |
+
+| 文件夹文库与阅读状态 | 全局用量账单 |
+| --- | --- |
+| ![文库与阅读状态](docs/screenshots/03-library.jpg) | ![用量账单](docs/screenshots/04-usage.jpg) |
+
 ## 本地运行
 
 需要 Node.js `>=22.13.0`。
 
+### 一键启动
+
 ```bash
 git clone https://github.com/kyre-99/lumen-paper-reader.git
 cd lumen-paper-reader
+```
+
+- Windows：双击 `scripts/setup.bat`（或在终端执行）
+- macOS / Linux / Git Bash：`./scripts/setup.sh`
+
+脚本会自动完成依赖安装、生成带随机密钥的 `.dev.vars`、初始化本地数据库并启动。之后再次启动只需重新运行同一脚本。
+
+### 手动步骤
+
+```bash
 npm install
 cp .env.example .dev.vars
 npm run local
 ```
 
-打开终端显示的本地地址即可使用。默认建议在 `.dev.vars` 中设置：
+打开终端显示的本地地址即可使用。一键脚本会自动生成下面的配置；手动安装时，默认建议在 `.dev.vars` 中设置：
 
 ```env
 LOCAL_ONLY=true

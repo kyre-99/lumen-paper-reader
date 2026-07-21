@@ -1,0 +1,1 @@
+ALTER TABLE `papers` ADD `status` text DEFAULT 'unread' NOT NULL;

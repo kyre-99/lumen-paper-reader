@@ -36,6 +36,27 @@
       "when": 1784279293276,
       "tag": "0004_tricky_killraven",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1784567480693,
+      "tag": "0005_living_prism",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1784598363805,
+      "tag": "0006_useful_dakota_north",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1784599274310,
+      "tag": "0007_misty_slapstick",
+      "breakpoints": true
     }
   ]
 }

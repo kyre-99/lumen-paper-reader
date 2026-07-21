@@ -29,6 +29,7 @@ export const papers = sqliteTable("papers", {
   objectKey: text("object_key"),
   paperText: text("paper_text").notNull().default(""),
   pageCount: integer("page_count").notNull().default(1),
+  status: text("status", { enum: ["unread", "reading", "done"] }).notNull().default("unread"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
@@ -55,6 +56,17 @@ export const paperStates = sqliteTable("paper_states", {
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
 
+export const llmUsage = sqliteTable("llm_usage", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  model: text("model").notNull().default(""),
+  mode: text("mode", { enum: ["global", "inline"] }).notNull().default("global"),
+  effort: text("effort", { enum: ["medium", "high", "max"] }).notNull().default("medium"),
+  promptTokens: integer("prompt_tokens").notNull().default(0),
+  completionTokens: integer("completion_tokens").notNull().default(0),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});
+
 export const userSettings = sqliteTable("user_settings", {
   userId: text("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
   globalSystemPrompt: text("global_system_prompt").notNull().default(""),
@@ -63,5 +75,10 @@ export const userSettings = sqliteTable("user_settings", {
   modelEndpoint: text("model_endpoint").notNull().default("https://api.openai.com/v1"),
   modelName: text("model_name").notNull().default("gpt-4.1-mini"),
   apiKeyEncrypted: text("api_key_encrypted").notNull().default(""),
+  syncEndpoint: text("sync_endpoint").notNull().default(""),
+  syncUsername: text("sync_username").notNull().default(""),
+  syncPasswordEncrypted: text("sync_password_encrypted").notNull().default(""),
+  syncRemotePath: text("sync_remote_path").notNull().default("lumen-backup"),
+  syncLastBackupAt: text("sync_last_backup_at"),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });

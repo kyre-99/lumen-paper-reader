@@ -8,7 +8,7 @@ export async function generateMetadata(): Promise<Metadata> {
   const protocol = incoming.get("x-forwarded-proto") || (host.startsWith("localhost") ? "http" : "https");
   const origin = `${protocol}://${host}`;
   return {
-    title: "文枢 Wenshu — AI 论文阅读器",
+    title: "文枢 Wenshu",
     description: "打开、理解并与每一篇研究论文对话。支持局部翻译、选区解释与自定义 AI 模型。",
     icons: { icon: "/favicon.svg", shortcut: "/favicon.svg" },
     openGraph: {

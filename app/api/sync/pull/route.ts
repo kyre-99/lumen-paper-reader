@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
 import { requireAppUser } from "../../../server-user";
+import { sanitizeObjectKey } from "../../../object-key";
 import { loadSyncConfig } from "../config";
 import { isSyncSnapshot, restoreSnapshot } from "../snapshot";
 import { getFile } from "../webdav";
@@ -37,7 +38,8 @@ export async function POST() {
         const response = await getFile(config, `${config.remotePath}/files/${paper.id}.pdf`);
         if (!response) { missing++; continue; }
         const body = await response.arrayBuffer();
-        await bucket.put(String(paper.objectKey), body, { httpMetadata: { contentType: "application/pdf" } });
+        const objectKey = await sanitizeObjectKey(user.id, String(paper.objectKey));
+        await bucket.put(objectKey, body, { httpMetadata: { contentType: "application/pdf" } });
         files++;
       } catch {
         missing++;

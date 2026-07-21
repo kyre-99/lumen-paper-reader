@@ -23,12 +23,8 @@ function persistentAnnotations(value: unknown) {
   });
 }
 
-async function requireApiUser() {
-  return requireAppUser();
-}
-
 export async function GET(request: Request) {
-  const user = await requireApiUser();
+  const user = await requireAppUser();
   if (!user) return Response.json({ error: "需要登录" }, { status: 401 });
 
   const db = getDb();
@@ -67,7 +63,7 @@ export async function GET(request: Request) {
 }
 
 export async function PUT(request: Request) {
-  const user = await requireApiUser();
+  const user = await requireAppUser();
   if (!user) return Response.json({ error: "需要登录" }, { status: 401 });
 
   const payload = await request.json() as any;
@@ -123,10 +119,10 @@ export async function PUT(request: Request) {
     currentPage: Math.max(1, Math.min(1000, Number(payload.currentPage) || 1)),
     zoom: Math.max(0.4, Math.min(2.5, Number(payload.zoom) || 0.88)),
     rightOpen: payload.rightOpen !== false,
-    messagesJson,
-    annotationsJson,
     updatedAt: new Date().toISOString(),
   };
+  // readerStates 只保留“当前打开哪篇 + 视口状态”指针；messagesJson/annotationsJson 消息副本只写 paperStates。
+  // 读取侧对 readerStates 旧数据的兼容回退（GET 中 restoredState 逻辑）保留不动。
   await db.insert(readerStates).values(stateValues).onConflictDoUpdate({ target: readerStates.userId, set: stateValues });
   if (activePaperId) {
     const paperStateValues = {

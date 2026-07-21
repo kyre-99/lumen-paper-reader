@@ -1,18 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
 import { getDb } from "../../../../db";
 import { userSettings } from "../../../../db/schema";
-import { decryptApiKey } from "../../../model-config-crypto";
+import { chatCompletionsUrl, resolveModelConfig } from "../../../model-config";
 import { requireAppUser } from "../../../server-user";
-
-function chatCompletionsUrl(input: string) {
-  const target = new URL(input);
-  if (target.protocol !== "https:") throw new Error("API 地址必须使用 HTTPS");
-  const path = target.pathname.replace(/\/+$/, "");
-  if (!path.endsWith("/chat/completions")) target.pathname = `${path}/chat/completions`;
-  return target;
-}
 
 export async function POST(request: NextRequest) {
   try {
@@ -22,10 +13,7 @@ export async function POST(request: NextRequest) {
     const { endpoint, apiKey, model } = body;
     const db = getDb();
     const [savedSettings] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
-    const runtime = env as unknown as Record<string, string | undefined>;
-    const resolvedEndpoint = String(endpoint || savedSettings?.modelEndpoint || runtime.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "").trim();
-    const resolvedModel = String(model || savedSettings?.modelName || runtime.OPENAI_MODEL || process.env.OPENAI_MODEL || "").trim();
-    const resolvedApiKey = String(apiKey || (savedSettings?.apiKeyEncrypted ? await decryptApiKey(savedSettings.apiKeyEncrypted) : "") || runtime.OPENAI_API_KEY || process.env.OPENAI_API_KEY || "").trim();
+    const { endpoint: resolvedEndpoint, model: resolvedModel, apiKey: resolvedApiKey } = await resolveModelConfig(savedSettings, { endpoint, apiKey, model });
     if (!resolvedEndpoint || !resolvedModel) return NextResponse.json({ ok: false, error: "请先填写 Base URL 和模型" }, { status: 400 });
     if (!resolvedApiKey) return NextResponse.json({ ok: false, error: "请先填写 API Key" }, { status: 400 });
     let target: URL;

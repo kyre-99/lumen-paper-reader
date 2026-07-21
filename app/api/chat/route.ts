@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { env } from "cloudflare:workers";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { getDb } from "../../../db";
-import { llmUsage, userSettings } from "../../../db/schema";
+import { llmUsage, papers, userSettings } from "../../../db/schema";
 import { DEFAULT_PROMPTS, renderSystemPrompt } from "../../chat-prompts";
-import { decryptApiKey } from "../../model-config-crypto";
+import { chatCompletionsUrl, resolveModelConfig } from "../../model-config";
 import { requireAppUser } from "../../server-user";
 
 const MAX_REFERENCE_CHARS = 26000;
@@ -77,6 +76,32 @@ function chunkPaper(fullText: string): Chunk[] {
   return chunks;
 }
 
+// 分块结果的模块级缓存：同一篇论文的重复提问不再每次重新切分全文。
+// key 为 `paperId:updatedAt`（服务端从库读取时）或文本长度+首尾采样哈希（客户端直传时）。
+const CHUNK_CACHE_LIMIT = 20;
+const chunkCache = new Map<string, Chunk[]>();
+
+function chunkCacheKey(paperId: string, updatedAt: string, text: string) {
+  if (paperId) return `${paperId}:${updatedAt}`;
+  const sample = `${text.slice(0, 64)}${text.length}${text.slice(-64)}`;
+  let hash = 0;
+  for (let index = 0; index < sample.length; index++) hash = (hash * 31 + sample.charCodeAt(index)) | 0;
+  return `text:${text.length}:${hash}`;
+}
+
+function cachedChunkPaper(cacheKey: string, text: string): Chunk[] {
+  const cached = chunkCache.get(cacheKey);
+  if (cached) return cached;
+  const chunks = chunkPaper(text);
+  if (chunkCache.size >= CHUNK_CACHE_LIMIT) {
+    // Map 按插入序迭代，满了就清掉最旧的一条
+    const oldest = chunkCache.keys().next().value;
+    if (oldest !== undefined) chunkCache.delete(oldest);
+  }
+  chunkCache.set(cacheKey, chunks);
+  return chunks;
+}
+
 function extractTerms(text: string): string[] {
   const latin = text.toLowerCase().match(/[a-z0-9][a-z0-9-]{1,}/g) || [];
   const cjk = text.match(/[\u4e00-\u9fff]/g) || [];
@@ -140,14 +165,6 @@ function cleanHistory(history: unknown, limit: number) {
     .filter((item) => item && (item.role === "user" || item.role === "assistant") && typeof item.content === "string")
     .slice(-limit)
     .map((item) => ({ role: item.role, content: item.content.slice(0, 12000) }));
-}
-
-function chatCompletionsUrl(input: string) {
-  const target = new URL(input);
-  if (target.protocol !== "https:") throw new Error("API 地址必须使用 HTTPS");
-  const path = target.pathname.replace(/\/+$/, "");
-  if (!path.endsWith("/chat/completions")) target.pathname = `${path}/chat/completions`;
-  return target;
 }
 
 async function complete(target: URL, apiKey: string, payload: Record<string, unknown>, meter?: TokenMeter): Promise<string> {
@@ -288,7 +305,10 @@ export async function POST(request: NextRequest) {
     const user = await requireAppUser();
     if (!user) return NextResponse.json({ error: "需要登录" }, { status: 401 });
     const body = await request.json();
-    const { endpoint, apiKey, model, paperTitle, question, paperContext = "", selectedText = "", surroundingContext = "", mode = "global", history = [], systemPrompts = {}, effort = "medium" } = body;
+    const { endpoint, apiKey, model, paperTitle, paperId = "", question, paperContext = "", selectedText = "", surroundingContext = "", mode = "global", history = [], systemPrompts = {}, effort = "medium" } = body;
+    // 输入大小上限：论文全文与对话历史分别限制 200KB / 100KB，避免超大请求体打满 Worker 内存
+    if (typeof paperContext === "string" && paperContext.length > 200 * 1024) return NextResponse.json({ error: "论文内容过大" }, { status: 413 });
+    if (JSON.stringify(Array.isArray(history) ? history : []).length > 100 * 1024) return NextResponse.json({ error: "对话历史过大" }, { status: 413 });
     // 框选图表问答：仅 inline 模式接受截图，校验 data URL 格式与解码后大小
     const imageDataUrl = mode === "inline" && typeof body.imageDataUrl === "string" ? body.imageDataUrl : "";
     if (imageDataUrl) {
@@ -297,13 +317,19 @@ export async function POST(request: NextRequest) {
       if ((imageDataUrl.length - commaAt - 1) * 0.75 > MAX_IMAGE_BYTES) return NextResponse.json({ error: "截图过大，请框选更小的区域" }, { status: 400 });
     }
     const db = getDb();
+    // 论文已入库时前端只带 paperId：校验归属后从库里取全文，避免每次提问都重传整篇文本
+    const paperIdText = String(paperId || "").slice(0, 80);
+    const fromClient = typeof paperContext === "string" && paperContext.length > 0;
+    let resolvedPaperContext = fromClient ? paperContext : "";
+    let paperUpdatedAt = "";
+    if (!resolvedPaperContext && paperIdText) {
+      const [paper] = await db.select({ paperText: papers.paperText, updatedAt: papers.updatedAt }).from(papers).where(and(eq(papers.id, paperIdText), eq(papers.userId, user.id))).limit(1);
+      resolvedPaperContext = paper?.paperText || "";
+      paperUpdatedAt = paper?.updatedAt || "";
+    }
+    const chunkKey = chunkCacheKey(fromClient ? "" : paperIdText, paperUpdatedAt, resolvedPaperContext);
     const [savedSettings] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
-    const runtime = env as unknown as Record<string, string | undefined>;
-    // 带图请求优先使用图表理解模型配置，缺省的字段逐项回退：请求体 → 主模型配置 → 环境变量
-    const visionKey = imageDataUrl && savedSettings?.visionApiKeyEncrypted ? await decryptApiKey(savedSettings.visionApiKeyEncrypted) : "";
-    const resolvedEndpoint = String((imageDataUrl && savedSettings?.visionModelEndpoint) || endpoint || savedSettings?.modelEndpoint || runtime.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "").trim();
-    const resolvedModel = String((imageDataUrl && savedSettings?.visionModelName) || model || savedSettings?.modelName || runtime.OPENAI_MODEL || process.env.OPENAI_MODEL || "").trim();
-    const resolvedApiKey = String(visionKey || apiKey || (savedSettings?.apiKeyEncrypted ? await decryptApiKey(savedSettings.apiKeyEncrypted) : "") || runtime.OPENAI_API_KEY || process.env.OPENAI_API_KEY || "").trim();
+    const { endpoint: resolvedEndpoint, model: resolvedModel, apiKey: resolvedApiKey } = await resolveModelConfig(savedSettings, { endpoint, apiKey, model }, { vision: Boolean(imageDataUrl) });
     if (!resolvedEndpoint || !resolvedApiKey || !resolvedModel || !question) return NextResponse.json({ error: "模型配置不完整，请先在 AI 设置中保存" }, { status: 400 });
     const target = chatCompletionsUrl(resolvedEndpoint);
     const isInline = mode === "inline";
@@ -337,7 +363,7 @@ export async function POST(request: NextRequest) {
           } else if (isInline) {
             // 划词问答：medium 只用选区和相邻原文（零额外调用）；high/max 会从全论文检索补充上下文
             const questionText = String(question);
-            const chunks = chunkPaper(String(paperContext));
+            const chunks = cachedChunkPaper(chunkKey, resolvedPaperContext);
             const gathered = new Map<number, Chunk>();
             if (chunks.length && level !== "medium") {
               let queries = [questionText, String(selectedText).slice(0, 120)];
@@ -367,7 +393,7 @@ export async function POST(request: NextRequest) {
             for await (const delta of streamCompletion(target, resolvedApiKey, { model: resolvedModel, messages, temperature: 0.3 }, meter)) send({ type: "delta", text: delta });
           } else {
             const questionText = String(question);
-            const chunks = chunkPaper(String(paperContext));
+            const chunks = cachedChunkPaper(chunkKey, resolvedPaperContext);
             const gathered = new Map<number, Chunk>();
 
             let queries = [questionText];

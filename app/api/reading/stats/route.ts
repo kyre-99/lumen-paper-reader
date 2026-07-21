@@ -39,8 +39,9 @@ export async function GET(request: Request) {
     weekSeconds += session.activeSeconds;
   }
 
-  // 连读天数：从“今天或昨天”出发逐日回溯，统计有阅读记录的连续自然日
-  const allDays = await db.selectDistinct({ day: readingSessions.day }).from(readingSessions).where(eq(readingSessions.userId, user.id));
+  // 连读天数：从“今天或昨天”出发逐日回溯，统计有阅读记录的连续自然日；
+  // 只取最近 400 个活跃日（连读回溯用不到更早的数据），避免全表 distinct 无上限扫描
+  const allDays = await db.selectDistinct({ day: readingSessions.day }).from(readingSessions).where(eq(readingSessions.userId, user.id)).orderBy(desc(readingSessions.day)).limit(400);
   const activeDays = new Set(allDays.map((row) => row.day));
   let streakDays = 0;
   let cursor = activeDays.has(today) ? today : shiftDay(today, -1);

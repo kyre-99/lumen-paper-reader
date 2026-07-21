@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
 import { requireAppUser } from "../../../server-user";
+import { sanitizeObjectKey } from "../../../object-key";
 import { buildSnapshot, isSyncSnapshot, restoreSnapshot } from "../snapshot";
 
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
@@ -67,7 +68,7 @@ export async function POST(request: Request) {
   let missing = 0;
   if (bucket && Array.isArray(embedded)) {
     for (const item of embedded as Array<{ paperId?: unknown; objectKey?: unknown; base64?: unknown }>) {
-      const objectKey = String(item?.objectKey || "").slice(0, 500);
+      const objectKey = await sanitizeObjectKey(user.id, String(item?.objectKey || ""));
       const base64 = typeof item?.base64 === "string" ? item.base64 : "";
       if (!objectKey || !base64) { missing++; continue; }
       try {

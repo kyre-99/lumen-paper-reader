@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
@@ -16,7 +16,7 @@ export const paperFolders = sqliteTable("paper_folders", {
   name: text("name").notNull(),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-});
+}, (table) => [index("paper_folders_user_id_idx").on(table.userId)]);
 
 export const papers = sqliteTable("papers", {
   id: text("id").primaryKey(),
@@ -32,7 +32,7 @@ export const papers = sqliteTable("papers", {
   status: text("status", { enum: ["unread", "reading", "done"] }).notNull().default("unread"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-});
+}, (table) => [index("papers_user_id_idx").on(table.userId)]);
 
 export const readerStates = sqliteTable("reader_states", {
   userId: text("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
@@ -68,7 +68,7 @@ export const readingSessions = sqliteTable("reading_sessions", {
   activeSeconds: integer("active_seconds").notNull().default(0),
   startPage: integer("start_page"),
   endPage: integer("end_page"),
-});
+}, (table) => [index("reading_sessions_user_paper_day_idx").on(table.userId, table.paperId, table.day)]);
 
 export const llmUsage = sqliteTable("llm_usage", {
   id: text("id").primaryKey(),
@@ -79,7 +79,7 @@ export const llmUsage = sqliteTable("llm_usage", {
   promptTokens: integer("prompt_tokens").notNull().default(0),
   completionTokens: integer("completion_tokens").notNull().default(0),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-});
+}, (table) => [index("llm_usage_user_id_idx").on(table.userId)]);
 
 export const userSettings = sqliteTable("user_settings", {
   userId: text("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),

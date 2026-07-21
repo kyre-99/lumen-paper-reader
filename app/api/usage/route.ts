@@ -1,4 +1,4 @@
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
 import { getDb } from "../../../db";
 import { llmUsage } from "../../../db/schema";
 import { requireAppUser } from "../../server-user";
@@ -30,36 +30,37 @@ export async function GET() {
   const user = await requireAppUser();
   if (!user) return Response.json({ error: "需要登录" }, { status: 401 });
   const db = getDb();
-  const rows = await db.select().from(llmUsage).where(eq(llmUsage.userId, user.id)).orderBy(desc(llmUsage.createdAt)).limit(2000);
+  // 总额与分模型统计在 SQL 侧聚合，避免把整表拉回 JS；费用按模型汇总后估算（对 tokens 是线性的，结果一致）
+  const [totals] = await db.select({
+    calls: sql<number>`count(*)`,
+    promptTokens: sql<number>`coalesce(sum(${llmUsage.promptTokens}), 0)`,
+    completionTokens: sql<number>`coalesce(sum(${llmUsage.completionTokens}), 0)`,
+  }).from(llmUsage).where(eq(llmUsage.userId, user.id));
+  const modelRows = await db.select({
+    model: llmUsage.model,
+    calls: sql<number>`count(*)`,
+    promptTokens: sql<number>`coalesce(sum(${llmUsage.promptTokens}), 0)`,
+    completionTokens: sql<number>`coalesce(sum(${llmUsage.completionTokens}), 0)`,
+  }).from(llmUsage).where(eq(llmUsage.userId, user.id)).groupBy(llmUsage.model);
+  const recent = await db.select().from(llmUsage).where(eq(llmUsage.userId, user.id)).orderBy(desc(llmUsage.createdAt)).limit(12);
 
-  let promptTokens = 0;
-  let completionTokens = 0;
   let estimatedCost = 0;
   let hasPricedModel = false;
-  const perModel = new Map<string, { model: string; calls: number; promptTokens: number; completionTokens: number; estimatedCost: number | null }>();
-
-  for (const row of rows) {
-    promptTokens += row.promptTokens;
-    completionTokens += row.completionTokens;
+  const perModel = modelRows.map((row) => {
     const cost = estimateCost(row.model, row.promptTokens, row.completionTokens);
     if (cost !== null) { estimatedCost += cost; hasPricedModel = true; }
-    const entry = perModel.get(row.model) || { model: row.model, calls: 0, promptTokens: 0, completionTokens: 0, estimatedCost: null as number | null };
-    entry.calls += 1;
-    entry.promptTokens += row.promptTokens;
-    entry.completionTokens += row.completionTokens;
-    if (cost !== null) entry.estimatedCost = (entry.estimatedCost ?? 0) + cost;
-    perModel.set(row.model, entry);
-  }
+    return { model: row.model, calls: row.calls, promptTokens: row.promptTokens, completionTokens: row.completionTokens, estimatedCost: cost };
+  });
 
   return Response.json({
-    totalCalls: rows.length,
-    promptTokens,
-    completionTokens,
-    totalTokens: promptTokens + completionTokens,
+    totalCalls: totals?.calls || 0,
+    promptTokens: totals?.promptTokens || 0,
+    completionTokens: totals?.completionTokens || 0,
+    totalTokens: (totals?.promptTokens || 0) + (totals?.completionTokens || 0),
     estimatedCost: hasPricedModel ? estimatedCost : null,
     currency: "USD",
-    perModel: [...perModel.values()].sort((a, b) => b.promptTokens + b.completionTokens - (a.promptTokens + a.completionTokens)),
-    recent: rows.slice(0, 12).map((row) => ({
+    perModel: perModel.sort((a, b) => b.promptTokens + b.completionTokens - (a.promptTokens + a.completionTokens)),
+    recent: recent.map((row) => ({
       id: row.id,
       model: row.model,
       mode: row.mode,

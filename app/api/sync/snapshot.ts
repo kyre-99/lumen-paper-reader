@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import { getDb } from "../../../db";
 import { paperFolders, papers, paperStates, readerStates } from "../../../db/schema";
+import { sanitizeObjectKey } from "../../object-key";
 
 // 全量备份快照（version 1），WebDAV 与本地导出共用
 export type SyncSnapshot = {
@@ -43,7 +44,9 @@ export async function restoreSnapshot(userId: string, snapshot: SyncSnapshot) {
     statements.push(db.insert(paperFolders).values({ ...folder, id: String(folder.id).slice(0, 64), userId, name: String(folder.name || "文件夹").slice(0, 200) }));
   }
   for (const paper of snapshot.papers) {
-    statements.push(db.insert(papers).values({ ...paper, id: String(paper.id).slice(0, 64), userId, title: String(paper.title || "未命名论文").slice(0, 500) }));
+    // 备份里的 objectKey 可能指向他人目录，统一重写为本用户目录下的合法 key
+    const objectKey = paper.objectKey ? await sanitizeObjectKey(userId, String(paper.objectKey)) : paper.objectKey;
+    statements.push(db.insert(papers).values({ ...paper, id: String(paper.id).slice(0, 64), userId, title: String(paper.title || "未命名论文").slice(0, 500), objectKey }));
   }
   for (const state of snapshot.paperStates) {
     statements.push(db.insert(paperStates).values({ ...state, paperId: String(state.paperId).slice(0, 64), userId }));

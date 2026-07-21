@@ -1,12 +1,8 @@
 import { env } from "cloudflare:workers";
 import { requireAppUser } from "../../../server-user";
+import { shortUserHash } from "../../../object-key";
 import { getDb } from "../../../../db";
 import { papers } from "../../../../db/schema";
-
-async function shortUserHash(email: string) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(email));
-  return Array.from(new Uint8Array(digest)).slice(0, 10).map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
 
 export async function POST(request: Request) {
   const user = await requireAppUser();

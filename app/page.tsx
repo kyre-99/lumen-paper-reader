@@ -48,11 +48,6 @@ import {
   ZoomOut,
 } from "lucide-react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
-import rehypeKatex from "rehype-katex";
-import "katex/dist/katex.min.css";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { DEFAULT_PROMPTS, type PromptConfig } from "./chat-prompts";
 import { parseReferences, parseAuthorYearReferences, matchAuthorYearEntry, type AuthorYearCitation } from "./references";
@@ -704,48 +699,14 @@ function demoAnswer(prompt: string, context?: string) {
   return `### 这段话在说什么？\n\n作者强调的是：传统序列模型需要逐步传递信息，而注意力机制让两个相距很远的位置也能**直接建立联系**。\n\n${context ? `> ${context}\n\n` : ""}这带来两个直接好处：\n\n- 更容易捕捉长距离依赖\n- 计算可以并行执行，训练速度更快\n\n如果你愿意，我还可以用一个具体句子画出 Q、K、V 的计算过程。`;
 }
 
-// 把模型常用的 \(...\) 和 \[...\] 公式写法统一转成 $...$ / $$...$$，跳过代码块
-function normalizeMathDelimiters(content: string) {
-  return content.split(/(```[\s\S]*?```|`[^`\n]*`)/g).map((part) => {
-    if (part.startsWith("`")) return part;
-    return part
-      .replace(/\\\[([\s\S]*?)\\\]/g, (_match, tex) => `$$${tex}$$`)
-      .replace(/\\\(([\s\S]*?)\\\)/g, (_match, tex) => `$${tex}$`);
-  }).join("");
-}
-
-// 把模型按输出契约写的【P1, P3】页码引用转成 markdown 链接（#cite-page-N），
-// 渲染时变成可点击 chip，点击跳到对应页；跳过代码块避免误替换
-function linkifyPageCitations(content: string) {
-  return content.split(/(```[\s\S]*?```|`[^`\n]*`)/g).map((part) => {
-    if (part.startsWith("`")) return part;
-    return part.replace(/【\s*P((?:\d+\s*[,，、]?\s*P?)+)】/g, (_match, inner: string) => {
-      const pages = inner.match(/\d+/g) || [];
-      return pages.map((page) => `[【P${page}】](#cite-page-${page})`).join(" ");
-    });
-  }).join("");
-}
-
-// memo 包裹：流式输出时只有当前消息变化，历史消息不必重新跑 Markdown/KaTeX 解析
+// Markdown/KaTeX 依赖较重，拆到 markdown-content.tsx 按需加载，不进首屏 bundle；
+// 加载期间先用纯文本占位（whitespace-pre-wrap），内容始终可读
+const MarkdownContentLazy = React.lazy(() => import("./markdown-content"));
 const MarkdownContent = React.memo(function MarkdownContent({ content, compact = false, onPageJump }: { content: string; compact?: boolean; onPageJump?: (page: number) => void }) {
   return (
-    <div className={`markdown-content${compact ? " compact" : ""}`}>
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
-        components={{
-          a: ({ children, href, ...props }) => {
-            const cite = href?.match(/^#cite-page-(\d+)$/);
-            if (cite && onPageJump) {
-              return <button type="button" className="page-cite" title={`跳转到第 ${cite[1]} 页`} onClick={(event) => { event.preventDefault(); event.stopPropagation(); onPageJump(Number(cite[1])); }}>{children}</button>;
-            }
-            return <a href={href} {...props} target="_blank" rel="noreferrer">{children}</a>;
-          },
-        }}
-      >
-        {linkifyPageCitations(normalizeMathDelimiters(content))}
-      </ReactMarkdown>
-    </div>
+    <React.Suspense fallback={<div className={`markdown-content${compact ? " compact" : ""}`} style={{ whiteSpace: "pre-wrap" }}>{content}</div>}>
+      <MarkdownContentLazy content={content} compact={compact} onPageJump={onPageJump} />
+    </React.Suspense>
   );
 });
 
@@ -856,13 +817,40 @@ async function capturePageRegion(pdf: PdfDocumentLike, pageNumber: number, regio
   }
 }
 
-function PdfPage({ pdf, pageNumber, zoom, showFormula, onFormula, onTextLayerReady, onThumbnail }: { pdf: any; pageNumber: number; zoom: number; showFormula: boolean; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void }) {
+// 页面虚拟化：IntersectionObserver 只挂载滚动容器可视区上下约 2 页的 canvas/TextLayer，
+// 视区外的页退化为带尺寸的占位 div；data-page-number 始终挂在根元素上，滚动定位/当前页检测不受影响
+const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, showFormula, onFormula, onTextLayerReady, onThumbnail, registerRef }: { pdf: any; pageNumber: number; zoom: number; baseSize: { width: number; height: number }; showFormula: boolean; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void; registerRef?: (pageNumber: number, el: HTMLElement | null) => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
-  const [size, setSize] = useState({ width: 760, height: 980 });
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  // scale=1 的页面尺寸：渲染过后存真实值，之前用第 1 页尺寸估算；占位宽高随 zoom 实时重算
+  const [measured, setMeasured] = useState<{ width: number; height: number } | null>(null);
+  const [nearViewport, setNearViewport] = useState(false);
   const [formulaAnchors, setFormulaAnchors] = useState<Array<FormulaAnchor & { left: number; top: number }>>([]);
+  const scaleFactor = 1.25 * zoom;
+  const base = measured || baseSize;
+  const size = { width: base.width * scaleFactor, height: base.height * scaleFactor };
+
+  // 根元素注册给父级的页码→元素 Map（滚动时按 Map 定位，不再全量 querySelectorAll）
+  const handleRootRef = useCallback((el: HTMLDivElement | null) => {
+    rootRef.current = el;
+    registerRef?.(pageNumber, el);
+  }, [pageNumber, registerRef]);
+
+  // 以滚动容器为 root，上下 200% 视口高度（约 ±2 页）内才挂载真实页面
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries[0];
+      if (entry) setNearViewport(entry.isIntersecting);
+    }, { root: el.closest(".reader-viewport"), rootMargin: "200% 0px" });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
+    if (!nearViewport) return;
     let cancelled = false;
     let renderTask: any;
     let textLayer: any;
@@ -878,7 +866,7 @@ function PdfPage({ pdf, pageNumber, zoom, showFormula, onFormula, onTextLayerRea
       canvas.height = Math.floor(viewport.height * outputScale);
       canvas.style.width = `${viewport.width}px`;
       canvas.style.height = `${viewport.height}px`;
-      setSize({ width: viewport.width, height: viewport.height });
+      setMeasured({ width: viewport.width / (1.25 * zoom), height: viewport.height / (1.25 * zoom) });
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       renderTask = page.render({ canvasContext: ctx, viewport, transform: outputScale === 1 ? null : [outputScale, 0, 0, outputScale, 0, 0] });
@@ -967,9 +955,9 @@ function PdfPage({ pdf, pageNumber, zoom, showFormula, onFormula, onTextLayerRea
       renderTask?.cancel?.();
       textLayer?.cancel?.();
     };
-  }, [onTextLayerReady, pdf, pageNumber, zoom]);
+  }, [nearViewport, onTextLayerReady, pdf, pageNumber, zoom]);
 
-  // 缩略图独立生成（白底小图，避免透明）：每页每文档只生成一次，不随缩放重建
+  // 缩略图独立生成（白底小图，避免透明）：每页每文档只生成一次，不随缩放重建，也不随虚拟化挂载状态变化
   useEffect(() => {
     if (!onThumbnail) return;
     let cancelled = false;
@@ -998,16 +986,18 @@ function PdfPage({ pdf, pageNumber, zoom, showFormula, onFormula, onTextLayerRea
   }, [onThumbnail, pdf, pageNumber]);
 
   return (
-    <div className="pdf-page" data-page-number={pageNumber} style={{ width: size.width, height: size.height, "--total-scale-factor": 1.25 * zoom } as React.CSSProperties}>
-      <canvas ref={canvasRef} />
-      <div className="textLayer" ref={textRef} />
-      {showFormula && formulaAnchors.map((formula, index) => <button key={`${formula.label || Math.round(formula.top)}-${index}`} className="formula-assist" data-formula-text={formula.text} data-formula-region={`${formula.regionX},${formula.regionY},${formula.regionWidth},${formula.regionHeight}`} style={{ left: formula.left, top: formula.top }} onClick={(event) => { event.stopPropagation(); onFormula(formula); }} aria-label={`询问第 ${pageNumber} 页公式 ${formula.label || ""}`.trim()} title={formula.text}><Sparkles size={13} /><span>问公式</span></button>)}
+    <div ref={handleRootRef} className="pdf-page" data-page-number={pageNumber} style={{ width: size.width, height: size.height, "--total-scale-factor": scaleFactor } as React.CSSProperties}>
+      {nearViewport && <canvas ref={canvasRef} />}
+      {nearViewport && <div className="textLayer" ref={textRef} />}
+      {nearViewport && showFormula && formulaAnchors.map((formula, index) => <button key={`${formula.label || Math.round(formula.top)}-${index}`} className="formula-assist" data-formula-text={formula.text} data-formula-region={`${formula.regionX},${formula.regionY},${formula.regionWidth},${formula.regionHeight}`} style={{ left: formula.left, top: formula.top }} onClick={(event) => { event.stopPropagation(); onFormula(formula); }} aria-label={`询问第 ${pageNumber} 页公式 ${formula.label || ""}`.trim()} title={formula.text}><Sparkles size={13} /><span>问公式</span></button>)}
     </div>
   );
-}
+});
 
-function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula, onTextLayerReady, onTextExtracted, onError, onThumbnail, onPdfReady }: { source: string | Uint8Array; zoom: number; showFormula: boolean; onReady: (pages: number) => void; onMetadata: (title: string) => void; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onTextExtracted: (text: string) => void; onError: (message: string) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void; onPdfReady?: (pdf: PdfDocumentLike | null) => void }) {
+const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula, onTextLayerReady, onTextExtracted, onError, onThumbnail, onPdfReady, registerRef }: { source: string | Uint8Array; zoom: number; showFormula: boolean; onReady: (pages: number) => void; onMetadata: (title: string) => void; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onTextExtracted: (text: string) => void; onError: (message: string) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void; onPdfReady?: (pdf: PdfDocumentLike | null) => void; registerRef?: (pageNumber: number, el: HTMLElement | null) => void }) {
   const [pdf, setPdf] = useState<any>(null);
+  // scale=1 的第 1 页尺寸，作为未渲染页占位高度的初始估算（拿到前按 A4 估算）
+  const [baseSize, setBaseSize] = useState({ width: 595, height: 842 });
 
   useEffect(() => {
     let task: any;
@@ -1021,6 +1011,11 @@ function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula
         setPdf(loaded);
         onPdfReady?.(loaded);
         onReady(loaded.numPages);
+        void loaded.getPage(1).then((firstPage: PdfPageLike) => {
+          if (cancelled) return;
+          const viewport = firstPage.getViewport({ scale: 1 });
+          setBaseSize({ width: viewport.width, height: viewport.height });
+        }).catch(() => undefined);
         void (async () => {
           const metadata = await loaded.getMetadata().catch(() => null) as { info?: { Title?: unknown }; metadata?: { get?: (key: string) => unknown } } | null;
           const metadataTitle = normalizedDocumentTitle(metadata?.info?.Title || metadata?.metadata?.get?.("dc:title"));
@@ -1070,8 +1065,34 @@ function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula
   if (!pdf) {
     return <div className="pdf-loading"><LoaderCircle className="spin" size={22} /><span>正在解析论文版面…</span></div>;
   }
-  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} showFormula={showFormula} onFormula={onFormula} onTextLayerReady={onTextLayerReady} onThumbnail={onThumbnail} />)}</div>;
-}
+  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} baseSize={baseSize} showFormula={showFormula} onFormula={onFormula} onTextLayerReady={onTextLayerReady} onThumbnail={onThumbnail} registerRef={registerRef} />)}</div>;
+});
+
+// 缩略图窗口化：IntersectionObserver 只给可视区上下约 5 项挂载 <img>，其余保留同尺寸占位（aspect-ratio 固定，布局不抖动）
+const ThumbItem = React.memo(function ThumbItem({ page, active, src, onJump }: { page: number; active: boolean; src?: string; onJump: (page: number) => void }) {
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const [nearViewport, setNearViewport] = useState(false);
+  useEffect(() => {
+    const el = buttonRef.current;
+    if (!el) return;
+    // 缩略图项高约 120px，±600px 约为可视区上下各 5 项
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries[0];
+      if (entry) setNearViewport(entry.isIntersecting);
+    }, { root: el.closest(".thumb-rail"), rootMargin: "600px 0px" });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+  return (
+    <button ref={buttonRef} className={`thumb-item ${active ? "active" : ""}`} onClick={() => onJump(page)} title={`跳到第 ${page} 页`} aria-label={`跳到第 ${page} 页`}>
+      {src && nearViewport
+        // eslint-disable-next-line @next/next/no-img-element
+        ? <img src={src} alt="" draggable={false} />
+        : <span className="thumb-placeholder">{!src && <LoaderCircle className="spin" size={13} />}</span>}
+      <span className="thumb-page-no">{page}</span>
+    </button>
+  );
+});
 
 function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => void; onOpenUrl: (url: string) => void; onOpenFile: (file: File) => void }) {
   const [url, setUrl] = useState("");
@@ -1752,6 +1773,12 @@ export default function Home() {
   const citationFlashTimerRef = useRef<number | null>(null);
   const selectionFrameRef = useRef(0);
   const scrollFrameRef = useRef(0);
+  // 页码→页面元素注册表（PdfPage 挂载时登记）：滚动时按 Map 顺序查当前页，不再每帧全量 querySelectorAll
+  const pageElsRef = useRef(new Map<number, HTMLElement>());
+  const registerPageEl = useCallback((page: number, el: HTMLElement | null) => {
+    if (el) pageElsRef.current.set(page, el);
+    else pageElsRef.current.delete(page);
+  }, []);
   const restoringWorkspaceRef = useRef(false);
   const pendingScrollPageRef = useRef<number | null>(null);
   // 划词回答的请求控制器：删除批注/换论文时中断对应流
@@ -1913,10 +1940,12 @@ export default function Home() {
         setUser(sessionPayload.user);
         setAuthReady(true);
 
-        const workspaceResponse = await fetch("/api/workspace", { cache: "no-store" });
+        const [workspaceResponse, settingsResponse] = await Promise.all([
+          fetch("/api/workspace", { cache: "no-store" }),
+          fetch("/api/settings", { cache: "no-store" }),
+        ]);
         const workspacePayload = await workspaceResponse.json();
         if (!workspaceResponse.ok) throw new Error(workspacePayload.error || "无法读取同步数据");
-        const settingsResponse = await fetch("/api/settings", { cache: "no-store" });
         if (settingsResponse.ok) {
           const settingsPayload = await settingsResponse.json();
           if (settingsPayload?.prompts?.global && settingsPayload?.prompts?.inline) setPromptConfig(settingsPayload.prompts);
@@ -2017,10 +2046,11 @@ export default function Home() {
     };
     try {
       if (config.apiKey || config.hasApiKey) {
+        // 文本已同步入库时只传 paperId（服务端按 paperId 取全文并缓存分块）；刚提取完尚未保存时仍带 paperContext 兜底
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: text, paperContext: paperText, mode: "global", history: messages.slice(-10), systemPrompts: promptConfig, effort }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: text, mode: "global", history: messages.slice(-10), systemPrompts: promptConfig, effort, ...(paperId ? { paperId } : {}), ...(paperId && paperText === lastSavedTextRef.current ? {} : { paperContext: paperText }) }),
         });
         if (!response.ok) {
           const payload = await response.json().catch(() => ({}));
@@ -2064,7 +2094,7 @@ export default function Home() {
       setStreaming(false);
       setStatusText("");
     }
-  }, [config, effort, loading, messages, paperText, paperTitle, promptConfig]);
+  }, [config, effort, loading, messages, paperId, paperText, paperTitle, promptConfig]);
 
   const refreshHighlights = useCallback((color: HighlightColor) => {
     if (!(CSS as any).highlights || !(window as any).Highlight) return;
@@ -2202,7 +2232,7 @@ export default function Home() {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, paperContext: paperText, mode: "inline", history: history.slice(-10), systemPrompts: promptConfig, effort: inlineEffort, ...(imageDataUrl ? { imageDataUrl } : {}) }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline", history: history.slice(-10), systemPrompts: promptConfig, effort: inlineEffort, ...(paperId ? { paperId } : {}), ...(paperId && paperText === lastSavedTextRef.current ? {} : { paperContext: paperText }), ...(imageDataUrl ? { imageDataUrl } : {}) }),
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -2244,7 +2274,7 @@ export default function Home() {
     } finally {
       if (inlineControllersRef.current.get(id) === controller) inlineControllersRef.current.delete(id);
     }
-  }, [config, inlineEffort, paperText, paperTitle, promptConfig, updateAnnotation]);
+  }, [config, inlineEffort, paperId, paperText, paperTitle, promptConfig, updateAnnotation]);
 
   const handleSelectionStart = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     citationDownRef.current = null;
@@ -3280,21 +3310,13 @@ export default function Home() {
         <div className="reader-main">
           {source && thumbsOpen === "show" && (
             <aside ref={thumbRailRef} className={`thumb-rail${thumbResizing ? " resizing" : ""}${thumbPanning ? " panning" : ""}`} aria-label="页面缩略图" style={{ width: thumbWidth }} onPointerDown={startThumbPan} onClickCapture={(event) => { if (thumbPanMovedRef.current) { event.preventDefault(); event.stopPropagation(); } }}>
-              {Array.from({ length: pageCount }, (_, index) => index + 1).map((page) => (
-                <button key={page} className={`thumb-item ${currentPage === page ? "active" : ""}`} onClick={() => goToPage(page)} title={`跳到第 ${page} 页`} aria-label={`跳到第 ${page} 页`}>
-                  {pageThumbs[page]
-                    // eslint-disable-next-line @next/next/no-img-element
-                    ? <img src={pageThumbs[page]} alt="" draggable={false} />
-                    : <span className="thumb-placeholder"><LoaderCircle className="spin" size={13} /></span>}
-                  <span className="thumb-page-no">{page}</span>
-                </button>
-              ))}
+              {Array.from({ length: pageCount }, (_, index) => index + 1).map((page) => <ThumbItem key={page} page={page} active={currentPage === page} src={pageThumbs[page]} onJump={goToPage} />)}
             </aside>
           )}
           {source && thumbsOpen === "show" && <div className="thumb-resize-handle" style={{ left: thumbWidth - 4 }} onPointerDown={startThumbResize} title="拖动调整缩略图栏宽度" aria-label="拖动调整缩略图栏宽度" role="separator" aria-orientation="vertical" />}
-          <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}${panMode ? " pan-mode" : ""}${readerPanning ? " panning" : ""}${figureLasso ? " figure-lasso-mode" : ""}`} ref={readerRef} onPointerDown={handleReaderPointerDown} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleSelectionStart} onClick={handleCitationClick} onScroll={() => { if (selectionPos) setSelectionPos(null); if (citationPopover) setCitationPopover(null); if (figureRegion) setFigureRegion(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); const reader = readerRef.current; if (!reader || scrollFrameRef.current) return; scrollFrameRef.current = window.requestAnimationFrame(() => { scrollFrameRef.current = 0; const probe = reader.scrollTop + 42; let visiblePage = 1; for (const el of Array.from(reader.querySelectorAll<HTMLElement>("[data-page-number]"))) { if (el.offsetTop <= probe) visiblePage = Number(el.dataset.pageNumber || 1); else break; } setCurrentPage((prev) => (prev === visiblePage ? prev : visiblePage)); }); }}>
+          <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}${panMode ? " pan-mode" : ""}${readerPanning ? " panning" : ""}${figureLasso ? " figure-lasso-mode" : ""}`} ref={readerRef} onPointerDown={handleReaderPointerDown} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleSelectionStart} onClick={handleCitationClick} onScroll={() => { if (selectionPos) setSelectionPos(null); if (citationPopover) setCitationPopover(null); if (figureRegion) setFigureRegion(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); const reader = readerRef.current; if (!reader || scrollFrameRef.current) return; scrollFrameRef.current = window.requestAnimationFrame(() => { scrollFrameRef.current = 0; const probe = reader.scrollTop + 42; let visiblePage = 1; for (const [page, el] of pageElsRef.current) { if (el.offsetTop <= probe) visiblePage = page; else break; } setCurrentPage((prev) => (prev === visiblePage ? prev : visiblePage)); }); }}>
           {source ? (
-            <PdfDocument source={source} zoom={zoom} showFormula={formulaAssist === "show"} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextLayerReady={handleTextLayerReady} onTextExtracted={handleTextExtracted} onError={handlePdfError} onThumbnail={handleThumbnail} onPdfReady={handlePdfInstance} />
+            <PdfDocument source={source} zoom={zoom} showFormula={formulaAssist === "show"} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextLayerReady={handleTextLayerReady} onTextExtracted={handleTextExtracted} onError={handlePdfError} onThumbnail={handleThumbnail} onPdfReady={handlePdfInstance} registerRef={registerPageEl} />
           ) : <div style={{ transform: `scale(${zoom})`, transformOrigin: "top center", width: "fit-content", minWidth: "calc(100% + 480px)", margin: "0 auto" }}><DemoPaper /></div>}
           {selectionRects.map((rect, index) => <div key={`selection-${index}`} className="selection-overlay-rect" style={rect} aria-hidden="true" />)}
           {citationFlash.map((rect, index) => <div key={`citation-flash-${index}`} className="citation-flash-rect" style={rect} aria-hidden="true" />)}

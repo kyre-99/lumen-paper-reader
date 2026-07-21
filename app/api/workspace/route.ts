@@ -52,12 +52,15 @@ export async function GET(request: Request) {
         sourceUrl: paper.sourceUrl,
         paperText: paper.paperText,
         pageCount: paper.pageCount,
+        status: paper.status,
       },
       currentPage: restoredState?.currentPage || 1,
       zoom: restoredState?.zoom || 0.88,
       rightOpen: restoredState?.rightOpen !== false,
       messages: parseArray(restoredState?.messagesJson || "[]"),
       annotations: persistentAnnotations(parseArray(restoredState?.annotationsJson || "[]")),
+      // 历史对话只存 paperStates；回退到 readerStates 行时没有该列，按空数组处理
+      conversations: parseArray((restoredState && "conversationsJson" in restoredState ? restoredState.conversationsJson : "[]") || "[]"),
       updatedAt: restoredState?.updatedAt || paper.updatedAt,
     },
   });
@@ -101,9 +104,17 @@ export async function PUT(request: Request) {
 
   const messages = Array.isArray(payload.messages) ? payload.messages.slice(-120) : [];
   const annotations = persistentAnnotations(payload.annotations).slice(-300);
+  // 历史对话防御性截断：最多 30 段，每段最多 200 条消息
+  const conversations = (Array.isArray(payload.conversations) ? payload.conversations : []).slice(-30).map((item: { id?: unknown; title?: unknown; createdAt?: unknown; messages?: unknown }) => ({
+    id: Number(item?.id) || 0,
+    title: String(item?.title || "").slice(0, 120),
+    createdAt: Number(item?.createdAt) || 0,
+    messages: Array.isArray(item?.messages) ? item.messages.slice(-200) : [],
+  }));
   const messagesJson = JSON.stringify(messages);
   const annotationsJson = JSON.stringify(annotations);
-  if (messagesJson.length > 500000 || annotationsJson.length > 750000) {
+  const conversationsJson = JSON.stringify(conversations);
+  if (messagesJson.length > 500000 || annotationsJson.length > 750000 || conversationsJson.length > 750000) {
     return Response.json({ error: "同步内容过大，请删除部分历史记录后重试" }, { status: 413 });
   }
   const stateValues = {
@@ -126,6 +137,7 @@ export async function PUT(request: Request) {
       rightOpen: stateValues.rightOpen,
       messagesJson,
       annotationsJson,
+      conversationsJson,
       updatedAt: stateValues.updatedAt,
     };
     await db.insert(paperStates).values(paperStateValues).onConflictDoUpdate({ target: paperStates.paperId, set: paperStateValues });

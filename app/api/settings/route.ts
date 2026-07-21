@@ -53,6 +53,12 @@ export async function GET() {
       model: hasSavedModelConfig ? settings!.modelName : environment.model,
       hasApiKey: Boolean(settings?.apiKeyEncrypted) || environment.hasApiKey,
     },
+    // 图表理解模型：密钥只回 hasApiKey，不回明文
+    visionConfig: {
+      endpoint: settings?.visionModelEndpoint || "",
+      model: settings?.visionModelName || "",
+      hasApiKey: Boolean(settings?.visionApiKeyEncrypted),
+    },
   });
 }
 
@@ -73,10 +79,23 @@ export async function PUT(request: Request) {
     const endpointUrl = new URL(modelEndpoint);
     if (endpointUrl.protocol !== "https:") throw new Error();
   } catch { return Response.json({ error: "API 地址必须是有效的 HTTPS 地址" }, { status: 400 }); }
+  // 图表理解模型（多模态）：全部留空表示不配置，问答时回退主模型；请求未携带 visionConfig 时保留已有配置
+  const hasVisionPayload = payload?.visionConfig !== undefined;
+  const visionModelEndpoint = hasVisionPayload ? String(payload?.visionConfig?.endpoint || "").trim().replace(/\/+$/, "").slice(0, 2000) : "";
+  const visionModelName = hasVisionPayload ? String(payload?.visionConfig?.model || "").trim().slice(0, 200) : "";
+  const visionApiKey = hasVisionPayload ? String(payload?.visionConfig?.apiKey || "").trim().slice(0, 1000) : "";
+  if (visionModelEndpoint) {
+    try {
+      const visionUrl = new URL(visionModelEndpoint);
+      if (visionUrl.protocol !== "https:") throw new Error();
+    } catch { return Response.json({ error: "图表理解模型的 API 地址必须是有效的 HTTPS 地址" }, { status: 400 }); }
+  }
   const db = getDb();
   const [existing] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
   const apiKeyEncrypted = apiKey ? await encryptApiKey(apiKey) : existing?.apiKeyEncrypted || "";
-  const values = { userId: user.id, globalSystemPrompt, inlineSystemPrompt, modelProvider, modelEndpoint, modelName, apiKeyEncrypted, updatedAt: new Date().toISOString() };
+  // 密钥处理与主模型一致：只在新提供时重新加密；endpoint 与模型名都清空时视为取消配置，一并清掉密钥
+  const visionApiKeyEncrypted = !hasVisionPayload ? existing?.visionApiKeyEncrypted || "" : visionApiKey ? await encryptApiKey(visionApiKey) : (visionModelEndpoint || visionModelName) ? existing?.visionApiKeyEncrypted || "" : "";
+  const values = { userId: user.id, globalSystemPrompt, inlineSystemPrompt, modelProvider, modelEndpoint, modelName, apiKeyEncrypted, visionModelEndpoint: hasVisionPayload ? visionModelEndpoint : existing?.visionModelEndpoint || "", visionModelName: hasVisionPayload ? visionModelName : existing?.visionModelName || "", visionApiKeyEncrypted, updatedAt: new Date().toISOString() };
   await db.insert(userSettings).values(values).onConflictDoUpdate({ target: userSettings.userId, set: values });
-  return Response.json({ saved: true, prompts: { global: globalSystemPrompt, inline: inlineSystemPrompt }, modelConfig: { provider: modelProvider, endpoint: modelEndpoint, model: modelName, hasApiKey: Boolean(apiKeyEncrypted) || environmentModelConfig().hasApiKey } });
+  return Response.json({ saved: true, prompts: { global: globalSystemPrompt, inline: inlineSystemPrompt }, modelConfig: { provider: modelProvider, endpoint: modelEndpoint, model: modelName, hasApiKey: Boolean(apiKeyEncrypted) || environmentModelConfig().hasApiKey }, visionConfig: { endpoint: values.visionModelEndpoint, model: values.visionModelName, hasApiKey: Boolean(visionApiKeyEncrypted) } });
 }

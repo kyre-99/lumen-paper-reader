@@ -3,6 +3,7 @@
 import {
   BookOpen,
   Bot,
+  ChartColumn,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -17,6 +18,7 @@ import {
   Globe2,
   Highlighter,
   Hand,
+  History,
   Languages,
   Library,
   Link2,
@@ -32,6 +34,7 @@ import {
   PanelRightOpen,
   Plus,
   Receipt,
+  Scan,
   Send,
   Settings,
   Sparkles,
@@ -52,8 +55,10 @@ import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { DEFAULT_PROMPTS, type PromptConfig } from "./chat-prompts";
+import { parseReferences, parseAuthorYearReferences, matchAuthorYearEntry, type AuthorYearCitation } from "./references";
 
 type ChatMessage = { id: number; role: "user" | "assistant"; content: string; steps?: string[] };
+type SavedConversation = { id: number; title: string; createdAt: number; messages: ChatMessage[] };
 type ChatEffort = "medium" | "high" | "max";
 const UI_FONT_SIZES = ["compact", "standard", "large", "xlarge"] as const;
 const CHAT_EFFORTS = ["medium", "high", "max"] as const;
@@ -115,7 +120,7 @@ async function consumeChatStream(response: Response, handlers: { onStep?: (label
   }
   if (failed) throw new Error(failed);
 }
-type ToolAction = "translate" | "explain" | "ask" | "formula";
+type ToolAction = "translate" | "explain" | "ask" | "formula" | "figure";
 type HighlightColor = "yellow" | "green" | "blue" | "rose";
 type Annotation = {
   id: number;
@@ -153,8 +158,12 @@ type Annotation = {
   formulaRegionTop?: number;
   formulaRegionPixelWidth?: number;
   formulaRegionPixelHeight?: number;
+  // 框选图表的截图（dataURL），持久化时会剥离，只保留区域坐标
+  figureImage?: string;
 };
 type FormulaAnchor = { text: string; label?: string; pageNumber: number; pageX: number; pageY: number; regionX: number; regionY: number; regionWidth: number; regionHeight: number };
+// 框选图表的选区：region* 为相对页面的归一化坐标，barX/barY 为操作条的屏幕坐标
+type FigureRegionSelection = { pageNumber: number; regionX: number; regionY: number; regionWidth: number; regionHeight: number; barX: number; barY: number };
 type SessionUser = { displayName: string; email: string; fullName: string | null; isGuest: boolean; isLocal?: boolean };
 type PaperSourceKind = "remote" | "upload";
 type PaperStatus = "unread" | "reading" | "done";
@@ -171,6 +180,33 @@ type UsageStats = {
   perModel: Array<{ model: string; calls: number; promptTokens: number; completionTokens: number; estimatedCost: number | null }>;
   recent: Array<{ id: string; model: string; mode: string; effort: string; promptTokens: number; completionTokens: number; createdAt: string }>;
 };
+type ReadingStats = {
+  days: Array<{ day: string; activeSeconds: number }>;
+  totals: { weekSeconds: number; paperCount: number; streakDays: number };
+  reading: Array<{ id: string; title: string; currentPage: number; pageCount: number }>;
+};
+
+// 客户端本地日期 YYYY-MM-DD，心跳与统计都按本地自然日聚合
+function localDayString(date = new Date()) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+// 本周一（本地时区）的日期字符串，作为统计接口的 from 参数
+function weekMondayString() {
+  const now = new Date();
+  const offset = (now.getDay() + 6) % 7; // 周一记为 0
+  return localDayString(new Date(now.getFullYear(), now.getMonth(), now.getDate() - offset));
+}
+
+// 阅读时长展示：45分钟 / 3小时20分
+function formatDuration(seconds: number) {
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 1) return `${Math.max(0, Math.round(seconds))}秒`;
+  if (minutes < 60) return `${minutes}分钟`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours}小时${rest}分` : `${hours}小时`;
+}
 
 const demoParagraphs = [
   {
@@ -225,13 +261,37 @@ function shouldPersistAnnotation(annotation: Annotation) {
 }
 
 // 需要持久化的批注序列化，自动保存与水合恢复的快照共用，保证两处结果一致
+// 图表批注的截图体积大（约 100-300KB），持久化时剥离，恢复后显示占位提示，区域坐标仍保留
 function serializePersistentAnnotations(list: Annotation[]) {
-  return JSON.stringify(list.filter(shouldPersistAnnotation).map((annotation) => ({ ...annotation, loading: false, draft: "" })));
+  return JSON.stringify(list.filter(shouldPersistAnnotation).map((annotation) => ({ ...annotation, loading: false, draft: "", ...(annotation.kind === "figure" ? { figureImage: "" } : {}) })));
 }
 
 // 工作区内容快照：用于判断自动保存时内容相对上次保存/恢复是否真的变化过
-function workspaceSnapshot(input: { paperId: string; title: string; meta: string; sourceKind: PaperSourceKind; sourceUrl: string | null; paperText: string; pageCount: number; currentPage: number; zoom: number; rightOpen: boolean; messages: ChatMessage[]; annotationsJson: string }) {
+function workspaceSnapshot(input: { paperId: string; title: string; meta: string; sourceKind: PaperSourceKind; sourceUrl: string | null; paperText: string; pageCount: number; currentPage: number; zoom: number; rightOpen: boolean; messages: ChatMessage[]; conversations: SavedConversation[]; annotationsJson: string }) {
   return JSON.stringify(input);
+}
+
+// 历史对话上限，超出时丢弃最旧的一段
+const MAX_SAVED_CONVERSATIONS = 30;
+
+// 把当前对话归档进历史：取首条用户消息做标题；没有用户消息（纯开场白）时不归档
+function archiveConversation(list: SavedConversation[], messages: ChatMessage[]): SavedConversation[] {
+  const firstUser = messages.find((message) => message.role === "user");
+  if (!firstUser) return list;
+  const title = firstUser.content.replace(/\s+/g, " ").trim();
+  const entry: SavedConversation = {
+    id: Date.now(),
+    title: title.length > 24 ? `${title.slice(0, 24)}…` : title || "未命名对话",
+    createdAt: Date.now(),
+    messages,
+  };
+  return [...list, entry].slice(-MAX_SAVED_CONVERSATIONS);
+}
+
+// 历史列表里的日期格式，如「7月21日 14:30」
+function formatConversationTime(timestamp: number) {
+  const date = new Date(timestamp);
+  return `${date.getMonth() + 1}月${date.getDate()}日 ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
 function trimRangeToText(input: Range) {
@@ -434,6 +494,173 @@ function rangeFromPointerPoints(root: Element, start: { x: number; y: number }, 
   return range;
 }
 
+// 取点击处光标及同一视觉行的文本节点：数字引用与作者-年份引用共用的行内上下文
+function citationLineNodes(textLayer: Element, x: number, y: number) {
+  const caret = textCaretFromPoint(textLayer, x, y);
+  if (!caret) return null;
+  const nodes: Text[] = [caret.node];
+  const lineRect = caret.node.parentElement?.getBoundingClientRect();
+  if (lineRect) {
+    for (const span of Array.from(textLayer.querySelectorAll("span"))) {
+      if (span.getAttribute("role") === "img" || span === caret.node.parentElement) continue;
+      const rect = span.getBoundingClientRect();
+      if (!rect.width || rect.bottom < lineRect.top - 2 || rect.top > lineRect.bottom + 2) continue;
+      const node = Array.from(span.childNodes).find((child): child is Text => child.nodeType === Node.TEXT_NODE && Boolean(child.textContent));
+      if (node) nodes.push(node);
+    }
+  }
+  return { caret, nodes };
+}
+
+// 判断点击坐标是否落在某个 [n] 引用标记上：先取光标处的文本节点，
+// 节点内没有完整标记时再带上同一行的兄弟 span 一起检查
+function citationNumberAtPoint(textLayer: Element, x: number, y: number) {
+  const line = citationLineNodes(textLayer, x, y);
+  if (!line) return null;
+  for (const node of line.nodes) {
+    const pattern = /\[(\d{1,3})\]/g;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(node.data))) {
+      const range = document.createRange();
+      range.setStart(node, match.index);
+      range.setEnd(node, match.index + match[0].length);
+      const rect = range.getBoundingClientRect();
+      const pad = 4; // 允许点在标记紧贴的边缘上
+      if (x >= rect.left - pad && x <= rect.right + pad && y >= rect.top - pad && y <= rect.bottom + pad) return Number(match[1]);
+    }
+  }
+  return null;
+}
+
+// 作者-年份引用的名字片段：允许 van/von/de 等贵族粒子前缀（长组合在前优先匹配）、连字符与变音字母
+const AY_NAME_PATTERN = "(?:van der |van den |van |von der |von |der |den |de )?[A-Z][\\wÀ-ÿ'’-]+";
+
+type AuthorYearHit = AuthorYearCitation & { badge: string };
+
+// 引用点击目标：数字模式 [n] 或作者-年份模式（按论文参考文献区格式自动判别）
+type CitationTarget = { kind: "numeric"; number: number } | { kind: "author-year"; hit: AuthorYearHit };
+
+// 识别作者-年份引用点击：把点击行的文本节点按视觉顺序拼成串并保留偏移映射，
+// 找含年份的圆括号组后区分叙述式（括号内只有年份，如 Guo et al. (2025)）
+// 与括号式（含作者，如 (Yang et al., 2024; Team et al., 2025)，按 ; 切段取点击所在段）
+function citationAuthorYearAtPoint(textLayer: Element, x: number, y: number): AuthorYearHit | null {
+  const line = citationLineNodes(textLayer, x, y);
+  if (!line) return null;
+  const ordered = line.nodes.slice().sort((a, b) => (a.parentElement?.getBoundingClientRect().left ?? 0) - (b.parentElement?.getBoundingClientRect().left ?? 0));
+  let combined = "";
+  const baseIndex = new Map<Text, number>();
+  for (const node of ordered) {
+    if (combined && !/\s$/.test(combined) && !/^\s/.test(node.data)) combined += " "; // span 边界补空格
+    baseIndex.set(node, combined.length);
+    combined += node.data;
+  }
+  const caretIndex = (baseIndex.get(line.caret.node) ?? 0) + line.caret.offset;
+
+  const narrativeLookbehind = new RegExp(`(${AY_NAME_PATTERN}(?:\\s+(?:and|&)\\s+${AY_NAME_PATTERN})?(?:\\s+et\\s+al\\.?)?)\\s*$`);
+  const segmentPattern = new RegExp(`(${AY_NAME_PATTERN})((?:\\s+(?:and|&)\\s+${AY_NAME_PATTERN})?(?:\\s+et\\s+al\\.?)?)\\s*,?\\s*\\(?((?:19|20)\\d{2})([a-z])?`);
+  // 第一作者即条目排序键：先截出第一个名字短语（可含 van/de 粒子），再取其最后一个词
+  const firstSurname = (phrase: string) => {
+    const name = phrase.trim().match(new RegExp(`^${AY_NAME_PATTERN}`));
+    return (name ? name[0] : phrase.trim()).split(/\s+/).pop() || "";
+  };
+
+  const groupPattern = /\(([^()]*(?:19|20)\d{2}[a-z]?[^()]*)\)/g;
+  let group: RegExpExecArray | null;
+  while ((group = groupPattern.exec(combined))) {
+    const start = group.index;
+    const end = group.index + group[0].length;
+    if (caretIndex < start - 1 || caretIndex > end) continue;
+    const inner = group[1];
+    // 叙述式：括号里只有年份，作者名在括号外
+    if (/^\s*(?:19|20)\d{2}[a-z]?\s*$/.test(inner)) {
+      const before = combined.slice(0, start).match(narrativeLookbehind);
+      const yearMatch = inner.match(/((?:19|20)\d{2})([a-z])?/);
+      const surname = before ? firstSurname(before[1]) : "";
+      if (!before || !surname || !yearMatch) return null;
+      return { surname, year: yearMatch[1], suffix: yearMatch[2] || "", badge: `${before[1].trim()} (${yearMatch[1]}${yearMatch[2] || ""})` };
+    }
+    // 括号式：按 ; 切段，取点击落在的那段
+    const innerStart = start + 1;
+    const segments: Array<{ from: number; to: number; text: string }> = [];
+    let segFrom = 0;
+    for (let i = 0; i <= inner.length; i++) {
+      if (i === inner.length || inner[i] === ";") {
+        segments.push({ from: innerStart + segFrom, to: innerStart + i, text: inner.slice(segFrom, i) });
+        segFrom = i + 1;
+      }
+    }
+    const hit = segments.find((seg) => caretIndex >= seg.from - 1 && caretIndex <= seg.to + 1) || segments[0];
+    const parsed = hit.text.match(segmentPattern);
+    const surname = parsed ? firstSurname(parsed[1]) : "";
+    if (!parsed || !surname) return null;
+    const authors = `${parsed[1]}${parsed[2]}`.trim().replace(/\s+/g, " ");
+    return { surname, year: parsed[3], suffix: parsed[4] || "", badge: `${authors}, ${parsed[3]}${parsed[4] || ""}` };
+  }
+  return null;
+}
+
+// 在一行拼串里找引用 token 的字符范围：数字模式取 [n]；作者-年份模式取含有效引用的圆括号组
+// （括号内有作者+年份，或纯年份且括号前有作者名的叙述式），与点击识别保持同一判定
+function lineCitationRanges(combined: string, authorYearMode: boolean) {
+  const ranges: Array<{ from: number; to: number }> = [];
+  if (!authorYearMode) {
+    const pattern = /\[\d{1,3}\]/g;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(combined))) ranges.push({ from: match.index, to: match.index + match[0].length });
+    return ranges;
+  }
+  const groupPattern = /\(([^()]*(?:19|20)\d{2}[a-z]?[^()]*)\)/g;
+  const segmentOk = new RegExp(`${AY_NAME_PATTERN}(\\s+(and|&)\\s+${AY_NAME_PATTERN})?(\\s+et\\s+al\\.?)?\\s*,?\\s*\\(?(?:19|20)\\d{2}[a-z]?`);
+  const narrativeLookbehind = new RegExp(`${AY_NAME_PATTERN}(\\s+(and|&)\\s+${AY_NAME_PATTERN})?(\\s+et\\s+al\\.?)?\\s*$`);
+  let group: RegExpExecArray | null;
+  while ((group = groupPattern.exec(combined))) {
+    const inner = group[1];
+    const pureYear = /^\s*(?:19|20)\d{2}[a-z]?\s*$/.test(inner);
+    if (pureYear ? narrativeLookbehind.test(combined.slice(0, group.index)) : segmentOk.test(inner)) {
+      ranges.push({ from: group.index, to: group.index + group[0].length });
+    }
+  }
+  return ranges;
+}
+
+// 给文本层加引用标记：按视觉行拼串定位 token，再映射回相交的 span——
+// 多引用括号 "(Lewis et al., 2020; Wang et al., 2023)" 里每个引用是独立 span（括号另算），
+// 旧的“span 内含完整括号”判定会漏掉它们，标出来的必须与能点开的完全一致
+function markCitationSpansInLayer(textLayer: Element, authorYearMode: boolean) {
+  const lines: Array<{ top: number; bottom: number; nodes: Text[] }> = [];
+  for (const span of Array.from(textLayer.querySelectorAll("span"))) {
+    if (span.getAttribute("role") === "img") continue;
+    const node = Array.from(span.childNodes).find((child): child is Text => child.nodeType === Node.TEXT_NODE && Boolean(child.textContent));
+    if (!node) continue;
+    const rect = span.getBoundingClientRect();
+    if (!rect.width || !rect.height) continue;
+    const line = lines.find((item) => rect.bottom >= item.top - 2 && rect.top <= item.bottom + 2);
+    if (line) {
+      line.nodes.push(node);
+      line.top = Math.min(line.top, rect.top);
+      line.bottom = Math.max(line.bottom, rect.bottom);
+    } else {
+      lines.push({ top: rect.top, bottom: rect.bottom, nodes: [node] });
+    }
+  }
+  for (const line of lines) {
+    const ordered = line.nodes.slice().sort((a, b) => (a.parentElement?.getBoundingClientRect().left ?? 0) - (b.parentElement?.getBoundingClientRect().left ?? 0));
+    let combined = "";
+    const baseIndex = new Map<Text, number>();
+    for (const node of ordered) {
+      if (combined && !/\s$/.test(combined) && !/^\s/.test(node.data)) combined += " "; // span 边界补空格
+      baseIndex.set(node, combined.length);
+      combined += node.data;
+    }
+    for (const range of lineCitationRanges(combined, authorYearMode)) {
+      for (const node of ordered) {
+        const base = baseIndex.get(node) ?? 0;
+        if (base < range.to && base + node.data.length > range.from) node.parentElement?.classList.add("citation-ref");
+      }
+    }
+  }
+}
+
 function findTextRange(root: Element, target: string) {
   const wanted = target.replace(/\s+/g, " ").trim();
   if (!wanted) return null;
@@ -487,18 +714,36 @@ function normalizeMathDelimiters(content: string) {
   }).join("");
 }
 
+// 把模型按输出契约写的【P1, P3】页码引用转成 markdown 链接（#cite-page-N），
+// 渲染时变成可点击 chip，点击跳到对应页；跳过代码块避免误替换
+function linkifyPageCitations(content: string) {
+  return content.split(/(```[\s\S]*?```|`[^`\n]*`)/g).map((part) => {
+    if (part.startsWith("`")) return part;
+    return part.replace(/【\s*P((?:\d+\s*[,，、]?\s*P?)+)】/g, (_match, inner: string) => {
+      const pages = inner.match(/\d+/g) || [];
+      return pages.map((page) => `[【P${page}】](#cite-page-${page})`).join(" ");
+    });
+  }).join("");
+}
+
 // memo 包裹：流式输出时只有当前消息变化，历史消息不必重新跑 Markdown/KaTeX 解析
-const MarkdownContent = React.memo(function MarkdownContent({ content, compact = false }: { content: string; compact?: boolean }) {
+const MarkdownContent = React.memo(function MarkdownContent({ content, compact = false, onPageJump }: { content: string; compact?: boolean; onPageJump?: (page: number) => void }) {
   return (
     <div className={`markdown-content${compact ? " compact" : ""}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
         components={{
-          a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
+          a: ({ children, href, ...props }) => {
+            const cite = href?.match(/^#cite-page-(\d+)$/);
+            if (cite && onPageJump) {
+              return <button type="button" className="page-cite" title={`跳转到第 ${cite[1]} 页`} onClick={(event) => { event.preventDefault(); event.stopPropagation(); onPageJump(Number(cite[1])); }}>{children}</button>;
+            }
+            return <a href={href} {...props} target="_blank" rel="noreferrer">{children}</a>;
+          },
         }}
       >
-        {normalizeMathDelimiters(content)}
+        {linkifyPageCitations(normalizeMathDelimiters(content))}
       </ReactMarkdown>
     </div>
   );
@@ -576,6 +821,39 @@ function DemoPaper() {
       <footer className="paper-footer"><span>1</span><span>Attention Is All You Need</span></footer>
     </article>
   );
+}
+
+// pdf.js 动态 import 没有静态类型，这里给出框选截图所需的最小结构
+type PdfDocumentLike = { getPage: (pageNumber: number) => Promise<PdfPageLike> };
+type PdfPageLike = {
+  getViewport: (input: { scale: number }) => { width: number; height: number };
+  render: (input: Record<string, unknown>) => { promise: Promise<void>; cancel?: () => void };
+};
+
+// 框选图表截图：按选区最长边约 1400px 渲染（缩放钳制 1-4 倍），白底 JPEG；渲染失败返回空串
+async function capturePageRegion(pdf: PdfDocumentLike, pageNumber: number, region: { regionX: number; regionY: number; regionWidth: number; regionHeight: number }) {
+  try {
+    const page = await pdf.getPage(pageNumber);
+    const base = page.getViewport({ scale: 1 });
+    const regionWidth = region.regionWidth * base.width;
+    const regionHeight = region.regionHeight * base.height;
+    if (regionWidth < 1 || regionHeight < 1) return "";
+    const scale = Math.min(4, Math.max(1, 1400 / Math.max(regionWidth, regionHeight)));
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(regionWidth * scale));
+    canvas.height = Math.max(1, Math.round(regionHeight * scale));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return "";
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    // transform 把选区左上角平移到画布原点（与缩略图同款 render 用法）
+    const task = page.render({ canvasContext: ctx, viewport, transform: [1, 0, 0, 1, -region.regionX * viewport.width, -region.regionY * viewport.height] });
+    await task.promise;
+    return canvas.toDataURL("image/jpeg", 0.85);
+  } catch {
+    return "";
+  }
 }
 
 function PdfPage({ pdf, pageNumber, zoom, showFormula, onFormula, onTextLayerReady, onThumbnail }: { pdf: any; pageNumber: number; zoom: number; showFormula: boolean; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void }) {
@@ -728,7 +1006,7 @@ function PdfPage({ pdf, pageNumber, zoom, showFormula, onFormula, onTextLayerRea
   );
 }
 
-function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula, onTextLayerReady, onTextExtracted, onError, onThumbnail }: { source: string | Uint8Array; zoom: number; showFormula: boolean; onReady: (pages: number) => void; onMetadata: (title: string) => void; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onTextExtracted: (text: string) => void; onError: (message: string) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void }) {
+function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula, onTextLayerReady, onTextExtracted, onError, onThumbnail, onPdfReady }: { source: string | Uint8Array; zoom: number; showFormula: boolean; onReady: (pages: number) => void; onMetadata: (title: string) => void; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onTextExtracted: (text: string) => void; onError: (message: string) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void; onPdfReady?: (pdf: PdfDocumentLike | null) => void }) {
   const [pdf, setPdf] = useState<any>(null);
 
   useEffect(() => {
@@ -741,6 +1019,7 @@ function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula
       const loaded = await task.promise;
       if (!cancelled) {
         setPdf(loaded);
+        onPdfReady?.(loaded);
         onReady(loaded.numPages);
         void (async () => {
           const metadata = await loaded.getMetadata().catch(() => null) as { info?: { Title?: unknown }; metadata?: { get?: (key: string) => unknown } } | null;
@@ -769,7 +1048,9 @@ function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula
             pageTexts.push(`--- PAGE ${pageNumber} ---\n${lines.join("\n")}`);
           }
           if (!cancelled) {
-            const extracted = pageTexts.join("\n\n").slice(0, 120000);
+            // 超长时保留头部 + 尾部：参考文献在文末，纯前截断会让引用解析永远失败
+            const full = pageTexts.join("\n\n");
+            const extracted = full.length <= 120000 ? full : `${full.slice(0, 95000)}\n\n…（中间内容因长度限制省略）…\n\n${full.slice(-24000)}`;
             if (!metadataTitle) {
               const extractedTitle = titleFromFirstPage(extracted);
               if (extractedTitle) onMetadata(extractedTitle);
@@ -781,9 +1062,10 @@ function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula
     })().catch((error) => !cancelled && onError(error?.message || "PDF 加载失败"));
     return () => {
       cancelled = true;
+      onPdfReady?.(null);
       task?.destroy?.();
     };
-  }, [source, onReady, onMetadata, onTextExtracted, onError]);
+  }, [source, onReady, onMetadata, onTextExtracted, onError, onPdfReady]);
 
   if (!pdf) {
     return <div className="pdf-loading"><LoaderCircle className="spin" size={22} /><span>正在解析论文版面…</span></div>;
@@ -937,6 +1219,58 @@ function UsageModal({ onClose, stats, loading }: { onClose: () => void; stats: U
   );
 }
 
+const WEEKDAY_LABELS = ["一", "二", "三", "四", "五", "六", "日"];
+
+function StatsModal({ onClose, stats, loading, onOpenPaper }: { onClose: () => void; stats: ReadingStats | null; loading: boolean; onOpenPaper: (id: string) => void }) {
+  const today = localDayString();
+  const maxSeconds = Math.max(1, ...(stats?.days.map((item) => item.activeSeconds) || [0]));
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className="modal-card stats-card" role="dialog" aria-modal="true" aria-labelledby="stats-title">
+        <button className="icon-button modal-close" onClick={onClose} aria-label="关闭"><X size={18} /></button>
+        <div className="settings-heading"><div className="modal-icon"><ChartColumn size={23} /></div><div><h2 id="stats-title">阅读统计</h2><p>按本机自然日统计阅读时长，页面处于前台时每 30 秒记录一次。</p></div></div>
+        {loading ? <div className="library-loading"><LoaderCircle className="spin" size={18} />正在汇总阅读数据…</div> : !stats ? (
+          <div className="library-empty usage-empty"><ChartColumn size={28} /><strong>暂时没有阅读记录</strong><p>打开一篇论文开始阅读，这里会自动记录你的阅读时长。</p></div>
+        ) : (
+          <>
+            <div className="usage-summary">
+              <div className="usage-stat"><small>本周时长</small><strong>{formatDuration(stats.totals.weekSeconds)}</strong><span>打开论文即自动计时</span></div>
+              <div className="usage-stat"><small>读过论文</small><strong>{stats.totals.paperCount}篇</strong><span>本周有阅读记录的论文</span></div>
+              <div className="usage-stat"><small>连续阅读</small><strong>{stats.totals.streakDays}天</strong><span>{stats.totals.streakDays > 0 ? "保持住，别中断" : "今天读一篇就开始"}</span></div>
+            </div>
+            <h3 className="usage-section-title">本周时长</h3>
+            <div className="stats-chart">
+              {stats.days.map((item, index) => (
+                <div key={item.day} className="stats-chart-col">
+                  <div className={`stats-bar ${item.day === today ? "today" : ""}`} style={{ height: `${Math.max(5, Math.round((item.activeSeconds / maxSeconds) * 100))}%` }}>
+                    <span className="stats-bar-tip">{formatDuration(item.activeSeconds)}</span>
+                  </div>
+                  <small>{WEEKDAY_LABELS[index]}</small>
+                </div>
+              ))}
+            </div>
+            <h3 className="usage-section-title">在读进度</h3>
+            {stats.reading.length === 0 ? (
+              <div className="library-empty stats-reading-empty"><BookOpen size={24} /><strong>暂无在读论文</strong><p>从文库打开一篇论文，会自动进入“阅读中”。</p></div>
+            ) : (
+              <div className="stats-reading-list">
+                {stats.reading.map((paper) => (
+                  <button key={paper.id} className="stats-reading-row" onClick={() => onOpenPaper(paper.id)} title={`继续阅读《${paper.title}》`}>
+                    <FileText size={15} />
+                    <span className="stats-reading-title">{paper.title}</span>
+                    <span className="stats-reading-progress"><i style={{ width: `${Math.min(100, Math.round((paper.currentPage / Math.max(1, paper.pageCount)) * 100))}%` }} /></span>
+                    <span className="stats-reading-pages">{paper.currentPage}/{paper.pageCount}页</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 const MODEL_PRESETS: Record<string, { endpoint: string; models: string[] }> = {
   "OpenAI 兼容": { endpoint: "https://api.zhizengzeng.com/v1", models: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "deepseek-chat", "deepseek-reasoner", "gemini-2.5-flash"] },
   OpenAI: { endpoint: "https://api.openai.com/v1", models: ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "o4-mini"] },
@@ -959,7 +1293,7 @@ const UI_FONT_OPTIONS: Array<{ value: UiFontSize; label: string; desc: string; s
   { value: "xlarge", label: "特大", desc: "最大化可读性", sample: 23 },
 ];
 
-function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { onClose: () => void; config: ApiConfig; setConfig: (v: ApiConfig) => void; prompts: PromptConfig; setPrompts: (v: PromptConfig) => void }) {
+function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, visionConfig, setVisionConfig }: { onClose: () => void; config: ApiConfig; setConfig: (v: ApiConfig) => void; prompts: PromptConfig; setPrompts: (v: PromptConfig) => void; visionConfig: VisionConfig; setVisionConfig: (v: VisionConfig) => void }) {
   const [tab, setTab] = useState<"model" | "prompts" | "sync">("model");
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveError, setSaveError] = useState("");
@@ -1013,11 +1347,12 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { on
     setSaveState("saving");
     setSaveError("");
     try {
-      const response = await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompts, modelConfig: config }) });
+      const response = await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompts, modelConfig: config, visionConfig: { endpoint: visionConfig.endpoint, model: visionConfig.model, apiKey: visionConfig.apiKey || undefined } }) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "设置保存失败");
       setPrompts(payload.prompts);
       setConfig({ ...payload.modelConfig, apiKey: "" });
+      if (payload.visionConfig) setVisionConfig({ ...payload.visionConfig, apiKey: "" });
       sessionStorage.removeItem("lumen-api-key");
       localStorage.removeItem("lumen-api-config");
       setSaveState("saved");
@@ -1171,6 +1506,11 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { on
             {testState === "fail" && <span className="test-result fail"><span className="test-dot" />{testMessage}</span>}
           </div>
           {!config.hasApiKey && <div className="settings-note"><Check size={14} />密钥会加密保存在本机，之后无需重复填写。</div>}
+          <div className="sync-section-title">图表理解模型（多模态）</div>
+          <p className="vision-section-hint">用于框选图表问答，需支持图像输入（如 gpt-4.1-mini、qwen-vl-max）。</p>
+          <label className="field-label">API Base URL<input value={visionConfig.endpoint} onChange={(e) => setVisionConfig({ ...visionConfig, endpoint: e.target.value })} placeholder="留空则使用主模型配置" /></label>
+          <label className="field-label">API Key<input type="password" value={visionConfig.apiKey} onChange={(e) => setVisionConfig({ ...visionConfig, apiKey: e.target.value })} placeholder={visionConfig.hasApiKey ? "************" : "留空则使用主模型配置"} /></label>
+          <label className="field-label">模型名<input value={visionConfig.model} onChange={(e) => setVisionConfig({ ...visionConfig, model: e.target.value })} placeholder="留空则使用主模型配置" /></label>
         </div> : tab === "sync" ? <div className="settings-pane">
           <div className="sync-section-title">云同步</div>
           <label className="field-label">WebDAV 地址<input value={syncConfig.endpoint} onChange={(event) => updateSync({ ...syncConfig, endpoint: event.target.value })} placeholder="https://dav.jianguoyun.com/dav/" /></label>
@@ -1233,6 +1573,7 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts }: { on
 }
 
 type ApiConfig = { provider: string; endpoint: string; model: string; apiKey: string; hasApiKey: boolean };
+type VisionConfig = { endpoint: string; model: string; apiKey: string; hasApiKey: boolean };
 
 export default function Home() {
   const [user, setUser] = useState<SessionUser | null>(null);
@@ -1241,7 +1582,7 @@ export default function Home() {
   const [guestSubmitting, setGuestSubmitting] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
   const [fontMenuOpen, setFontMenuOpen] = useState(false);
-  const [saveStatus, setSaveStatus] = useState<"loading" | "saved" | "saving" | "error">("loading");
+  const [saveStatus, setSaveStatus] = useState<"loading" | "saved" | "saving" | "error" | "dirty">("loading");
   const [hydrated, setHydrated] = useState(false);
   const [openModal, setOpenModal] = useState(false);
   const [libraryOpen, setLibraryOpen] = useState(false);
@@ -1251,6 +1592,9 @@ export default function Home() {
   const [usageOpen, setUsageOpen] = useState(false);
   const [usageStats, setUsageStats] = useState<UsageStats | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
+  const [statsOpen, setStatsOpen] = useState(false);
+  const [readingStats, setReadingStats] = useState<ReadingStats | null>(null);
+  const [statsLoading, setStatsLoading] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [uiFontSize, setUiFontSize] = useStoredPref<"compact" | "standard" | "large" | "xlarge">("lumen-ui-font-size", "standard", UI_FONT_SIZES);
   const [rightOpen, setRightOpen] = useState(true);
@@ -1349,6 +1693,7 @@ export default function Home() {
   }, []);
   const [source, setSource] = useState<string | Uint8Array | null>(null);
   const [paperId, setPaperId] = useState<string | null>(null);
+  const [paperStatus, setPaperStatus] = useState<PaperStatus | null>(null);
   const [paperSourceKind, setPaperSourceKind] = useState<PaperSourceKind | null>(null);
   const [paperSourceUrl, setPaperSourceUrl] = useState<string | null>(null);
   const [paperTitle, setPaperTitle] = useState("Attention Is All You Need");
@@ -1356,6 +1701,9 @@ export default function Home() {
   const [pageCount, setPageCount] = useState(15);
   const [thumbCache, setThumbCache] = useState<{ key: string; thumbs: Record<number, string> }>({ key: "", thumbs: {} });
   const [currentPage, setCurrentPage] = useState(1);
+  // 心跳回调读取的最新页码，避免每翻一页就重建定时器
+  const currentPageRef = useRef(1);
+  useEffect(() => { currentPageRef.current = currentPage; }, [currentPage]);
   // 页码输入框用本地字符串，Enter/blur 才提交，外部翻页时同步
   const [pageInput, setPageInput] = useState("1");
   const [pageInputSyncedTo, setPageInputSyncedTo] = useState(currentPage);
@@ -1368,6 +1716,9 @@ export default function Home() {
   const [selectedText, setSelectedText] = useState("");
   const [selectionContext, setSelectionContext] = useState("");
   const [selectionPos, setSelectionPos] = useState<{ x: number; y: number } | null>(null);
+  const [citationPopover, setCitationPopover] = useState<{ target: CitationTarget; x: number; y: number } | null>(null);
+  const [citationCopied, setCitationCopied] = useState(false);
+  const [citationFlash, setCitationFlash] = useState<SelectionOverlayRect[]>([]);
   const [selectionRects, setSelectionRects] = useState<SelectionOverlayRect[]>([]);
   const [pdfContextMenu, setPdfContextMenu] = useState<{ x: number; y: number; pageNumber: number; pageX: number; pageY: number } | null>(null);
   const [selectionAnchor, setSelectionAnchor] = useState<{ top: number; left: number; cardTop: number; cardLeft: number; pageNumber: number } | null>(null);
@@ -1396,6 +1747,9 @@ export default function Home() {
   const resizeRef = useRef<{ id: number; startX: number; startY: number; startWidth: number; startHeight: number } | null>(null);
   const lastDraggedPinRef = useRef<number | null>(null);
   const selectionPointerRef = useRef<{ x: number; y: number; root: Element } | null>(null);
+  // 引用点击判定：mousedown 时的屏幕坐标，mouseup/click 时对比位移区分「点按」与「划词」
+  const citationDownRef = useRef<{ x: number; y: number } | null>(null);
+  const citationFlashTimerRef = useRef<number | null>(null);
   const selectionFrameRef = useRef(0);
   const scrollFrameRef = useRef(0);
   const restoringWorkspaceRef = useRef(false);
@@ -1411,11 +1765,40 @@ export default function Home() {
   const saveSeqRef = useRef(0);
   const lastSavedSnapshotRef = useRef("");
   const lastSavedTextRef = useRef("");
+  // 恢复论文内容时置位：脏状态检测据此跳过“恢复”这一批变化，不误判为未保存
+  const suppressDirtyRef = useRef(false);
+  const saveStatusRef = useRef(saveStatus);
   const [config, setConfig] = useState<ApiConfig>({ provider: "OpenAI", endpoint: "https://api.openai.com/v1", model: "gpt-4.1-mini", apiKey: "", hasApiKey: false });
+  const [visionConfig, setVisionConfig] = useState<VisionConfig>({ endpoint: "", model: "", apiKey: "", hasApiKey: false });
   const [promptConfig, setPromptConfig] = useState<PromptConfig>(DEFAULT_PROMPTS);
+  // 框选图表模式：lassoRect 为拖动中的屏幕矩形，figureRegion 为松手后确认的选区
+  const [figureLasso, setFigureLasso] = useState(false);
+  const [lassoRect, setLassoRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const [figureRegion, setFigureRegion] = useState<FigureRegionSelection | null>(null);
+  const lassoStartRef = useRef<{ x: number; y: number; page: HTMLElement } | null>(null);
+  const lassoRectRef = useRef<{ left: number; top: number; width: number; height: number } | null>(null);
+  // 已加载的 pdf.js 文档实例，供框选区域截图使用
+  const pdfRef = useRef<PdfDocumentLike | null>(null);
+  const handlePdfInstance = useCallback((pdf: PdfDocumentLike | null) => { pdfRef.current = pdf; }, []);
+  // 未配置图表理解模型时的一次性提醒（localStorage 持久化关闭状态）
+  const [visionHintDismissed, setVisionHintDismissed] = useStoredPref<"0" | "1">("wenshu.visionHintDismissed", "0", ["0", "1"]);
+  const dismissVisionHint = useCallback(() => setVisionHintDismissed("1"), [setVisionHintDismissed]);
+  // 切换论文/缩放时退出框选模式并清除选区（与页码输入框同款的渲染期同步写法）
+  const lassoKey = `${typeof source === "string" ? source : source ? "file" : ""}:${zoom}`;
+  const [lassoSyncedKey, setLassoSyncedKey] = useState(lassoKey);
+  if (lassoSyncedKey !== lassoKey) {
+    setLassoSyncedKey(lassoKey);
+    if (figureLasso || figureRegion || lassoRect) {
+      setFigureLasso(false);
+      setLassoRect(null);
+      setFigureRegion(null);
+    }
+  }
   const [messages, setMessages] = useState<ChatMessage[]>([
     { id: 1, role: "assistant", content: "这里是**全文对话**。我会基于整篇论文回答总结、方法、实验与结论问题；局部翻译和解释会留在原文旁边。" },
   ]);
+  const [conversations, setConversations] = useState<SavedConversation[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   // 文本层就绪批量上报：约 200ms 合并成一次 textLayerVersion 递增，避免每页一次整树渲染
   const handleTextLayerReady = useCallback(() => {
@@ -1430,6 +1813,11 @@ export default function Home() {
       }, 200);
     }
   }, []);
+
+  // 文末参考文献表：paperText 变化时重新解析，解析失败得到空 Map
+  const references = useMemo(() => parseReferences(paperText), [paperText]);
+  // 作者-年份模式：只在数字模式解析不到条目时启用（[n] 格式优先级更高，行为不回归）
+  const authorYearRefs = useMemo(() => (references.size ? [] : parseAuthorYearReferences(paperText)), [paperText, references]);
 
   const thumbSourceKey = typeof source === "string" ? source : source ? "file" : "";
   // 缩略图先进 ref 累积，约 200ms 批量写入 state
@@ -1451,6 +1839,7 @@ export default function Home() {
   useEffect(() => () => {
     if (thumbFlushTimerRef.current !== null) window.clearTimeout(thumbFlushTimerRef.current);
     if (textLayerFlushTimerRef.current !== null) window.clearTimeout(textLayerFlushTimerRef.current);
+    if (citationFlashTimerRef.current !== null) window.clearTimeout(citationFlashTimerRef.current);
   }, []);
   const pageThumbs = thumbCache.key === thumbSourceKey ? thumbCache.thumbs : {};
 
@@ -1466,6 +1855,17 @@ export default function Home() {
     setCurrentPage(next);
     scrollToPage(next);
   }, [pageCount, scrollToPage]);
+
+  // 点击回答里的【Pn】引用 chip：跳到对应页并闪烁一圈绿框提示位置
+  const handlePageJump = useCallback((page: number) => {
+    goToPage(page);
+    window.setTimeout(() => {
+      const target = readerRef.current?.querySelector(`[data-page-number="${page}"]`);
+      if (!target) return;
+      target.classList.add("page-flash");
+      window.setTimeout(() => target.classList.remove("page-flash"), 1700);
+    }, 480);
+  }, [goToPage]);
 
   // 打开/恢复论文后，等文本层渲染出来再滚动到上次阅读页
   useEffect(() => {
@@ -1521,15 +1921,19 @@ export default function Home() {
           const settingsPayload = await settingsResponse.json();
           if (settingsPayload?.prompts?.global && settingsPayload?.prompts?.inline) setPromptConfig(settingsPayload.prompts);
           if (settingsPayload?.modelConfig) setConfig({ ...settingsPayload.modelConfig, apiKey: "" });
+          if (settingsPayload?.visionConfig) setVisionConfig({ ...settingsPayload.visionConfig, apiKey: "" });
         }
         const workspace = workspacePayload.workspace;
         if (workspace?.paper) {
           restoringWorkspaceRef.current = true;
+          suppressDirtyRef.current = true;
           clearPaperAnnotations();
           const paper = workspace.paper;
           const restoredMessages: ChatMessage[] = Array.isArray(workspace.messages) && workspace.messages.length ? workspace.messages : [{ id: Date.now(), role: "assistant", content: "已恢复这篇论文的阅读记录。" }];
           const restoredAnnotations: Annotation[] = (Array.isArray(workspace.annotations) ? workspace.annotations : []).map((item: Annotation) => ({ ...item, loading: false, draft: "", thread: Array.isArray(item.thread) ? item.thread : [], pageNumber: item.pageNumber || 1 }));
+          const restoredConversations: SavedConversation[] = Array.isArray(workspace.conversations) ? workspace.conversations : [];
           setPaperId(paper.id);
+          setPaperStatus(paper.status || "unread");
           setPaperSourceKind(paper.sourceKind);
           setPaperSourceUrl(paper.sourceUrl || null);
           setPaperTitle(paper.title);
@@ -1542,8 +1946,10 @@ export default function Home() {
           setRightOpen(workspace.rightOpen !== false);
           setMessages(restoredMessages);
           setAnnotations(restoredAnnotations);
+          setConversations(restoredConversations);
+          setHistoryOpen(false);
           // 记录恢复内容的快照，自动保存据此跳过未变更的"原样写回"
-          lastSavedSnapshotRef.current = workspaceSnapshot({ paperId: paper.id, title: paper.title, meta: paper.meta, sourceKind: paper.sourceKind, sourceUrl: paper.sourceUrl || null, paperText: "", pageCount: paper.pageCount || 1, currentPage: workspace.currentPage || 1, zoom: workspace.zoom || 0.88, rightOpen: workspace.rightOpen !== false, messages: restoredMessages, annotationsJson: serializePersistentAnnotations(restoredAnnotations) });
+          lastSavedSnapshotRef.current = workspaceSnapshot({ paperId: paper.id, title: paper.title, meta: paper.meta, sourceKind: paper.sourceKind, sourceUrl: paper.sourceUrl || null, paperText: "", pageCount: paper.pageCount || 1, currentPage: workspace.currentPage || 1, zoom: workspace.zoom || 0.88, rightOpen: workspace.rightOpen !== false, messages: restoredMessages, conversations: restoredConversations, annotationsJson: serializePersistentAnnotations(restoredAnnotations) });
           lastSavedTextRef.current = paper.paperText || "";
           if (paper.sourceKind === "upload") {
             setSource(`/api/papers/${paper.id}/file`);
@@ -1782,9 +2188,9 @@ export default function Home() {
     return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); window.removeEventListener("pointercancel", end); };
   }, [updateAnnotation]);
 
-  const requestInlineAnswer = useCallback(async (id: number, action: ToolAction, text: string, surrounding: string, customQuestion?: string, history: ChatMessage[] = []) => {
-    const prompt = customQuestion || (action === "translate" ? "请将选中的内容准确翻译成中文，保留公式与专业术语，并简短标注关键术语。" : action === "formula" ? "请逐项解释这个公式：说明每个符号、公式的直觉含义、它在论文中的作用，以及阅读时应注意的假设。" : "请直观解释选中内容的含义、它在本段中的作用，以及读者容易误解的地方。");
-    const userMessage: ChatMessage = { id: Date.now(), role: "user", content: customQuestion || (action === "translate" ? "翻译这段内容" : action === "formula" ? "解释这个公式" : action === "explain" ? "解释这段内容" : prompt) };
+  const requestInlineAnswer = useCallback(async (id: number, action: ToolAction, text: string, surrounding: string, customQuestion?: string, history: ChatMessage[] = [], imageDataUrl?: string) => {
+    const prompt = customQuestion || (action === "translate" ? "请将选中的内容准确翻译成中文，保留公式与专业术语，并简短标注关键术语。" : action === "formula" ? "请逐项解释这个公式：说明每个符号、公式的直觉含义、它在论文中的作用，以及阅读时应注意的假设。" : action === "figure" ? "请解读这张图表/表格：说明它的构成、坐标轴与单位、主要趋势、关键数值，以及它支持的结论。" : "请直观解释选中内容的含义、它在本段中的作用，以及读者容易误解的地方。");
+    const userMessage: ChatMessage = { id: Date.now(), role: "user", content: customQuestion || (action === "translate" ? "翻译这段内容" : action === "formula" ? "解释这个公式" : action === "figure" ? "解读这张图表" : action === "explain" ? "解释这段内容" : prompt) };
     const nextThread = [...history, userMessage];
     // 同一批注重新提问时中断上一次未完成的流
     inlineControllersRef.current.get(id)?.abort();
@@ -1796,7 +2202,7 @@ export default function Home() {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, paperContext: paperText, mode: "inline", history: history.slice(-10), systemPrompts: promptConfig, effort: inlineEffort }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, paperContext: paperText, mode: "inline", history: history.slice(-10), systemPrompts: promptConfig, effort: inlineEffort, ...(imageDataUrl ? { imageDataUrl } : {}) }),
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -1841,6 +2247,11 @@ export default function Home() {
   }, [config, inlineEffort, paperText, paperTitle, promptConfig, updateAnnotation]);
 
   const handleSelectionStart = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    citationDownRef.current = null;
+    // 任何一次按下都先收起引用气泡；新的点按会在 click 时重新打开
+    setCitationPopover(null);
+    // 框选图表模式下禁用划词（preventDefault 阻止拖出原生选区）
+    if (figureLasso) { event.preventDefault(); return; }
     if (event.button !== 0 || panMode) return;
     // 本次按下已被平移接管（空白区域左键或中键），不进入划词流程，避免拖动时拉出选区
     if (readerPanRef.current) {
@@ -1853,10 +2264,11 @@ export default function Home() {
     const target = event.target as HTMLElement;
     const root = target.closest(".textLayer, .demo-paper");
     selectionPointerRef.current = root ? { x: event.clientX, y: event.clientY, root } : null;
+    citationDownRef.current = root ? { x: event.clientX, y: event.clientY } : null;
     setSelectionRects([]);
     setSelectionPos(null);
     if (pdfContextMenu) setPdfContextMenu(null);
-  }, [panMode, pdfContextMenu]);
+  }, [panMode, pdfContextMenu, figureLasso]);
 
   const handleSelectionMove = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     const pointerStart = selectionPointerRef.current;
@@ -1918,6 +2330,75 @@ export default function Home() {
     setShowReaderTip(false);
   }, []);
 
+  // 引用点按：与划词共用手指流程——只有「位移 < 5px 且没有产生选区」的按下才算点击
+  const handleCitationClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const down = citationDownRef.current;
+    citationDownRef.current = null;
+    if (!down || panMode) return;
+    if (Math.abs(event.clientX - down.x) > 5 || Math.abs(event.clientY - down.y) > 5) return;
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed && selection.toString().trim().length >= 2) return;
+    const textLayer = (event.target as HTMLElement).closest(".textLayer");
+    if (!textLayer) return;
+    // 按论文自动判别：参考文献区解析出 [n] 条目走数字模式，否则尝试作者-年份
+    let target: CitationTarget | null = null;
+    if (references.size) {
+      const number = citationNumberAtPoint(textLayer, event.clientX, event.clientY);
+      if (number) target = { kind: "numeric", number };
+    } else if (authorYearRefs.length) {
+      const hit = citationAuthorYearAtPoint(textLayer, event.clientX, event.clientY);
+      if (hit) target = { kind: "author-year", hit };
+    }
+    if (!target) return;
+    event.preventDefault();
+    setSelectionRects([]);
+    setSelectionPos(null);
+    setCitationCopied(false);
+    setCitationPopover({
+      target,
+      x: Math.min(Math.max(event.clientX, 180), window.innerWidth - 180),
+      y: Math.min(event.clientY + 14, window.innerHeight - 240),
+    });
+  }, [panMode, references, authorYearRefs]);
+
+  // 跳转到原文：先滚到条目所在页，等渲染稳定后定位条目开头并做一次绿色闪烁
+  const jumpToReference = useCallback((entry: { text: string; page: number; index?: number }) => {
+    setCitationPopover(null);
+    // 立即跳转而非平滑滚动：闪烁高亮的坐标按滚动后位置计算，平滑动画会导致错位
+    scrollToPage(entry.page, "auto");
+    window.setTimeout(() => {
+      const reader = readerRef.current;
+      const page = reader?.querySelector(`[data-page-number="${entry.page}"]`) as HTMLElement | null;
+      const textLayer = page?.querySelector(".textLayer") || page;
+      if (!reader || !textLayer) return;
+      const needle = entry.text.slice(0, 40).trim();
+      const range = (needle && findTextRange(textLayer, needle)) || (entry.index ? findTextRange(textLayer, `[${entry.index}]`) : null);
+      if (!range) return; // 定位失败至少停留在正确页
+      setCitationFlash(overlayRectsForRange(range, textLayer.closest(".pdf-page, .demo-paper"), reader));
+      if (citationFlashTimerRef.current !== null) window.clearTimeout(citationFlashTimerRef.current);
+      citationFlashTimerRef.current = window.setTimeout(() => {
+        citationFlashTimerRef.current = null;
+        setCitationFlash([]);
+      }, 2100);
+    }, 380);
+  }, [scrollToPage]);
+
+  // ESC 关闭引用气泡；缩放会重排文本层，直接收起
+  useEffect(() => {
+    if (!citationPopover) return;
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setCitationPopover(null); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [citationPopover]);
+
+  // 缩放会重排文本层：渲染期间检测到 zoom 变化就收起气泡与闪烁（与页码输入框同款同步写法）
+  const [citationZoomSyncedTo, setCitationZoomSyncedTo] = useState(zoom);
+  if (citationZoomSyncedTo !== zoom) {
+    setCitationZoomSyncedTo(zoom);
+    setCitationPopover(null);
+    setCitationFlash([]);
+  }
+
   const createAnnotation = useCallback((kind: ToolAction | "highlight", color: HighlightColor = "green") => {
     if (!selectedText || !selectionAnchor || !selectionRangeRef.current) return;
     const id = Date.now() + Math.floor(Math.random() * 1000);
@@ -1970,6 +2451,109 @@ export default function Home() {
     window.setTimeout(() => flashFormulaRegion(id), 0);
     void requestInlineAnswer(id, "formula", formula.text, surrounding);
   }, [flashFormulaRegion, requestInlineAnswer]);
+
+  // 框选图表：lasso 模式下左键按下开始拖框，否则走原有的平移逻辑
+  const handleReaderPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (figureLasso && event.button === 0) {
+      const page = (event.target as HTMLElement).closest(".pdf-page") as HTMLElement | null;
+      if (!page) return;
+      event.preventDefault();
+      lassoStartRef.current = { x: event.clientX, y: event.clientY, page };
+      setFigureRegion(null);
+      setLassoRect(null);
+      return;
+    }
+    startReaderPan(event);
+  }, [figureLasso, startReaderPan]);
+
+  // 框选拖动与松手：矩形钳制在起始页内；松手时矩形 ≥12×12 才确认选区并弹出操作条
+  useEffect(() => {
+    if (!figureLasso) return;
+    const move = (event: PointerEvent) => {
+      const start = lassoStartRef.current;
+      if (!start) return;
+      const pageRect = start.page.getBoundingClientRect();
+      const left = Math.min(Math.max(Math.min(start.x, event.clientX), pageRect.left), pageRect.right);
+      const right = Math.min(Math.max(Math.max(start.x, event.clientX), pageRect.left), pageRect.right);
+      const top = Math.min(Math.max(Math.min(start.y, event.clientY), pageRect.top), pageRect.bottom);
+      const bottom = Math.min(Math.max(Math.max(start.y, event.clientY), pageRect.top), pageRect.bottom);
+      const rect = { left, top, width: right - left, height: bottom - top };
+      lassoRectRef.current = rect;
+      setLassoRect(rect);
+    };
+    const up = () => {
+      const start = lassoStartRef.current;
+      const rect = lassoRectRef.current;
+      lassoStartRef.current = null;
+      lassoRectRef.current = null;
+      setLassoRect(null);
+      if (!start || !rect || rect.width < 12 || rect.height < 12) return;
+      const pageRect = start.page.getBoundingClientRect();
+      setFigureRegion({
+        pageNumber: Number(start.page.dataset.pageNumber || 1),
+        regionX: (rect.left - pageRect.left) / Math.max(1, pageRect.width),
+        regionY: (rect.top - pageRect.top) / Math.max(1, pageRect.height),
+        regionWidth: rect.width / Math.max(1, pageRect.width),
+        regionHeight: rect.height / Math.max(1, pageRect.height),
+        barX: Math.min(Math.max(rect.left + rect.width / 2, 120), window.innerWidth - 120),
+        barY: Math.min(rect.top + rect.height + 12, window.innerHeight - 64),
+      });
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+    return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", up); };
+  }, [figureLasso]);
+
+  // ESC：先取消已确认的选区，再退出框选模式
+  useEffect(() => {
+    if (!figureLasso && !figureRegion) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (figureRegion) setFigureRegion(null);
+      else setFigureLasso(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [figureLasso, figureRegion]);
+
+  // 「问图表」：截取选区图片，创建钉在区域右缘的图表批注（区域坐标复用公式的归一化字段，缩放/刷新后与公式同款重对齐）
+  const createFigureAnnotation = useCallback(async (region: FigureRegionSelection) => {
+    const reader = readerRef.current;
+    const pdf = pdfRef.current;
+    const page = reader?.querySelector(`[data-page-number="${region.pageNumber}"]`) as HTMLElement | null;
+    if (!reader || !page || !pdf) return;
+    const readerRect = reader.getBoundingClientRect();
+    const pageRect = page.getBoundingClientRect();
+    const pageX = Math.min(.96, Math.max(.04, region.regionX + region.regionWidth));
+    const pageY = Math.min(.98, Math.max(.02, region.regionY));
+    const left = pageRect.left - readerRect.left + reader.scrollLeft + pageX * pageRect.width;
+    const top = pageRect.top - readerRect.top + reader.scrollTop + pageY * pageRect.height;
+    const formulaRegionLeft = pageRect.left - readerRect.left + reader.scrollLeft + region.regionX * pageRect.width;
+    const formulaRegionTop = pageRect.top - readerRect.top + reader.scrollTop + region.regionY * pageRect.height;
+    const formulaRegionPixelWidth = region.regionWidth * pageRect.width;
+    const formulaRegionPixelHeight = region.regionHeight * pageRect.height;
+    const visibleRight = reader.scrollLeft + reader.clientWidth;
+    const id = Date.now() + Math.floor(Math.random() * 1000);
+    const cardLeft = left + 358 > visibleRight ? Math.max(reader.scrollLeft + 14, left - 360) : left + 15;
+    const cardTop = Math.max(reader.scrollTop + 8, Math.min(reader.scrollTop + reader.clientHeight - 110, top + 15));
+    const text = `第 ${region.pageNumber} 页图表区域`;
+    const surrounding = String(page.innerText || "").replace(/\s+/g, " ").slice(0, 2000);
+    const annotation: Annotation = { id, kind: "figure", color: "green", text, surrounding, top, left, cardTop, cardLeft, open: true, loading: false, result: "", draft: "", thread: [], pageNumber: region.pageNumber, pageX, pageY, formulaRegionX: region.regionX, formulaRegionY: region.regionY, formulaRegionWidth: region.regionWidth, formulaRegionHeight: region.regionHeight, formulaRegionLeft, formulaRegionTop, formulaRegionPixelWidth, formulaRegionPixelHeight, pinOffsetX: 0, pinOffsetY: 0, cardOffsetX: cardLeft - left, cardOffsetY: cardTop - top };
+    annotationAnchorsRef.current.set(id, { top, left });
+    setAnnotations((items) => [...items, annotation]);
+    window.setTimeout(() => flashFormulaRegion(id), 0);
+    const imageDataUrl = await capturePageRegion(pdf, region.pageNumber, region);
+    if (imageDataUrl) updateAnnotation(id, { figureImage: imageDataUrl });
+    void requestInlineAnswer(id, "figure", text, surrounding, undefined, [], imageDataUrl || undefined);
+  }, [flashFormulaRegion, requestInlineAnswer, updateAnnotation]);
+
+  const askAboutFigureRegion = useCallback(() => {
+    const region = figureRegion;
+    setFigureRegion(null);
+    setFigureLasso(false);
+    if (region) void createFigureAnnotation(region);
+  }, [createFigureAnnotation, figureRegion]);
 
   const handlePdfContextMenu = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     const page = (event.target as HTMLElement).closest(".pdf-page") as HTMLElement | null;
@@ -2041,7 +2625,7 @@ export default function Home() {
     const cardTop = Math.max(reader.scrollTop + 8, Math.min(reader.scrollTop + reader.clientHeight - 110, annotation.top + 15));
     const anchor = annotationAnchorsRef.current.get(annotation.id) || { top: annotation.top - (annotation.pinOffsetY || 0), left: annotation.left - (annotation.pinOffsetX || 0) };
     updateAnnotation(annotation.id, { open: true, cardLeft, cardTop, cardOffsetX: cardLeft - anchor.left, cardOffsetY: cardTop - anchor.top });
-    if (annotation.kind === "formula") flashFormulaRegion(annotation.id);
+    if (annotation.kind === "formula" || annotation.kind === "figure") flashFormulaRegion(annotation.id);
     else flashAnnotationRange(annotation.id);
   }, [flashAnnotationRange, flashFormulaRegion, updateAnnotation]);
 
@@ -2059,6 +2643,8 @@ export default function Home() {
     setAnnotations([]);
     setSelectedText("");
     setSelectionPos(null);
+    setCitationPopover(null);
+    setCitationFlash([]);
   }, []);
 
   const realignAnnotations = useCallback(() => {
@@ -2068,7 +2654,7 @@ export default function Home() {
     setAnnotations((items) => {
       let changed = false;
       const next = items.map((annotation) => {
-        if ((annotation.kind === "text-note" || annotation.kind === "formula") && annotation.pageX !== undefined && annotation.pageY !== undefined) {
+        if ((annotation.kind === "text-note" || annotation.kind === "formula" || annotation.kind === "figure") && annotation.pageX !== undefined && annotation.pageY !== undefined) {
           const page = reader.querySelector(`[data-page-number="${annotation.pageNumber || 1}"]`) as HTMLElement | null;
           if (!page) return annotation;
           const pageRect = page.getBoundingClientRect();
@@ -2080,7 +2666,7 @@ export default function Home() {
           const top = anchor.top + (annotation.pinOffsetY || 0);
           const cardLeft = anchor.left + cardOffsetX;
           const cardTop = anchor.top + cardOffsetY;
-          const hasFormulaRegion = annotation.kind === "formula"
+          const hasFormulaRegion = (annotation.kind === "formula" || annotation.kind === "figure")
             && annotation.formulaRegionX !== undefined
             && annotation.formulaRegionY !== undefined
             && annotation.formulaRegionWidth !== undefined
@@ -2173,6 +2759,17 @@ export default function Home() {
     });
   }, [textLayerVersion]);
 
+  // 给文本层里的引用加可点击的视觉提示：与点击识别共用按视觉行拼串的逻辑，标出来的都能点开
+  useEffect(() => {
+    const reader = readerRef.current;
+    if (!reader) return;
+    const authorYearMode = !references.size && authorYearRefs.length > 0;
+    if (!authorYearMode && !references.size) return;
+    for (const textLayer of Array.from(reader.querySelectorAll(".textLayer"))) {
+      markCitationSpansInLayer(textLayer, authorYearMode);
+    }
+  }, [textLayerVersion, references, authorYearRefs]);
+
   useEffect(() => {
     const reader = readerRef.current;
     if (!reader) return;
@@ -2193,7 +2790,7 @@ export default function Home() {
     if (!reader || !annotations.length) return;
     const restoreRanges = () => {
       for (const annotation of annotations) {
-        if (annotation.kind === "text-note" || annotation.kind === "formula") continue;
+        if (annotation.kind === "text-note" || annotation.kind === "formula" || annotation.kind === "figure") continue;
         const page = reader.querySelector(`[data-page-number="${annotation.pageNumber || 1}"]`);
         const textRoot = page?.querySelector(".textLayer") || page;
         if (!textRoot) continue;
@@ -2222,52 +2819,119 @@ export default function Home() {
   }, [addAnnotationRange, annotations, realignAnnotations, source, textLayerVersion]);
 
   const anyAnnotationLoading = annotations.some((annotation) => annotation.loading);
+
+  // 保存所需的最新状态镜像：performSave 经 ref 读取，保持回调稳定，定时器不因交互频繁重建
+  const saveInputRef = useRef({ paperId, paperTitle, paperMeta, paperSourceKind, paperSourceUrl, paperText, pageCount, currentPage, zoom, rightOpen, messages, conversations, annotations, blocked: false as boolean });
   useEffect(() => {
-    if (!hydrated || !user || !paperId || !paperSourceKind) return;
-    // 流式输出期间不调度保存：这些状态变化本身在 deps 里，流结束后会自然触发一次保存
-    if (loading || streaming || anyAnnotationLoading) return;
-    const timer = window.setTimeout(async () => {
-      // 序列化只在真正保存时做一次；论文文本与上次一致时不重复携带
-      const annotationsJson = serializePersistentAnnotations(annotations);
-      const includePaperText = paperText !== lastSavedTextRef.current;
-      const snapshot = workspaceSnapshot({ paperId, title: paperTitle, meta: paperMeta, sourceKind: paperSourceKind, sourceUrl: paperSourceUrl, paperText: includePaperText ? paperText : "", pageCount, currentPage, zoom, rightOpen, messages, annotationsJson });
-      // 与上次成功保存（或水合恢复）的内容一致时不重复写回
-      if (snapshot === lastSavedSnapshotRef.current) return;
-      const seq = ++saveSeqRef.current;
-      try {
-        setSaveStatus("saving");
-        const response = await fetch("/api/workspace", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            paper: {
-              id: paperId,
-              title: paperTitle,
-              meta: paperMeta,
-              sourceKind: paperSourceKind,
-              sourceUrl: paperSourceUrl,
-              pageCount,
-              ...(includePaperText ? { paperText } : {}),
-            },
-            currentPage,
-            zoom,
-            rightOpen,
-            messages,
-            annotations: JSON.parse(annotationsJson),
-          }),
-        });
-        if (!response.ok) throw new Error("save failed");
-        if (seq !== saveSeqRef.current) return; // 已有更新的保存发出（如切换论文），丢弃过期响应
-        lastSavedSnapshotRef.current = snapshot;
-        lastSavedTextRef.current = paperText;
-        setSaveStatus("saved");
-      } catch {
-        if (seq !== saveSeqRef.current) return;
-        setSaveStatus("error");
-      }
-    }, 900);
+    saveInputRef.current = { paperId, paperTitle, paperMeta, paperSourceKind, paperSourceUrl, paperText, pageCount, currentPage, zoom, rightOpen, messages, conversations, annotations, blocked: loading || streaming || anyAnnotationLoading };
+    saveStatusRef.current = saveStatus;
+  });
+
+  // 脏状态检测：低频保存下状态条不能一直显示“已保存”；deps 里的内容状态任一变化即标未保存，
+  // 只做引用比较，不做序列化，避免引入新的卡顿；setTimeout 避免 effect 内同步 setState
+  useEffect(() => {
+    if (!hydrated || !paperId || !paperSourceKind) return;
+    if (suppressDirtyRef.current) { suppressDirtyRef.current = false; return; } // 恢复论文的那批变化不算未保存
+    const timer = window.setTimeout(() => {
+      if (saveStatusRef.current !== "saving" && saveStatusRef.current !== "loading") setSaveStatus("dirty");
+    }, 0);
     return () => window.clearTimeout(timer);
-  }, [annotations, anyAnnotationLoading, currentPage, hydrated, loading, messages, pageCount, paperId, paperMeta, paperSourceKind, paperSourceUrl, paperText, paperTitle, rightOpen, streaming, user, zoom]);
+  }, [annotations, conversations, currentPage, hydrated, messages, pageCount, paperId, paperMeta, paperSourceKind, paperText, paperTitle, rightOpen, zoom]);
+
+  // 手动/低频自动共用的保存逻辑；内容相对上次保存无变化时直接跳过
+  const performSave = useCallback(async (reason: "auto" | "manual" | "background" = "auto") => {
+    const input = saveInputRef.current;
+    if (!hydrated || !user || !input.paperId || !input.paperSourceKind) return;
+    if (reason === "auto" && input.blocked) return; // 流式输出期间自动保存让位，手动保存不受限
+    const annotationsJson = serializePersistentAnnotations(input.annotations);
+    const includePaperText = input.paperText !== lastSavedTextRef.current;
+    const snapshot = workspaceSnapshot({ paperId: input.paperId, title: input.paperTitle, meta: input.paperMeta, sourceKind: input.paperSourceKind, sourceUrl: input.paperSourceUrl, paperText: includePaperText ? input.paperText : "", pageCount: input.pageCount, currentPage: input.currentPage, zoom: input.zoom, rightOpen: input.rightOpen, messages: input.messages, conversations: input.conversations, annotationsJson });
+    if (snapshot === lastSavedSnapshotRef.current) {
+      if (reason === "manual") setSaveStatus("saved"); // 引用级脏检测偶有误报（如批注 loading 态翻转），手动保存时校正
+      return;
+    }
+    const seq = ++saveSeqRef.current;
+    try {
+      setSaveStatus("saving");
+      const response = await fetch("/api/workspace", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          paper: {
+            id: input.paperId,
+            title: input.paperTitle,
+            meta: input.paperMeta,
+            sourceKind: input.paperSourceKind,
+            sourceUrl: input.paperSourceUrl,
+            pageCount: input.pageCount,
+            ...(includePaperText ? { paperText: input.paperText } : {}),
+          },
+          currentPage: input.currentPage,
+          zoom: input.zoom,
+          rightOpen: input.rightOpen,
+          messages: input.messages,
+          conversations: input.conversations,
+          annotations: JSON.parse(annotationsJson),
+        }),
+      });
+      if (!response.ok) throw new Error("save failed");
+      if (seq !== saveSeqRef.current) return; // 已有更新的保存发出（如切换论文），丢弃过期响应
+      lastSavedSnapshotRef.current = snapshot;
+      lastSavedTextRef.current = input.paperText;
+      setSaveStatus("saved");
+    } catch {
+      if (seq !== saveSeqRef.current) return;
+      setSaveStatus("error");
+    }
+  }, [hydrated, user]);
+
+  // 低频自动保存：每小时兜底一次（页面常开时）；切到后台立即保存，避免长时间未落盘的内容丢失
+  useEffect(() => {
+    const timer = window.setInterval(() => { void performSave("auto"); }, 60 * 60 * 1000);
+    const onVisibilityChange = () => { if (document.visibilityState === "hidden") void performSave("background"); };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisibilityChange); };
+  }, [performSave]);
+
+  // 阅读心跳：真实论文打开期间每 30 秒上报一次活跃时长；切到后台时用 keepalive 补最后一拍，静默失败
+  useEffect(() => {
+    if (!user || !paperId || !paperSourceKind) return;
+    let lastPingAt = Date.now();
+    const ping = (deltaSeconds: number, keepalive = false) => {
+      lastPingAt = Date.now();
+      fetch("/api/reading/ping", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paperId, currentPage: currentPageRef.current, deltaSeconds, day: localDayString() }),
+        keepalive,
+      }).catch(() => undefined);
+    };
+    const timer = window.setInterval(() => { if (document.visibilityState === "visible") ping(30); }, 30000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "hidden") return;
+      ping(Math.min(60, Math.max(1, Math.round((Date.now() - lastPingAt) / 1000))), true);
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisibilityChange); };
+  }, [user, paperId, paperSourceKind]);
+
+  // 阅读状态自动流转：打开未读论文自动标记“阅读中”，翻到最后一页自动标记“已阅读”；在途请求用 ref 去重，失败时下次自动保存后重试
+  const statusPatchRef = useRef("");
+  useEffect(() => {
+    if (!user || !paperId || !paperSourceKind || !paperStatus) return;
+    const next: PaperStatus | null = paperStatus === "unread" ? "reading" : paperStatus === "reading" && pageCount > 1 && currentPage >= pageCount ? "done" : null;
+    if (!next) return;
+    const key = `${paperId}:${next}`;
+    if (statusPatchRef.current === key) return;
+    statusPatchRef.current = key;
+    fetch(`/api/papers/${encodeURIComponent(paperId)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: next }) })
+      .then((response) => {
+        if (!response.ok) { statusPatchRef.current = ""; return; }
+        setPaperStatus(next);
+        setLibraryPapers((papers) => papers.map((paper) => paper.id === paperId ? { ...paper, status: next } : paper));
+      })
+      .catch(() => { statusPatchRef.current = ""; });
+  }, [user, paperId, paperSourceKind, paperStatus, currentPage, pageCount, saveStatus]);
 
   const showLibrary = useCallback(async () => {
     setLibraryOpen(true);
@@ -2294,6 +2958,19 @@ export default function Home() {
     } catch (error: unknown) {
       setToast(errorMessage(error, "用量读取失败"));
     } finally { setUsageLoading(false); }
+  }, []);
+
+  const showStats = useCallback(async () => {
+    setStatsOpen(true);
+    setStatsLoading(true);
+    try {
+      const response = await fetch(`/api/reading/stats?from=${weekMondayString()}&today=${localDayString()}`, { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "无法读取阅读统计");
+      setReadingStats(payload as ReadingStats);
+    } catch (error: unknown) {
+      setToast(errorMessage(error, "阅读统计读取失败"));
+    } finally { setStatsLoading(false); }
   }, []);
 
   const createLibraryFolder = useCallback(async (name: string) => {
@@ -2343,6 +3020,7 @@ export default function Home() {
 
   const openLibraryPaper = useCallback(async (id: string) => {
     if (id === paperId) { setLibraryOpen(false); return; }
+    void performSave("background"); // 切换前把当前论文未落盘的内容先存掉
     setLibraryLoading(true);
     try {
       const response = await fetch(`/api/workspace?paperId=${encodeURIComponent(id)}`, { cache: "no-store" });
@@ -2351,10 +3029,13 @@ export default function Home() {
       const workspace = payload.workspace;
       const paper = workspace.paper;
       restoringWorkspaceRef.current = true;
+      suppressDirtyRef.current = true;
       clearPaperAnnotations();
       const restoredMessages: ChatMessage[] = Array.isArray(workspace.messages) && workspace.messages.length ? workspace.messages : [{ id: Date.now(), role: "assistant", content: "这篇论文已经打开，可以继续提问。" }];
       const restoredAnnotations: Annotation[] = (Array.isArray(workspace.annotations) ? workspace.annotations : []).map((item: Annotation) => ({ ...item, loading: false, draft: "", thread: Array.isArray(item.thread) ? item.thread : [], pageNumber: item.pageNumber || 1 }));
+      const restoredConversations: SavedConversation[] = Array.isArray(workspace.conversations) ? workspace.conversations : [];
       setPaperId(paper.id);
+      setPaperStatus(paper.status || "unread");
       setPaperSourceKind(paper.sourceKind);
       setPaperSourceUrl(paper.sourceUrl || null);
       setPaperTitle(paper.title);
@@ -2367,8 +3048,10 @@ export default function Home() {
       setRightOpen(workspace.rightOpen !== false);
       setMessages(restoredMessages);
       setAnnotations(restoredAnnotations);
+      setConversations(restoredConversations);
+      setHistoryOpen(false);
       // 记录恢复内容的快照，自动保存据此跳过未变更的"原样写回"
-      lastSavedSnapshotRef.current = workspaceSnapshot({ paperId: paper.id, title: paper.title, meta: paper.meta, sourceKind: paper.sourceKind, sourceUrl: paper.sourceUrl || null, paperText: "", pageCount: paper.pageCount || 1, currentPage: workspace.currentPage || 1, zoom: workspace.zoom || 0.88, rightOpen: workspace.rightOpen !== false, messages: restoredMessages, annotationsJson: serializePersistentAnnotations(restoredAnnotations) });
+      lastSavedSnapshotRef.current = workspaceSnapshot({ paperId: paper.id, title: paper.title, meta: paper.meta, sourceKind: paper.sourceKind, sourceUrl: paper.sourceUrl || null, paperText: "", pageCount: paper.pageCount || 1, currentPage: workspace.currentPage || 1, zoom: workspace.zoom || 0.88, rightOpen: workspace.rightOpen !== false, messages: restoredMessages, conversations: restoredConversations, annotationsJson: serializePersistentAnnotations(restoredAnnotations) });
       lastSavedTextRef.current = paper.paperText || "";
       if (paper.sourceKind === "upload") {
         setSource(`/api/papers/${paper.id}/file`);
@@ -2384,14 +3067,16 @@ export default function Home() {
     } catch (error: any) {
       setToast(error?.message || "论文打开失败");
     } finally { setLibraryLoading(false); }
-  }, [clearPaperAnnotations, paperId]);
+  }, [clearPaperAnnotations, paperId, performSave]);
 
   const openUrl = (raw: string) => {
     const normalized = normalizePaperUrl(raw);
     if (!/^https?:\/\//i.test(normalized)) { setToast("请输入有效的公开链接"); return; }
+    void performSave("background"); // 切换前先把当前论文存掉
     restoringWorkspaceRef.current = false;
     clearPaperAnnotations();
     setPaperId(crypto.randomUUID());
+    setPaperStatus("unread");
     setPaperSourceKind("remote");
     setPaperSourceUrl(normalized);
     setCurrentPage(1);
@@ -2404,12 +3089,15 @@ export default function Home() {
     setPaperTitle(arxivId ? `arXiv ${arxivId}` : normalizedDocumentTitle(urlName) || "正在读取论文…");
     setPaperMeta(`${new URL(normalized).hostname} · 真实 PDF`);
     setMessages([{ id: Date.now(), role: "assistant", content: "论文正在解析。文字提取完成后，我会在这里基于**全文上下文**回答问题。" }]);
+    setConversations([]);
+    setHistoryOpen(false);
     setOpenModal(false);
     setToast("论文已加入阅读区");
   };
 
   const openFile = async (file: File) => {
     if (!user) { setToast("请先登录再上传 PDF"); return; }
+    void performSave("background"); // 切换前先把当前论文存掉
     restoringWorkspaceRef.current = false;
     setExtractingText(true);
     setToast("正在保存并打开 PDF…");
@@ -2423,6 +3111,7 @@ export default function Home() {
       if (!response.ok) throw new Error(payload.error || "上传失败");
       clearPaperAnnotations();
       setPaperId(payload.paper.id);
+      setPaperStatus("unread");
       setPaperSourceKind("upload");
       setPaperSourceUrl(null);
       setPaperText("");
@@ -2432,6 +3121,8 @@ export default function Home() {
       setPaperTitle(payload.paper.title);
       setPaperMeta(payload.paper.meta);
       setMessages([{ id: Date.now(), role: "assistant", content: "上传的论文正在解析。完成后，我会在这里基于**全文上下文**回答问题。" }]);
+      setConversations([]);
+      setHistoryOpen(false);
       setOpenModal(false);
       setToast("PDF 已保存到你的账户");
     } catch (error: any) {
@@ -2487,9 +3178,37 @@ export default function Home() {
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 2200); return () => clearTimeout(timer); }, [toast]);
 
   const startNewChat = useCallback(() => {
+    // 当前对话里已有用户提问时先归档进历史，再开新对话
+    setConversations((old) => archiveConversation(old, messages));
+    setHistoryOpen(false);
     setMessages([{ id: Date.now(), role: "assistant", content: "新的对话已开始。我会基于整篇论文回答总结、方法、实验与结论问题。" }]);
-    setToast("已开始新对话，历史记录已清空");
+    setToast("已开始新对话，原对话已存入历史");
+  }, [messages]);
+
+  // 恢复一条历史对话：当前对话先归档，被选中的对话移出历史成为当前对话
+  const restoreConversation = useCallback((conversation: SavedConversation) => {
+    setConversations((old) => archiveConversation(old.filter((item) => item.id !== conversation.id), messages));
+    setMessages(conversation.messages);
+    setHistoryOpen(false);
+    setToast("已恢复这条历史对话");
+  }, [messages]);
+
+  const deleteConversation = useCallback((id: number) => {
+    setConversations((old) => old.filter((item) => item.id !== id));
   }, []);
+
+  // 当前气泡对应的文献条目与同年条目数；未解析到时为 null，由 JSX 展示「未找到」
+  let citationEntry: { text: string; page: number; index?: number } | null = null;
+  let citationSameYearCount = 0;
+  if (citationPopover) {
+    if (citationPopover.target.kind === "numeric") {
+      citationEntry = references.get(citationPopover.target.number) || null;
+    } else {
+      const matched = matchAuthorYearEntry(authorYearRefs, citationPopover.target.hit);
+      citationEntry = matched.entry;
+      citationSameYearCount = matched.sameYearCount;
+    }
+  }
 
   return (
     <main className={`app-shell font-${uiFontSize} ${rightOpen ? "right-open" : "right-closed"}${panelResizing ? " panel-resizing" : ""}`} style={{ "--panel-w": `${panelWidth}px` } as React.CSSProperties}>
@@ -2498,6 +3217,7 @@ export default function Home() {
         <nav className="rail-nav">
           <RailButton icon={<BookOpen size={20} />} label="阅读器" active />
           <RailButton icon={<Library size={20} />} label="我的文库" onClick={showLibrary} />
+          <RailButton icon={<ChartColumn size={20} />} label="阅读统计" onClick={showStats} />
           <RailButton icon={<Receipt size={20} />} label="用量账单" onClick={showUsage} />
         </nav>
         <div className="rail-bottom">
@@ -2519,7 +3239,7 @@ export default function Home() {
           </div>
           <RailButton icon={<Settings size={20} />} label="设置" onClick={() => setSettingsOpen(true)} />
           <button className="avatar" aria-label="个人资料" onClick={() => setAccountOpen(!accountOpen)}>{(user?.displayName || user?.email || "W").slice(0, 1).toUpperCase()}</button>
-          {accountOpen && user && <div className="account-popover"><strong>{user.displayName}</strong><span>{user.isLocal ? "本机私人资料库" : user.isGuest ? "当前浏览器的游客空间" : user.email}</span><div className={`account-sync ${saveStatus}`}><Cloud size={13} />{saveStatus === "saving" ? "正在保存" : saveStatus === "error" ? "保存遇到问题" : user.isLocal ? "已保存到本机" : "已同步到云端"}</div>{!user.isLocal && <a href="/api/auth/logout"><LogOut size={13} />退出登录</a>}</div>}
+          {accountOpen && user && <div className="account-popover"><strong>{user.displayName}</strong><span>{user.isLocal ? "本机私人资料库" : user.isGuest ? "当前浏览器的游客空间" : user.email}</span><div className={`account-sync ${saveStatus}`}><Cloud size={13} />{saveStatus === "saving" ? "正在保存" : saveStatus === "error" ? "保存遇到问题" : saveStatus === "dirty" ? "有未保存的更改" : user.isLocal ? "已保存到本机" : "已同步到云端"}</div>{!user.isLocal && <a href="/api/auth/logout"><LogOut size={13} />退出登录</a>}</div>}
         </div>
       </aside>
 
@@ -2530,7 +3250,7 @@ export default function Home() {
             <div><h1>{paperTitle}</h1></div>
           </div>
           <div className="top-actions">
-            <div className={`sync-status ${saveStatus}`} title="内容变化后会自动写入本地数据库；只有实际写入时才短暂显示保存中">{saveStatus === "error" ? <CloudOff size={14} /> : <Cloud size={14} />}<span>{saveStatus === "loading" ? "读取中" : saveStatus === "saving" ? "保存中" : saveStatus === "error" ? "保存失败" : "本机已保存"}</span></div>
+            <button type="button" className={`sync-status ${saveStatus}`} onClick={() => void performSave("manual")} disabled={saveStatus === "saving" || saveStatus === "loading"} title="点击立即保存；内容每小时自动保存一次，切到后台或切换论文时也会保存">{saveStatus === "error" ? <CloudOff size={14} /> : <Cloud size={14} />}<span>{saveStatus === "loading" ? "读取中" : saveStatus === "saving" ? "保存中" : saveStatus === "error" ? "保存失败 · 点击重试" : saveStatus === "dirty" ? "未保存 · 点击保存" : "本机已保存"}</span></button>
             <button className={`model-card ${config.apiKey || config.hasApiKey ? "configured" : ""}`} onClick={() => setSettingsOpen(true)} title={config.apiKey || config.hasApiKey ? `当前模型：${config.model}（点击修改）` : "还没有配置模型，点击去设置"}>
               <span className={`status-dot ${config.apiKey || config.hasApiKey ? "online" : ""}`} />
               <span className="model-card-text">
@@ -2553,6 +3273,7 @@ export default function Home() {
           <div className="toolbar-spacer" />
           <button className={`icon-button small ${panMode ? "active" : ""}`} aria-label={panMode ? "切换到选择模式" : "切换到抓手平移模式"} title={panMode ? "选择模式：划词翻译/高亮" : "抓手模式：左键拖动平移页面"} onClick={() => { setPanMode(!panMode); setToast(panMode ? "已切回选择模式，可以划词标注" : "抓手模式：按住左键拖动页面，中键也可随时拖动"); }}><Hand size={17} /></button>
           {source && <button className={`icon-button small ${formulaAssist === "show" ? "active" : ""}`} aria-label={formulaAssist === "show" ? "隐藏公式按钮" : "显示公式按钮"} title={formulaAssist === "show" ? "隐藏页面上的「问公式」按钮" : "显示页面上的「问公式」按钮"} onClick={() => setFormulaAssist(formulaAssist === "show" ? "hide" : "show")}><Sparkles size={17} /></button>}
+          {source && <button className={`icon-button small ${figureLasso ? "active" : ""}`} aria-label={figureLasso ? "退出框选图表" : "框选图表"} title={figureLasso ? "退出框选模式（ESC 或再次点击）" : "框选图表：在页面上拖出矩形，向 AI 询问图表内容"} onClick={() => { setFigureLasso(!figureLasso); setFigureRegion(null); setLassoRect(null); lassoStartRef.current = null; lassoRectRef.current = null; }}><Scan size={17} /></button>}
           <button className="icon-button small" aria-label="全屏" title="切换全屏" onClick={toggleFullscreen}><Maximize2 size={17} /></button>
         </div>
 
@@ -2571,13 +3292,14 @@ export default function Home() {
             </aside>
           )}
           {source && thumbsOpen === "show" && <div className="thumb-resize-handle" style={{ left: thumbWidth - 4 }} onPointerDown={startThumbResize} title="拖动调整缩略图栏宽度" aria-label="拖动调整缩略图栏宽度" role="separator" aria-orientation="vertical" />}
-          <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}${panMode ? " pan-mode" : ""}${readerPanning ? " panning" : ""}`} ref={readerRef} onPointerDown={startReaderPan} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleSelectionStart} onScroll={() => { if (selectionPos) setSelectionPos(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); const reader = readerRef.current; if (!reader || scrollFrameRef.current) return; scrollFrameRef.current = window.requestAnimationFrame(() => { scrollFrameRef.current = 0; const probe = reader.scrollTop + 42; let visiblePage = 1; for (const el of Array.from(reader.querySelectorAll<HTMLElement>("[data-page-number]"))) { if (el.offsetTop <= probe) visiblePage = Number(el.dataset.pageNumber || 1); else break; } setCurrentPage((prev) => (prev === visiblePage ? prev : visiblePage)); }); }}>
+          <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}${panMode ? " pan-mode" : ""}${readerPanning ? " panning" : ""}${figureLasso ? " figure-lasso-mode" : ""}`} ref={readerRef} onPointerDown={handleReaderPointerDown} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleSelectionStart} onClick={handleCitationClick} onScroll={() => { if (selectionPos) setSelectionPos(null); if (citationPopover) setCitationPopover(null); if (figureRegion) setFigureRegion(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); const reader = readerRef.current; if (!reader || scrollFrameRef.current) return; scrollFrameRef.current = window.requestAnimationFrame(() => { scrollFrameRef.current = 0; const probe = reader.scrollTop + 42; let visiblePage = 1; for (const el of Array.from(reader.querySelectorAll<HTMLElement>("[data-page-number]"))) { if (el.offsetTop <= probe) visiblePage = Number(el.dataset.pageNumber || 1); else break; } setCurrentPage((prev) => (prev === visiblePage ? prev : visiblePage)); }); }}>
           {source ? (
-            <PdfDocument source={source} zoom={zoom} showFormula={formulaAssist === "show"} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextLayerReady={handleTextLayerReady} onTextExtracted={handleTextExtracted} onError={handlePdfError} onThumbnail={handleThumbnail} />
+            <PdfDocument source={source} zoom={zoom} showFormula={formulaAssist === "show"} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextLayerReady={handleTextLayerReady} onTextExtracted={handleTextExtracted} onError={handlePdfError} onThumbnail={handleThumbnail} onPdfReady={handlePdfInstance} />
           ) : <div style={{ transform: `scale(${zoom})`, transformOrigin: "top center", width: "fit-content", minWidth: "calc(100% + 480px)", margin: "0 auto" }}><DemoPaper /></div>}
           {selectionRects.map((rect, index) => <div key={`selection-${index}`} className="selection-overlay-rect" style={rect} aria-hidden="true" />)}
-          {annotations.filter((annotation) => annotation.kind === "formula" && flashedFormulaIds.has(annotation.id) && annotation.formulaRegionLeft !== undefined && annotation.formulaRegionTop !== undefined && annotation.formulaRegionPixelWidth !== undefined && annotation.formulaRegionPixelHeight !== undefined).map((annotation) => (
-            <div key={`formula-region-${annotation.id}`} className="formula-annotation-region" style={{ left: annotation.formulaRegionLeft, top: annotation.formulaRegionTop, width: annotation.formulaRegionPixelWidth, height: annotation.formulaRegionPixelHeight }} aria-hidden="true" />
+          {citationFlash.map((rect, index) => <div key={`citation-flash-${index}`} className="citation-flash-rect" style={rect} aria-hidden="true" />)}
+          {annotations.filter((annotation) => (annotation.kind === "formula" || annotation.kind === "figure") && flashedFormulaIds.has(annotation.id) && annotation.formulaRegionLeft !== undefined && annotation.formulaRegionTop !== undefined && annotation.formulaRegionPixelWidth !== undefined && annotation.formulaRegionPixelHeight !== undefined).map((annotation) => (
+            <div key={`formula-region-${annotation.id}`} className={`formula-annotation-region${annotation.kind === "figure" ? " figure" : ""}`} style={{ left: annotation.formulaRegionLeft, top: annotation.formulaRegionTop, width: annotation.formulaRegionPixelWidth, height: annotation.formulaRegionPixelHeight }} aria-hidden="true" />
           ))}
           {annotations.map((annotation) => annotation.kind === "text-note" ? (
             <section key={annotation.id} className={`pdf-text-note ${draggingId === annotation.id ? "dragging" : ""}`} style={{ top: annotation.cardTop, left: annotation.cardLeft, color: annotation.textColor || "#9a5a16" }} onMouseDown={(event) => event.stopPropagation()}>
@@ -2598,24 +3320,36 @@ export default function Home() {
                 aria-label="打开原文旁批注"
                 title="拖动图标；点击定位原文"
               >
-                {annotation.kind === "translate" ? <Languages size={14} /> : annotation.kind === "formula" || annotation.kind === "explain" ? <Sparkles size={14} /> : annotation.kind === "ask" ? <MessageSquareText size={14} /> : <Highlighter size={14} />}
+                {annotation.kind === "translate" ? <Languages size={14} /> : annotation.kind === "figure" ? <Scan size={14} /> : annotation.kind === "formula" || annotation.kind === "explain" ? <Sparkles size={14} /> : annotation.kind === "ask" ? <MessageSquareText size={14} /> : <Highlighter size={14} />}
               </button>
               {annotation.open && (
                 <section className={`inline-card ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`} style={{ top: annotation.cardTop, left: annotation.cardLeft, width: annotation.cardWidth, ...(annotation.cardHeight ? { height: annotation.cardHeight, maxHeight: "none" as const } : {}) }} onMouseDown={(event) => event.stopPropagation()}>
                   <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")} title="拖动移动悬浮卡片">
                     <div className="inline-card-title">
                       <MoreHorizontal className="drag-grip" size={15} />
-                      <span>{annotation.kind === "translate" ? <Languages size={15} /> : annotation.kind === "formula" || annotation.kind === "explain" ? <Sparkles size={15} /> : annotation.kind === "ask" ? <MessageSquareText size={15} /> : <Highlighter size={15} />}</span>
-                      <div><strong>{annotation.kind === "translate" ? "局部翻译" : annotation.kind === "formula" ? "公式解释" : annotation.kind === "explain" ? "段落解释" : annotation.kind === "ask" ? "针对这段提问" : "高亮标记"}</strong><small>{annotation.kind === "translate" && !shouldPersistAnnotation(annotation) ? "临时翻译 · 本次阅读显示" : "仅使用相关原文 · 自动保存"}</small></div>
+                      <span>{annotation.kind === "translate" ? <Languages size={15} /> : annotation.kind === "figure" ? <Scan size={15} /> : annotation.kind === "formula" || annotation.kind === "explain" ? <Sparkles size={15} /> : annotation.kind === "ask" ? <MessageSquareText size={15} /> : <Highlighter size={15} />}</span>
+                      <div><strong>{annotation.kind === "translate" ? "局部翻译" : annotation.kind === "formula" ? "公式解释" : annotation.kind === "figure" ? "图表解读" : annotation.kind === "explain" ? "段落解释" : annotation.kind === "ask" ? "针对这段提问" : "高亮标记"}</strong><small>{annotation.kind === "translate" && !shouldPersistAnnotation(annotation) ? "临时翻译 · 本次阅读显示" : annotation.kind === "figure" ? "框选区域 · 自动保存" : "仅使用相关原文 · 自动保存"}</small></div>
                     </div>
                     <div className="inline-card-actions">
                       <button className="delete-note-head" onClick={() => removeAnnotation(annotation.id)} aria-label="删除标记" title="删除标记"><Trash2 size={14} /></button>
                       <button onClick={() => closeAnnotation(annotation)} aria-label="收起批注" title="收起批注"><X size={15} /></button>
                     </div>
                   </header>
-                  <blockquote>{annotation.text}</blockquote>
+                  {annotation.kind === "figure" ? (
+                    annotation.figureImage
+                      // eslint-disable-next-line @next/next/no-img-element
+                      ? <img className="inline-card-figure" src={annotation.figureImage} alt={annotation.text} draggable={false} />
+                      : <div className="inline-card-figure placeholder">图表截图未保存</div>
+                  ) : <blockquote>{annotation.text}</blockquote>}
+                  {annotation.kind === "figure" && !visionConfig.model && visionHintDismissed !== "1" && (
+                    <div className="vision-hint">
+                      <span>未配置图表理解模型，本次将使用主模型；若回答失败请在设置中配置多模态模型。</span>
+                      <button onClick={() => setSettingsOpen(true)}>去配置</button>
+                      <button className="vision-hint-close" onClick={dismissVisionHint} aria-label="不再提醒"><X size={12} /></button>
+                    </div>
+                  )}
                   {annotation.kind === "highlight" && <><p className="highlight-saved"><Check size={14} />已保存为{annotation.color === "yellow" ? "黄色" : annotation.color === "green" ? "绿色" : annotation.color === "blue" ? "蓝色" : "玫红色"}高亮</p><label className="highlight-note"><span>个人批注</span><textarea value={annotation.note || ""} onChange={(event) => updateAnnotation(annotation.id, { note: event.target.value })} placeholder="记录你对这段内容的想法…" rows={3} /></label></>}
-                  {annotation.thread.length > 0 && <div className="inline-thread">{annotation.thread.map((message) => <div key={message.id} className={`inline-message ${message.role}`}>{message.role === "assistant" ? <MarkdownContent content={message.content} compact /> : <p>{message.content}</p>}</div>)}</div>}
+                  {annotation.thread.length > 0 && <div className="inline-thread">{annotation.thread.map((message) => <div key={message.id} className={`inline-message ${message.role}`}>{message.role === "assistant" ? <MarkdownContent content={message.content} compact onPageJump={handlePageJump} /> : <p>{message.content}</p>}</div>)}</div>}
                   {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />{annotation.loadingLabel || "正在结合相邻段落分析…"}</div>}
                   {annotation.kind !== "highlight" && !annotation.loading && (
                     <div className="inline-ask follow-up">
@@ -2639,29 +3373,44 @@ export default function Home() {
         <header className="ai-header">
           <div className="ai-title"><div className="ai-glyph"><Sparkles size={17} /></div><div className="ai-title-text"><h2>全文 AI</h2><span>{extractingText ? "正在解析论文…" : paperText ? "已读入全文，随时提问" : "演示论文 · 可直接体验"}</span></div></div>
           <div className="ai-header-actions">
-            <button className="icon-button small" onClick={startNewChat} aria-label="开始新对话" title="清空当前对话，开始新对话"><SquarePen size={15} /></button>
+            <button className={`icon-button small ${historyOpen ? "active" : ""}`} onClick={() => setHistoryOpen(!historyOpen)} aria-label="历史对话" title="查看历史对话"><History size={15} /></button>
+            <button className="icon-button small" onClick={startNewChat} aria-label="开始新对话" title="当前对话存入历史，开始新对话"><SquarePen size={15} /></button>
             <button className="icon-button small" onClick={() => setRightOpen(false)} aria-label="收起 AI 面板" title="收起 AI 面板"><PanelRightClose size={16} /></button>
           </div>
         </header>
-        <div className="quick-actions">
+        {!historyOpen && <div className="quick-actions">
           <button onClick={() => sendQuestion("请用三点总结这篇论文的核心贡献。")}>总结全文</button>
           <button onClick={() => sendQuestion("请解释这篇论文最重要的方法，并给出直觉理解。")}>解释方法</button>
           <button onClick={() => sendQuestion("请列出阅读这篇论文前需要了解的概念。")}>前置知识</button>
-        </div>
+        </div>}
+        {historyOpen ? (
+          <div className="chat-stream chat-history">
+            <button className="history-back" onClick={() => setHistoryOpen(false)}><ChevronLeft size={14} />返回当前对话</button>
+            {conversations.length === 0 && <div className="history-empty">还没有历史对话</div>}
+            {[...conversations].reverse().map((conversation) => (
+              <div key={conversation.id} className="history-row" role="button" tabIndex={0} title="恢复这条对话" onClick={() => restoreConversation(conversation)} onKeyDown={(event) => { if (event.key === "Enter") restoreConversation(conversation); }}>
+                <span className="history-row-title">{conversation.title}</span>
+                <span className="history-row-meta">{conversation.messages.length} 条 · {formatConversationTime(conversation.createdAt)}</span>
+                <button className="history-row-delete" aria-label="删除这条历史对话" title="删除这条历史对话" onClick={(event) => { event.stopPropagation(); deleteConversation(conversation.id); }}><Trash2 size={13} /></button>
+              </div>
+            ))}
+          </div>
+        ) : (
         <div className="chat-stream">
           {messages.map((message, messageIndex) => (
             <div key={message.id} className={`message ${message.role}${streaming && message.role === "assistant" && messageIndex === messages.length - 1 ? " streaming" : ""}`}>
               {message.role === "assistant" && <div className="message-avatar"><Sparkles size={14} /></div>}
               <div className="message-body">
                 {message.role === "assistant" && message.steps && message.steps.length > 0 && <div className="message-steps"><Zap size={11} /><span>{message.steps.join(" → ")}</span></div>}
-                {message.role === "assistant" ? <MarkdownContent content={message.content} /> : <p>{message.content}</p>}
+                {message.role === "assistant" ? <MarkdownContent content={message.content} onPageJump={handlePageJump} /> : <p>{message.content}</p>}
                 {message.role === "assistant" && <div className="message-tools"><button aria-label="复制回答" onClick={() => navigator.clipboard.writeText(message.content)}><Copy size={13} /></button><button aria-label="有帮助"><Check size={13} /></button></div>}
               </div>
             </div>
           ))}
           {loading && !streaming && <div className="message assistant"><div className="message-avatar"><Sparkles size={14} /></div><div className="thinking-wrap"><div className="thinking"><span /><span /><span /></div>{statusText && <div className="thinking-status"><Zap size={11} />{statusText}</div>}</div></div>}
         </div>
-        <div className="composer-wrap">
+        )}
+        {!historyOpen && <div className="composer-wrap">
           <div className="composer-top-row">
             <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? "解析中" : paperText ? "上下文已就绪" : "等待文字"}</small></div>
           </div>
@@ -2670,9 +3419,17 @@ export default function Home() {
             <div className="composer-bottom"><span>⌘ ↵</span><button onClick={() => sendQuestion(question)} disabled={!question.trim() || loading || extractingText} aria-label="发送"><Send size={16} /></button></div>
           </div>
           <p className="ai-disclaimer">AI 可能会出错，请核对重要结论</p>
-        </div>
+        </div>}
       </aside>
 
+      {lassoRect && <div className="figure-lasso-rect" style={lassoRect} aria-hidden="true" />}
+      {figureRegion && (
+        <div className="figure-lasso-actions" style={{ left: figureRegion.barX, top: figureRegion.barY }}>
+          <button onClick={askAboutFigureRegion}><Scan size={14} />问图表</button>
+          <span />
+          <button onClick={() => setFigureRegion(null)}>取消</button>
+        </div>
+      )}
       {selectionPos && (
         <div className="selection-menu" style={{ left: selectionPos.x, top: selectionPos.y }}>
           {(() => {
@@ -2695,13 +3452,34 @@ export default function Home() {
           {showColors && <div className="color-picker" aria-label="选择高亮颜色">{(["yellow", "green", "blue", "rose"] as HighlightColor[]).map((color) => <button key={color} className={color} aria-label={`${color} 高亮`} onClick={() => createAnnotation("highlight", color)} />)}</div>}
         </div>
       )}
+      {citationPopover && (
+        <>
+          <div className="popover-backdrop" onMouseDown={() => setCitationPopover(null)} />
+          <div className="citation-popover" style={{ left: citationPopover.x, top: citationPopover.y }} onMouseDown={(event) => event.stopPropagation()}>
+            <header>
+              <span className="citation-badge">{citationPopover.target.kind === "numeric" ? `[${citationPopover.target.number}]` : citationPopover.target.hit.badge}</span>
+              <span className="citation-title">参考文献</span>
+              <button onClick={() => setCitationPopover(null)} aria-label="关闭" title="关闭"><X size={14} /></button>
+            </header>
+            <div className={`citation-body${citationEntry ? "" : " empty"}`}>{citationEntry ? citationEntry.text : "未在文末找到该参考文献"}</div>
+            {citationEntry && citationPopover.target.kind === "author-year" && !citationPopover.target.hit.suffix && citationSameYearCount > 1 && (
+              <div className="citation-note">该作者同年有 {citationSameYearCount} 条引用，已定位到第一条</div>
+            )}
+            <footer>
+              <button disabled={!citationEntry} onClick={() => citationEntry && jumpToReference(citationEntry)}><BookOpen size={13} />跳转到原文</button>
+              <button disabled={!citationEntry} onClick={async () => { if (!citationEntry) return; await navigator.clipboard.writeText(citationEntry.text); setCitationCopied(true); window.setTimeout(() => setCitationCopied(false), 1000); }}>{citationCopied ? <Check size={13} /> : <Copy size={13} />}复制</button>
+            </footer>
+          </div>
+        </>
+      )}
       {pdfContextMenu && <div className="pdf-context-menu" style={{ left: pdfContextMenu.x, top: pdfContextMenu.y }} onMouseDown={(event) => event.stopPropagation()}>
         <button onClick={createPdfTextNote}><MessageSquareText size={15} /><span><strong>添加文字批注</strong><small>写在当前 PDF 位置</small></span></button>
       </div>}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
       {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} />}
-      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} />}
+      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} visionConfig={visionConfig} setVisionConfig={setVisionConfig} />}
       {usageOpen && <UsageModal onClose={() => setUsageOpen(false)} stats={usageStats} loading={usageLoading} />}
+      {statsOpen && <StatsModal onClose={() => setStatsOpen(false)} stats={readingStats} loading={statsLoading} onOpenPaper={(id) => { setStatsOpen(false); void openLibraryPaper(id); }} />}
       {toast && <div className="toast"><Check size={15} />{toast}</div>}
       {!authReady && <div className="auth-gate"><div className="auth-card"><BrandMark /><LoaderCircle className="spin" size={22} /><h2>正在确认登录状态</h2><p>正在安全地读取你的论文空间…</p></div></div>}
       {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>开始使用文枢</h2><p>暂时不配置登录也没关系，可以先用游客身份继续阅读和测试。</p><button className="primary-button wide auth-guest" onClick={startGuestSession} disabled={guestSubmitting}>{guestSubmitting ? <><LoaderCircle className="spin" size={15} />正在创建游客空间</> : "游客试用"}</button><div className="auth-divider"><span>以后再登录</span></div><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a>{authMessage && <div className="auth-message">{authMessage}</div>}<small>游客数据只绑定当前浏览器；清除 Cookie 后无法恢复，也不能跨设备同步。</small></div></div>}

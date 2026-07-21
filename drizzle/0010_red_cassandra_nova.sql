@@ -1,0 +1,1 @@
+ALTER TABLE `paper_states` ADD `conversations_json` text DEFAULT '[]' NOT NULL;

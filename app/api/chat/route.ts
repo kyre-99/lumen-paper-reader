@@ -36,6 +36,13 @@ const INLINE_CONTRACT = `
 
 回答要求：先结论后展开；翻译要忠实流畅；公式用 LaTeX 表示（行内 $...$，独立公式 $$...$$）；资料不足就直说，不要编造。`;
 
+const FIGURE_CONTRACT = `
+
+图表解读要求：结合截图说明这张图表/表格展示了什么——构成、坐标轴与单位、主要趋势、关键数值，以及它支持的结论；明确区分图中直接可见的信息与推断，推断以“（推断）”开头；公式用 LaTeX 表示；若引用了页面文字内容，在句末标注【P页码】，不确定页码就不要标注。`;
+
+// 框选图表的截图上限（解码后字节数）
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
 const AGENT_SYSTEM = `你是论文研究 Agent，可以使用工具在论文中主动查找资料。每一步只输出一个 JSON，不要输出任何其他内容：
 - 检索相关片段：{"action":"search","queries":["英文术语","中文词"]}（queries 给 2-4 个，英文优先）
 - 阅读指定页的完整片段：{"action":"read","pages":[3,7]}（pages 最多 6 页）
@@ -282,12 +289,21 @@ export async function POST(request: NextRequest) {
     if (!user) return NextResponse.json({ error: "需要登录" }, { status: 401 });
     const body = await request.json();
     const { endpoint, apiKey, model, paperTitle, question, paperContext = "", selectedText = "", surroundingContext = "", mode = "global", history = [], systemPrompts = {}, effort = "medium" } = body;
+    // 框选图表问答：仅 inline 模式接受截图，校验 data URL 格式与解码后大小
+    const imageDataUrl = mode === "inline" && typeof body.imageDataUrl === "string" ? body.imageDataUrl : "";
+    if (imageDataUrl) {
+      const commaAt = imageDataUrl.indexOf(",");
+      if (!imageDataUrl.startsWith("data:image/") || commaAt < 0) return NextResponse.json({ error: "图片格式不支持" }, { status: 400 });
+      if ((imageDataUrl.length - commaAt - 1) * 0.75 > MAX_IMAGE_BYTES) return NextResponse.json({ error: "截图过大，请框选更小的区域" }, { status: 400 });
+    }
     const db = getDb();
     const [savedSettings] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
     const runtime = env as unknown as Record<string, string | undefined>;
-    const resolvedEndpoint = String(endpoint || savedSettings?.modelEndpoint || runtime.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "").trim();
-    const resolvedModel = String(model || savedSettings?.modelName || runtime.OPENAI_MODEL || process.env.OPENAI_MODEL || "").trim();
-    const resolvedApiKey = String(apiKey || (savedSettings?.apiKeyEncrypted ? await decryptApiKey(savedSettings.apiKeyEncrypted) : "") || runtime.OPENAI_API_KEY || process.env.OPENAI_API_KEY || "").trim();
+    // 带图请求优先使用图表理解模型配置，缺省的字段逐项回退：请求体 → 主模型配置 → 环境变量
+    const visionKey = imageDataUrl && savedSettings?.visionApiKeyEncrypted ? await decryptApiKey(savedSettings.visionApiKeyEncrypted) : "";
+    const resolvedEndpoint = String((imageDataUrl && savedSettings?.visionModelEndpoint) || endpoint || savedSettings?.modelEndpoint || runtime.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "").trim();
+    const resolvedModel = String((imageDataUrl && savedSettings?.visionModelName) || model || savedSettings?.modelName || runtime.OPENAI_MODEL || process.env.OPENAI_MODEL || "").trim();
+    const resolvedApiKey = String(visionKey || apiKey || (savedSettings?.apiKeyEncrypted ? await decryptApiKey(savedSettings.apiKeyEncrypted) : "") || runtime.OPENAI_API_KEY || process.env.OPENAI_API_KEY || "").trim();
     if (!resolvedEndpoint || !resolvedApiKey || !resolvedModel || !question) return NextResponse.json({ error: "模型配置不完整，请先在 AI 设置中保存" }, { status: 400 });
     const target = chatCompletionsUrl(resolvedEndpoint);
     const isInline = mode === "inline";
@@ -303,7 +319,22 @@ export async function POST(request: NextRequest) {
       async start(controller) {
         const send = (payload: Record<string, unknown>) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
         try {
-          if (isInline) {
+          if (isInline && imageDataUrl) {
+            // 框选图表问答：单次直接流式调用，跳过检索规划与 Agent
+            const questionText = String(question);
+            const messages = [
+              { role: "system", content: renderSystemPrompt(inlinePrompt, title) + INLINE_CONTRACT + FIGURE_CONTRACT },
+              ...historyMessages,
+              {
+                role: "user",
+                content: [
+                  { type: "text", text: `我正在阅读论文《${title}》，框选了其中一张图表/表格（${String(selectedText).slice(0, 200) || "页面截图区域"}）。\n\n该区域所在页面的文字内容：\n<nearby_text>\n${String(surroundingContext).slice(0, 10000)}\n</nearby_text>\n\n我的问题是：\n${questionText}` },
+                  { type: "image_url", image_url: { url: imageDataUrl } },
+                ],
+              },
+            ];
+            for await (const delta of streamCompletion(target, resolvedApiKey, { model: resolvedModel, messages, temperature: 0.3 }, meter)) send({ type: "delta", text: delta });
+          } else if (isInline) {
             // 划词问答：medium 只用选区和相邻原文（零额外调用）；high/max 会从全论文检索补充上下文
             const questionText = String(question);
             const chunks = chunkPaper(String(paperContext));

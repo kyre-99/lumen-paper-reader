@@ -70,29 +70,31 @@ export async function PUT(request: Request) {
   const payload = await request.json() as any;
   const paper = payload.paper && typeof payload.paper === "object" ? payload.paper : null;
   const db = getDb();
-  let activePaperId: string | null = null;
+  const [existingReaderState] = await db.select({ activePaperId: readerStates.activePaperId }).from(readerStates).where(eq(readerStates.userId, user.id)).limit(1);
+  let activePaperId: string | null = existingReaderState?.activePaperId || null;
 
+  // paperText 未提供时保留已有文本，避免每次保存都全量重写
   if (paper) {
     const id = String(paper.id || "").slice(0, 80);
     if (!id) return Response.json({ error: "论文记录缺少 ID" }, { status: 400 });
     const [existing] = await db.select({ userId: papers.userId }).from(papers).where(eq(papers.id, id)).limit(1);
     if (existing && existing.userId !== user.id) return Response.json({ error: "无权修改该论文" }, { status: 403 });
 
-    const values = {
+    const baseValues = {
       id,
       userId: user.id,
       title: String(paper.title || "未命名论文").slice(0, 300),
       meta: String(paper.meta || "").slice(0, 500),
       sourceKind: paper.sourceKind === "upload" ? "upload" as const : "remote" as const,
       sourceUrl: paper.sourceKind === "remote" ? String(paper.sourceUrl || "").slice(0, 2000) : null,
-      paperText: String(paper.paperText || "").slice(0, 180000),
       pageCount: Math.max(1, Math.min(1000, Number(paper.pageCount) || 1)),
       updatedAt: new Date().toISOString(),
     };
+    const hasText = typeof paper.paperText === "string";
     if (existing) {
-      await db.update(papers).set(values).where(and(eq(papers.id, id), eq(papers.userId, user.id)));
+      await db.update(papers).set(hasText ? { ...baseValues, paperText: String(paper.paperText).slice(0, 180000) } : baseValues).where(and(eq(papers.id, id), eq(papers.userId, user.id)));
     } else {
-      await db.insert(papers).values(values);
+      await db.insert(papers).values({ ...baseValues, paperText: hasText ? String(paper.paperText).slice(0, 180000) : "" });
     }
     activePaperId = id;
   }

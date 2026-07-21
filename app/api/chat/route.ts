@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { env } from "cloudflare:workers";
 import { eq } from "drizzle-orm";
 import { getDb } from "../../../db";
-import { userSettings } from "../../../db/schema";
+import { llmUsage, userSettings } from "../../../db/schema";
 import { DEFAULT_PROMPTS, renderSystemPrompt } from "../../chat-prompts";
 import { decryptApiKey } from "../../model-config-crypto";
 import { requireAppUser } from "../../server-user";
@@ -13,6 +13,15 @@ const AGENT_MAX_ROUNDS = 3;
 
 type Effort = "medium" | "high" | "max";
 type Chunk = { id: number; page: number; heading: string; text: string };
+// 单次 /api/chat 请求内多次模型调用的 token 累计器
+type TokenMeter = { prompt: number; completion: number };
+
+function addUsage(meter: TokenMeter | undefined, usage: unknown) {
+  if (!meter || !usage || typeof usage !== "object") return;
+  const tokens = usage as { prompt_tokens?: unknown; completion_tokens?: unknown };
+  meter.prompt += Number(tokens.prompt_tokens) || 0;
+  meter.completion += Number(tokens.completion_tokens) || 0;
+}
 
 const ANSWER_CONTRACT = `
 
@@ -134,25 +143,29 @@ function chatCompletionsUrl(input: string) {
   return target;
 }
 
-async function complete(target: URL, apiKey: string, payload: Record<string, unknown>): Promise<string> {
+async function complete(target: URL, apiKey: string, payload: Record<string, unknown>, meter?: TokenMeter): Promise<string> {
   const response = await fetch(target.toString(), {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({ ...payload, stream: false }),
   });
-  const data = await response.json().catch(() => ({})) as { error?: { message?: string }; choices?: Array<{ message?: { content?: unknown } }> };
+  const data = await response.json().catch(() => ({})) as { error?: { message?: string }; choices?: Array<{ message?: { content?: unknown } }>; usage?: unknown };
   if (!response.ok) throw new Error(data?.error?.message || `模型接口返回 ${response.status}`);
+  addUsage(meter, data.usage);
   const content = data?.choices?.[0]?.message?.content;
   if (typeof content !== "string" || !content.trim()) throw new Error("模型没有返回可读取的内容");
   return content;
 }
 
-async function* streamCompletion(target: URL, apiKey: string, payload: Record<string, unknown>): AsyncGenerator<string> {
-  const response = await fetch(target.toString(), {
+async function* streamCompletion(target: URL, apiKey: string, payload: Record<string, unknown>, meter?: TokenMeter): AsyncGenerator<string> {
+  const post = (body: Record<string, unknown>) => fetch(target.toString(), {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ ...payload, stream: true }),
+    body: JSON.stringify(body),
   });
+  // include_usage 让流式响应在末尾携带 token 统计；部分兼容端点不支持该参数时退回普通流式请求
+  let response = await post({ ...payload, stream: true, stream_options: { include_usage: true } });
+  if (!response.ok || !response.body) response = await post({ ...payload, stream: true });
   if (!response.ok || !response.body) {
     const data = await response.json().catch(() => ({})) as { error?: { message?: string } };
     throw new Error(data?.error?.message || `模型接口返回 ${response.status}`);
@@ -172,14 +185,16 @@ async function* streamCompletion(target: URL, apiKey: string, payload: Record<st
       const data = trimmed.slice(5).trim();
       if (data === "[DONE]") return;
       try {
-        const delta = JSON.parse(data)?.choices?.[0]?.delta?.content;
+        const chunk = JSON.parse(data);
+        addUsage(meter, chunk?.usage);
+        const delta = chunk?.choices?.[0]?.delta?.content;
         if (typeof delta === "string" && delta) yield delta;
       } catch { /* 忽略不完整的分片 */ }
     }
   }
 }
 
-async function planRetrieval(target: URL, apiKey: string, model: string, question: string) {
+async function planRetrieval(target: URL, apiKey: string, model: string, question: string, meter?: TokenMeter) {
   const content = await complete(target, apiKey, {
     model,
     temperature: 0,
@@ -188,7 +203,7 @@ async function planRetrieval(target: URL, apiKey: string, model: string, questio
       { role: "system", content: `你是检索规划器。用户正在阅读一篇英文论文并提问。输出 JSON：{"queries":["..."],"broad":false}。queries 给 3-5 个检索词，中英文都要有，英文用论文中最可能出现的专业术语；broad 仅当问题要求总结/概括/评价整篇论文时为 true。只输出 JSON。` },
       { role: "user", content: question },
     ],
-  });
+  }, meter);
   const parsed = parseJsonObject(content);
   return {
     queries: Array.isArray(parsed.queries) ? parsed.queries.map(String).filter(Boolean).slice(0, 6) : [],
@@ -196,7 +211,7 @@ async function planRetrieval(target: URL, apiKey: string, model: string, questio
   };
 }
 
-async function planSecondRound(target: URL, apiKey: string, model: string, question: string, previews: string) {
+async function planSecondRound(target: URL, apiKey: string, model: string, question: string, previews: string, meter?: TokenMeter) {
   const content = await complete(target, apiKey, {
     model,
     temperature: 0,
@@ -205,7 +220,7 @@ async function planSecondRound(target: URL, apiKey: string, model: string, quest
       { role: "system", content: `你是检索审查员。根据已有资料预览判断是否足以充分回答问题。输出 JSON {"needMore":false,"queries":[]}；若关键信息缺失，needMore 为 true 并给 2-3 个补充检索词（英文专业术语优先）。只输出 JSON。` },
       { role: "user", content: `问题：${question}\n\n已有资料预览：\n${previews}` },
     ],
-  });
+  }, meter);
   const parsed = parseJsonObject(content);
   return {
     needMore: Boolean(parsed.needMore),
@@ -221,6 +236,7 @@ async function runAgentLoop(
   chunks: Chunk[],
   gathered: Map<number, Chunk>,
   send: (payload: Record<string, unknown>) => void,
+  meter?: TokenMeter,
 ) {
   const messages: Array<Record<string, unknown>> = [
     { role: "system", content: AGENT_SYSTEM },
@@ -229,7 +245,7 @@ async function runAgentLoop(
   for (let round = 0; round < AGENT_MAX_ROUNDS; round++) {
     let reply = "";
     try {
-      reply = await complete(target, apiKey, { model, messages, temperature: 0, max_tokens: 300 });
+      reply = await complete(target, apiKey, { model, messages, temperature: 0, max_tokens: 300 }, meter);
     } catch {
       return;
     }
@@ -280,6 +296,7 @@ export async function POST(request: NextRequest) {
     const globalPrompt = String(systemPrompts?.global || savedSettings?.globalSystemPrompt || DEFAULT_PROMPTS.global).trim().slice(0, 12000) || DEFAULT_PROMPTS.global;
     const inlinePrompt = String(systemPrompts?.inline || savedSettings?.inlineSystemPrompt || DEFAULT_PROMPTS.inline).trim().slice(0, 12000) || DEFAULT_PROMPTS.inline;
     const historyMessages = cleanHistory(history, 10);
+    const meter: TokenMeter = { prompt: 0, completion: 0 };
 
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
@@ -294,7 +311,7 @@ export async function POST(request: NextRequest) {
             if (chunks.length && level !== "medium") {
               let queries = [questionText, String(selectedText).slice(0, 120)];
               try {
-                const plan = await planRetrieval(target, resolvedApiKey, resolvedModel, questionText);
+                const plan = await planRetrieval(target, resolvedApiKey, resolvedModel, questionText, meter);
                 if (plan.queries.length) queries = plan.queries;
               } catch { /* 检索规划失败时退回原问题 */ }
               send({ type: "step", label: `在全文中检索：${queries.slice(0, 2).join(" / ")}` });
@@ -302,7 +319,7 @@ export async function POST(request: NextRequest) {
               first.forEach((chunk) => gathered.set(chunk.id, chunk));
               if (first.length) send({ type: "step", label: `找到 ${first.length} 个相关片段（${pagesLabel(first)}）` });
               if (level === "max") {
-                await runAgentLoop(target, resolvedApiKey, resolvedModel, questionText, chunks, gathered, send);
+                await runAgentLoop(target, resolvedApiKey, resolvedModel, questionText, chunks, gathered, send, meter);
               }
             }
             const reference = [...gathered.values()]
@@ -316,7 +333,7 @@ export async function POST(request: NextRequest) {
               ...historyMessages,
               { role: "user", content: `我正在看下面这段论文。\n\n<selected_text>\n${String(selectedText).slice(0, 6000)}\n</selected_text>\n\n<nearby_text>\n${String(surroundingContext).slice(0, 10000)}\n</nearby_text>${referenceBlock}\n\n我的问题是：\n${questionText}` },
             ];
-            for await (const delta of streamCompletion(target, resolvedApiKey, { model: resolvedModel, messages, temperature: 0.3 })) send({ type: "delta", text: delta });
+            for await (const delta of streamCompletion(target, resolvedApiKey, { model: resolvedModel, messages, temperature: 0.3 }, meter)) send({ type: "delta", text: delta });
           } else {
             const questionText = String(question);
             const chunks = chunkPaper(String(paperContext));
@@ -328,7 +345,7 @@ export async function POST(request: NextRequest) {
               // medium（快速档）：零额外模型调用，直接用原问题做本地检索，保证最快最便宜
               if (level !== "medium") {
                 try {
-                  const plan = await planRetrieval(target, resolvedApiKey, resolvedModel, questionText);
+                  const plan = await planRetrieval(target, resolvedApiKey, resolvedModel, questionText, meter);
                   if (plan.queries.length) queries = plan.queries;
                   broad = broad || plan.broad;
                 } catch { /* 检索规划失败时退回原问题 */ }
@@ -346,7 +363,7 @@ export async function POST(request: NextRequest) {
               if (level === "high" && !broad && first.length) {
                 try {
                   const previews = first.map((chunk) => `P${chunk.page} ${chunk.heading || ""}：${chunk.text.slice(0, 160)}`).join("\n");
-                  const gap = await planSecondRound(target, resolvedApiKey, resolvedModel, questionText, previews);
+                  const gap = await planSecondRound(target, resolvedApiKey, resolvedModel, questionText, previews, meter);
                   if (gap.needMore && gap.queries.length) {
                     const more = retrieveChunks(chunks, gap.queries, false, 6, gathered);
                     more.forEach((chunk) => gathered.set(chunk.id, chunk));
@@ -356,7 +373,7 @@ export async function POST(request: NextRequest) {
                 } catch { /* 第二轮失败不阻塞回答 */ }
               }
               if (level === "max") {
-                await runAgentLoop(target, resolvedApiKey, resolvedModel, questionText, chunks, gathered, send);
+                await runAgentLoop(target, resolvedApiKey, resolvedModel, questionText, chunks, gathered, send, meter);
               }
             }
 
@@ -371,9 +388,14 @@ export async function POST(request: NextRequest) {
               { role: "user", content: `下面是从论文中检索到的参考片段，页码以【P数字】标注：\n\n<paper_reference>\n${reference || "（未检索到可参考的论文内容）"}\n</paper_reference>\n\n我的问题是：\n${questionText}` },
             ];
             send({ type: "step", label: "整理回答…" });
-            for await (const delta of streamCompletion(target, resolvedApiKey, { model: resolvedModel, messages, temperature: 0.3 })) send({ type: "delta", text: delta });
+            for await (const delta of streamCompletion(target, resolvedApiKey, { model: resolvedModel, messages, temperature: 0.3 }, meter)) send({ type: "delta", text: delta });
           }
-          send({ type: "done" });
+          if (meter.prompt || meter.completion) {
+            try {
+              await db.insert(llmUsage).values({ id: crypto.randomUUID(), userId: user.id, model: resolvedModel, mode: isInline ? "inline" : "global", effort: level, promptTokens: meter.prompt, completionTokens: meter.completion, createdAt: new Date().toISOString() });
+            } catch { /* 用量写入失败不影响回答 */ }
+          }
+          send({ type: "done", usage: { promptTokens: meter.prompt, completionTokens: meter.completion } });
         } catch (error: unknown) {
           send({ type: "error", message: error instanceof Error ? error.message : "请求失败" });
         }

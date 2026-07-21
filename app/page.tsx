@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  AlertCircle,
   BookOpen,
   Bot,
   ChartColumn,
@@ -38,6 +39,7 @@ import {
   Send,
   Settings,
   Sparkles,
+  Square,
   SquarePen,
   Trash2,
   Type,
@@ -52,7 +54,8 @@ import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { DEFAULT_PROMPTS, type PromptConfig } from "./chat-prompts";
 import { parseReferences, parseAuthorYearReferences, matchAuthorYearEntry, type AuthorYearCitation } from "./references";
 
-type ChatMessage = { id: number; role: "user" | "assistant"; content: string; steps?: string[] };
+type ChatMessage = { id: number; role: "user" | "assistant"; content: string; steps?: string[]; plain?: boolean };
+type ToastMessage = { text: string; kind?: "success" | "error" };
 type SavedConversation = { id: number; title: string; createdAt: number; messages: ChatMessage[] };
 type ChatEffort = "medium" | "high" | "max";
 const UI_FONT_SIZES = ["compact", "standard", "large", "xlarge"] as const;
@@ -117,6 +120,7 @@ async function consumeChatStream(response: Response, handlers: { onStep?: (label
 }
 type ToolAction = "translate" | "explain" | "ask" | "formula" | "figure";
 type HighlightColor = "yellow" | "green" | "blue" | "rose";
+const HIGHLIGHT_COLOR_LABELS: Record<HighlightColor, string> = { yellow: "黄色", green: "绿色", blue: "蓝色", rose: "玫红色" };
 type Annotation = {
   id: number;
   kind: ToolAction | "highlight" | "text-note";
@@ -155,6 +159,8 @@ type Annotation = {
   formulaRegionPixelHeight?: number;
   // 框选图表的截图（dataURL），持久化时会剥离，只保留区域坐标
   figureImage?: string;
+  // 本次会话内新建标记：只有新建批注的输入框自动聚焦，恢复工作区渲染的不抢焦点（持久化时剥离）
+  fresh?: boolean;
 };
 type FormulaAnchor = { text: string; label?: string; pageNumber: number; pageX: number; pageY: number; regionX: number; regionY: number; regionWidth: number; regionHeight: number };
 // 框选图表的选区：region* 为相对页面的归一化坐标，barX/barY 为操作条的屏幕坐标
@@ -258,7 +264,7 @@ function shouldPersistAnnotation(annotation: Annotation) {
 // 需要持久化的批注序列化，自动保存与水合恢复的快照共用，保证两处结果一致
 // 图表批注的截图体积大（约 100-300KB），持久化时剥离，恢复后显示占位提示，区域坐标仍保留
 function serializePersistentAnnotations(list: Annotation[]) {
-  return JSON.stringify(list.filter(shouldPersistAnnotation).map((annotation) => ({ ...annotation, loading: false, draft: "", ...(annotation.kind === "figure" ? { figureImage: "" } : {}) })));
+  return JSON.stringify(list.filter(shouldPersistAnnotation).map((annotation) => ({ ...annotation, loading: false, draft: "", fresh: undefined, ...(annotation.kind === "figure" ? { figureImage: "" } : {}) })));
 }
 
 // 工作区内容快照：用于判断自动保存时内容相对上次保存/恢复是否真的变化过
@@ -819,7 +825,7 @@ async function capturePageRegion(pdf: PdfDocumentLike, pageNumber: number, regio
 
 // 页面虚拟化：IntersectionObserver 只挂载滚动容器可视区上下约 2 页的 canvas/TextLayer，
 // 视区外的页退化为带尺寸的占位 div；data-page-number 始终挂在根元素上，滚动定位/当前页检测不受影响
-const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, showFormula, onFormula, onTextLayerReady, onThumbnail, registerRef }: { pdf: any; pageNumber: number; zoom: number; baseSize: { width: number; height: number }; showFormula: boolean; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void; registerRef?: (pageNumber: number, el: HTMLElement | null) => void }) {
+const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, showFormula, onFormula, onTextLayerReady, onThumbnail, registerRef, registerThumbRequest }: { pdf: any; pageNumber: number; zoom: number; baseSize: { width: number; height: number }; showFormula: boolean; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void; registerRef?: (pageNumber: number, el: HTMLElement | null) => void; registerThumbRequest?: (pageNumber: number, listener: (() => void) | null) => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -827,6 +833,9 @@ const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, s
   const [measured, setMeasured] = useState<{ width: number; height: number } | null>(null);
   const [nearViewport, setNearViewport] = useState(false);
   const [formulaAnchors, setFormulaAnchors] = useState<Array<FormulaAnchor & { left: number; top: number }>>([]);
+  // 缩略图懒生成：对应 ThumbItem 进入视口附近后才置位（一旦置位就生成并保留）；换文档后重新等待
+  const [thumbWantedFor, setThumbWantedFor] = useState<unknown>(null);
+  const thumbWanted = thumbWantedFor === pdf;
   const scaleFactor = 1.25 * zoom;
   const base = measured || baseSize;
   const size = { width: base.width * scaleFactor, height: base.height * scaleFactor };
@@ -848,6 +857,14 @@ const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, s
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
+
+  // 向父级登记缩略图请求监听：ThumbItem 进入视口附近时触发，只生成被看到过的页
+  useEffect(() => {
+    if (!registerThumbRequest) return;
+    const listener = () => setThumbWantedFor(pdf);
+    registerThumbRequest(pageNumber, listener);
+    return () => registerThumbRequest(pageNumber, null);
+  }, [pageNumber, pdf, registerThumbRequest]);
 
   useEffect(() => {
     if (!nearViewport) return;
@@ -957,9 +974,10 @@ const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, s
     };
   }, [nearViewport, onTextLayerReady, pdf, pageNumber, zoom]);
 
-  // 缩略图独立生成（白底小图，避免透明）：每页每文档只生成一次，不随缩放重建，也不随虚拟化挂载状态变化
+  // 缩略图独立生成（白底小图，避免透明）：每页每文档只生成一次，不随缩放重建，也不随虚拟化挂载状态变化；
+  // 懒生成：只有对应 ThumbItem 进入过视口附近（thumbWanted）才渲染，未生成时缩略图位显示占位 spinner
   useEffect(() => {
-    if (!onThumbnail) return;
+    if (!onThumbnail || !thumbWanted) return;
     let cancelled = false;
     let thumbTask: { promise: Promise<void>; cancel: () => void } | null = null;
     (async () => {
@@ -983,7 +1001,7 @@ const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, s
       cancelled = true;
       thumbTask?.cancel?.();
     };
-  }, [onThumbnail, pdf, pageNumber]);
+  }, [onThumbnail, pdf, pageNumber, thumbWanted]);
 
   return (
     <div ref={handleRootRef} className="pdf-page" data-page-number={pageNumber} style={{ width: size.width, height: size.height, "--total-scale-factor": scaleFactor } as React.CSSProperties}>
@@ -994,7 +1012,7 @@ const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, s
   );
 });
 
-const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula, onTextLayerReady, onTextExtracted, onError, onThumbnail, onPdfReady, registerRef }: { source: string | Uint8Array; zoom: number; showFormula: boolean; onReady: (pages: number) => void; onMetadata: (title: string) => void; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onTextExtracted: (text: string) => void; onError: (message: string) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void; onPdfReady?: (pdf: PdfDocumentLike | null) => void; registerRef?: (pageNumber: number, el: HTMLElement | null) => void }) {
+const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula, onTextLayerReady, onTextExtracted, onExtractProgress, onError, onThumbnail, onPdfReady, registerRef, registerThumbRequest }: { source: string | Uint8Array; zoom: number; showFormula: boolean; onReady: (pages: number) => void; onMetadata: (title: string) => void; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onTextExtracted: (text: string) => void; onExtractProgress?: (done: number, total: number) => void; onError: (message: string) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void; onPdfReady?: (pdf: PdfDocumentLike | null) => void; registerRef?: (pageNumber: number, el: HTMLElement | null) => void; registerThumbRequest?: (pageNumber: number, listener: (() => void) | null) => void }) {
   const [pdf, setPdf] = useState<any>(null);
   // scale=1 的第 1 页尺寸，作为未渲染页占位高度的初始估算（拿到前按 A4 估算）
   const [baseSize, setBaseSize] = useState({ width: 595, height: 842 });
@@ -1022,7 +1040,7 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
           if (metadataTitle && !cancelled) onMetadata(metadataTitle);
           const pageTexts: string[] = [];
           const limit = Math.min(loaded.numPages, 80);
-          for (let pageNumber = 1; pageNumber <= limit && !cancelled; pageNumber++) {
+          const extractPageText = async (pageNumber: number) => {
             const page = await loaded.getPage(pageNumber);
             const content = await page.getTextContent();
             const lines: string[] = [];
@@ -1040,7 +1058,14 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
               previousY = y;
             }
             if (currentLine.length) lines.push(currentLine.join(" "));
-            pageTexts.push(`--- PAGE ${pageNumber} ---\n${lines.join("\n")}`);
+            return `--- PAGE ${pageNumber} ---\n${lines.join("\n")}`;
+          };
+          // 每批 6 页并发提取，批间检查 cancelled；最终结果仍按页序拼接；每批完成上报进度
+          for (let batchStart = 1; batchStart <= limit && !cancelled; batchStart += 6) {
+            const batchSize = Math.min(6, limit - batchStart + 1);
+            const batch = await Promise.all(Array.from({ length: batchSize }, (_, index) => extractPageText(batchStart + index)));
+            pageTexts.push(...batch);
+            onExtractProgress?.(batchStart + batchSize - 1, limit);
           }
           if (!cancelled) {
             // 超长时保留头部 + 尾部：参考文献在文末，纯前截断会让引用解析永远失败
@@ -1060,16 +1085,16 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
       onPdfReady?.(null);
       task?.destroy?.();
     };
-  }, [source, onReady, onMetadata, onTextExtracted, onError, onPdfReady]);
+  }, [source, onReady, onMetadata, onTextExtracted, onExtractProgress, onError, onPdfReady]);
 
   if (!pdf) {
     return <div className="pdf-loading"><LoaderCircle className="spin" size={22} /><span>正在解析论文版面…</span></div>;
   }
-  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} baseSize={baseSize} showFormula={showFormula} onFormula={onFormula} onTextLayerReady={onTextLayerReady} onThumbnail={onThumbnail} registerRef={registerRef} />)}</div>;
+  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} baseSize={baseSize} showFormula={showFormula} onFormula={onFormula} onTextLayerReady={onTextLayerReady} onThumbnail={onThumbnail} registerRef={registerRef} registerThumbRequest={registerThumbRequest} />)}</div>;
 });
 
 // 缩略图窗口化：IntersectionObserver 只给可视区上下约 5 项挂载 <img>，其余保留同尺寸占位（aspect-ratio 固定，布局不抖动）
-const ThumbItem = React.memo(function ThumbItem({ page, active, src, onJump }: { page: number; active: boolean; src?: string; onJump: (page: number) => void }) {
+const ThumbItem = React.memo(function ThumbItem({ page, active, src, onJump, onNear }: { page: number; active: boolean; src?: string; onJump: (page: number) => void; onNear?: (page: number) => void }) {
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const [nearViewport, setNearViewport] = useState(false);
   useEffect(() => {
@@ -1083,6 +1108,10 @@ const ThumbItem = React.memo(function ThumbItem({ page, active, src, onJump }: {
     observer.observe(el);
     return () => observer.disconnect();
   }, []);
+  // 进入视口附近时通知父级，触发对应页的缩略图懒生成
+  useEffect(() => {
+    if (nearViewport) onNear?.(page);
+  }, [nearViewport, onNear, page]);
   return (
     <button ref={buttonRef} className={`thumb-item ${active ? "active" : ""}`} onClick={() => onJump(page)} title={`跳到第 ${page} 页`} aria-label={`跳到第 ${page} 页`}>
       {src && nearViewport
@@ -1097,6 +1126,11 @@ const ThumbItem = React.memo(function ThumbItem({ page, active, src, onJump }: {
 function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => void; onOpenUrl: (url: string) => void; onOpenFile: (file: File) => void }) {
   const [url, setUrl] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal-card" role="dialog" aria-modal="true" aria-labelledby="open-title">
@@ -1106,7 +1140,7 @@ function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => voi
         <p>粘贴 arXiv 链接或任何公开 PDF 地址，也可以从本地上传。</p>
         <label className="url-field">
           <Link2 size={18} />
-          <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="例如 https://arxiv.org/pdf/2507.21892" autoFocus />
+          <input value={url} onChange={(e) => setUrl(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && url.trim()) onOpenUrl(url); }} placeholder="例如 https://arxiv.org/pdf/2507.21892" autoFocus />
         </label>
         <button className="primary-button wide" onClick={() => onOpenUrl(url)} disabled={!url.trim()}><Globe2 size={17} />打开链接</button>
         <div className="modal-or"><span>或</span></div>
@@ -1118,12 +1152,22 @@ function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => voi
   );
 }
 
-function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpenPaper, onAddPaper, onCreateFolder, onMovePaper, onSetStatus }: { onClose: () => void; papers: LibraryPaper[]; folders: LibraryFolder[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void; onCreateFolder: (name: string) => Promise<LibraryFolder | null>; onMovePaper: (paperId: string, folderId: string | null) => Promise<boolean>; onSetStatus: (paperId: string, status: PaperStatus) => Promise<boolean> }) {
+function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpenPaper, onAddPaper, onCreateFolder, onMovePaper, onSetStatus, onDeletePaper, onRenameFolder, onDeleteFolder }: { onClose: () => void; papers: LibraryPaper[]; folders: LibraryFolder[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void; onCreateFolder: (name: string) => Promise<LibraryFolder | null>; onMovePaper: (paperId: string, folderId: string | null) => Promise<boolean>; onSetStatus: (paperId: string, status: PaperStatus) => Promise<boolean>; onDeletePaper: (id: string) => Promise<boolean>; onRenameFolder: (id: string, name: string) => Promise<boolean>; onDeleteFolder: (id: string) => Promise<boolean> }) {
   const [activeFolder, setActiveFolder] = useState("all");
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [folderName, setFolderName] = useState("");
   const [folderSaving, setFolderSaving] = useState(false);
-  const visiblePapers = useMemo(() => activeFolder === "all" ? papers : activeFolder === "unfiled" ? papers.filter((paper) => !paper.folderId) : papers.filter((paper) => paper.folderId === activeFolder), [papers, activeFolder]);
+  const [search, setSearch] = useState("");
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+  const visiblePapers = useMemo(() => {
+    const byFolder = activeFolder === "all" ? papers : activeFolder === "unfiled" ? papers.filter((paper) => !paper.folderId) : papers.filter((paper) => paper.folderId === activeFolder);
+    const keyword = search.trim().toLowerCase();
+    return keyword ? byFolder.filter((paper) => paper.title.toLowerCase().includes(keyword)) : byFolder;
+  }, [papers, activeFolder, search]);
   const activeFolderName = activeFolder === "all" ? "全部论文" : activeFolder === "unfiled" ? "未分类" : folders.find((folder) => folder.id === activeFolder)?.name || "文件夹";
   const createFolder = async () => {
     const name = folderName.trim();
@@ -1147,11 +1191,18 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
             <button className={activeFolder === "all" ? "active" : ""} onClick={() => setActiveFolder("all")}><Library size={15} /><span>全部论文</span><small>{papers.length}</small></button>
             <button className={activeFolder === "unfiled" ? "active" : ""} onClick={() => setActiveFolder("unfiled")}><FolderOpen size={15} /><span>未分类</span><small>{papers.filter((paper) => !paper.folderId).length}</small></button>
             <div className="folder-divider" />
-            {folders.map((folder) => <button key={folder.id} className={activeFolder === folder.id ? "active" : ""} onClick={() => setActiveFolder(folder.id)}><FolderOpen size={15} /><span>{folder.name}</span><small>{papers.filter((paper) => paper.folderId === folder.id).length}</small></button>)}
-            {creatingFolder ? <div className="new-folder-row"><input value={folderName} onChange={(event) => setFolderName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createFolder(); if (event.key === "Escape") setCreatingFolder(false); }} placeholder="文件夹名称" autoFocus /><button onClick={() => void createFolder()} disabled={!folderName.trim() || folderSaving} aria-label="创建文件夹">{folderSaving ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}</button></div> : <button className="new-folder-button" onClick={() => setCreatingFolder(true)}><Plus size={14} /><span>新建文件夹</span></button>}
+            {folders.map((folder) => (
+              <div key={folder.id} className="folder-row">
+                <button className={`folder-main ${activeFolder === folder.id ? "active" : ""}`} onClick={() => setActiveFolder(folder.id)}><FolderOpen size={15} /><span>{folder.name}</span><small>{papers.filter((paper) => paper.folderId === folder.id).length}</small></button>
+                <button className="folder-action" aria-label={`重命名文件夹“${folder.name}”`} title="重命名文件夹" onClick={() => { const name = window.prompt("文件夹名称", folder.name)?.trim(); if (name && name !== folder.name) void onRenameFolder(folder.id, name); }}><SquarePen size={12} /></button>
+                <button className="folder-action" aria-label={`删除文件夹“${folder.name}”`} title="删除文件夹（论文保留，移到未分类）" onClick={() => { if (window.confirm(`删除文件夹“${folder.name}”？里面的论文会保留，移到未分类。`)) { if (activeFolder === folder.id) setActiveFolder("all"); void onDeleteFolder(folder.id); } }}><Trash2 size={12} /></button>
+              </div>
+            ))}
+            {creatingFolder ? <div className="new-folder-row"><input value={folderName} onChange={(event) => setFolderName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createFolder(); if (event.key === "Escape") { event.stopPropagation(); setCreatingFolder(false); } }} placeholder="文件夹名称" autoFocus /><button onClick={() => void createFolder()} disabled={!folderName.trim() || folderSaving} aria-label="创建文件夹">{folderSaving ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}</button></div> : <button className="new-folder-button" onClick={() => setCreatingFolder(true)}><Plus size={14} /><span>新建文件夹</span></button>}
           </aside>
           <section className="library-content">
             <div className="library-content-title"><strong>{activeFolderName}</strong><span>{visiblePapers.length} 篇</span></div>
+            <input className="library-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索论文标题…" aria-label="搜索论文标题" />
             {loading ? <div className="library-loading"><LoaderCircle className="spin" size={18} />正在读取文库…</div> : visiblePapers.length ? (
               <div className="library-list">
                 {visiblePapers.map((paper) => (
@@ -1174,10 +1225,11 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
                         {folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
                       </select>
                     </label>
+                    <button className="folder-action library-delete" aria-label={`删除《${paper.title}》`} title="删除论文（对话和批注一起删除）" onClick={() => { if (window.confirm(`确定删除《${paper.title}》吗？对话和批注会一起删除，无法恢复。`)) void onDeletePaper(paper.id); }}><Trash2 size={14} /></button>
                   </div>
                 ))}
               </div>
-            ) : <div className="library-empty"><FolderOpen size={28} /><strong>{papers.length ? "这个文件夹还是空的" : "文库还是空的"}</strong><p>{papers.length ? "可以从其他文件夹把论文移动到这里。" : "打开链接或上传 PDF 后会自动出现在这里。"}</p></div>}
+            ) : <div className="library-empty"><FolderOpen size={28} /><strong>{search.trim() ? "没有标题匹配的论文" : papers.length ? "这个文件夹还是空的" : "文库还是空的"}</strong><p>{search.trim() ? "换个关键词试试，或清空搜索。" : papers.length ? "可以从其他文件夹把论文移动到这里。" : "打开链接或上传 PDF 后会自动出现在这里。"}</p></div>}
           </section>
         </div>
         <button className="primary-button wide" onClick={onAddPaper}><Plus size={16} />添加论文</button>
@@ -1199,6 +1251,11 @@ const USAGE_MODE_LABELS: Record<string, string> = { global: "全文问答", inli
 const USAGE_EFFORT_LABELS: Record<string, string> = { medium: "快速", high: "深入", max: "研究" };
 
 function UsageModal({ onClose, stats, loading }: { onClose: () => void; stats: UsageStats | null; loading: boolean }) {
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div className="modal-card usage-card" role="dialog" aria-modal="true" aria-labelledby="usage-title">
@@ -1245,6 +1302,11 @@ const WEEKDAY_LABELS = ["一", "二", "三", "四", "五", "六", "日"];
 function StatsModal({ onClose, stats, loading, onOpenPaper }: { onClose: () => void; stats: ReadingStats | null; loading: boolean; onOpenPaper: (id: string) => void }) {
   const today = localDayString();
   const maxSeconds = Math.max(1, ...(stats?.days.map((item) => item.activeSeconds) || [0]));
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div className="modal-card stats-card" role="dialog" aria-modal="true" aria-labelledby="stats-title">
@@ -1335,6 +1397,11 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
   const localFileRef = useRef<HTMLInputElement>(null);
   const providerModels = MODEL_PRESETS[config.provider]?.models || [];
   const usesCustomModel = !providerModels.includes(config.model);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
   const testConnection = async () => {
     if (testState === "testing") return;
     setTestState("testing");
@@ -1377,7 +1444,6 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
       sessionStorage.removeItem("lumen-api-key");
       localStorage.removeItem("lumen-api-config");
       setSaveState("saved");
-      window.setTimeout(onClose, 650);
     } catch (error: any) { setSaveError(error?.message || "保存失败，请稍后重试"); setSaveState("error"); }
   };
   // 进入云同步 tab 时懒加载已保存的配置（密码不回传，只回 hasPassword）
@@ -1649,6 +1715,8 @@ export default function Home() {
   const [readerPanning, setReaderPanning] = useState(false);
   const readerPanRef = useRef<{ startX: number; startY: number; startLeft: number; startTop: number; moved: boolean } | null>(null);
   const startReaderPan = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    // 触屏交给浏览器原生滚动（touch-action: pan-x pan-y），非抓手模式下不启动 JS 平移，避免与系统手势冲突
+    if (event.pointerType === "touch" && !panMode) return;
     const leftButtonPan = event.button === 0 && (panMode || isReaderPanSafeTarget(event.target as HTMLElement));
     if (!(event.button === 1 || leftButtonPan)) return;
     const reader = readerRef.current;
@@ -1754,8 +1822,16 @@ export default function Home() {
   const [effort, setEffort] = useStoredPref<ChatEffort>("lumen-chat-effort", "medium", CHAT_EFFORTS);
   const [inlineEffort, setInlineEffort] = useStoredPref<ChatEffort>("lumen-inline-effort", "medium", CHAT_EFFORTS);
   const [copied, setCopied] = useState(false);
-  const [toast, setToast] = useState("");
-  const [showReaderTip, setShowReaderTip] = useState(true);
+  const [copiedMessageId, setCopiedMessageId] = useState<number | null>(null);
+  const [toast, setToast] = useState<ToastMessage | null>(null);
+  // 阅读提示：关闭过一次（手动/30 秒到点/产生过划词）就持久化，不再每次刷新出现
+  const [readerTipSeen, setReaderTipSeen] = useStoredPref<"0" | "1">("lumen-reader-tip-seen", "0", ["0", "1"]);
+  const showReaderTip = readerTipSeen === "0";
+  const dismissReaderTip = useCallback(() => setReaderTipSeen("1"), [setReaderTipSeen]);
+  // PDF 加载失败后的阅读区占位态：保留错误信息，由用户选择重新打开或回到演示
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // 全文文字提取进度（分批并发，每批完成上报）；null 表示无进行中的提取或已完成
+  const [extractProgress, setExtractProgress] = useState<{ done: number; total: number } | null>(null);
   const [draggingId, setDraggingId] = useState<number | null>(null);
   const [flashedFormulaIds, setFlashedFormulaIds] = useState<Set<number>>(() => new Set());
   const readerRef = useRef<HTMLDivElement>(null);
@@ -1780,9 +1856,13 @@ export default function Home() {
     else pageElsRef.current.delete(page);
   }, []);
   const restoringWorkspaceRef = useRef(false);
+  // 恢复论文时已弹过“已恢复…”toast，PDF 就绪的 toast 跳过一次，避免 1 秒内互相覆盖
+  const skipReadyToastRef = useRef(false);
   const pendingScrollPageRef = useRef<number | null>(null);
   // 划词回答的请求控制器：删除批注/换论文时中断对应流
   const inlineControllersRef = useRef(new Map<number, AbortController>());
+  // 全局对话的请求控制器：发送新问题/换论文/点停止按钮时中断进行中的流
+  const chatControllerRef = useRef<AbortController | null>(null);
   // 缩略图与文本层就绪回调批量上报，避免每页一次 setState
   const thumbPendingRef = useRef<{ key: string; thumbs: Record<number, string> }>({ key: "", thumbs: {} });
   const thumbFlushTimerRef = useRef<number | null>(null);
@@ -1807,6 +1887,9 @@ export default function Home() {
   // 已加载的 pdf.js 文档实例，供框选区域截图使用
   const pdfRef = useRef<PdfDocumentLike | null>(null);
   const handlePdfInstance = useCallback((pdf: PdfDocumentLike | null) => { pdfRef.current = pdf; }, []);
+  const handleExtractProgress = useCallback((done: number, total: number) => {
+    setExtractProgress(done >= total ? null : { done, total });
+  }, []);
   // 未配置图表理解模型时的一次性提醒（localStorage 持久化关闭状态）
   const [visionHintDismissed, setVisionHintDismissed] = useStoredPref<"0" | "1">("wenshu.visionHintDismissed", "0", ["0", "1"]);
   const dismissVisionHint = useCallback(() => setVisionHintDismissed("1"), [setVisionHintDismissed]);
@@ -1822,7 +1905,8 @@ export default function Home() {
     }
   }
   const [messages, setMessages] = useState<ChatMessage[]>([
-    { id: 1, role: "assistant", content: "这里是**全文对话**。我会基于整篇论文回答总结、方法、实验与结论问题；局部翻译和解释会留在原文旁边。" },
+    // 首屏欢迎消息走纯文本渲染（plain），避免为首屏加载 markdown/katex chunk；旧持久化数据没有该字段时仍按 markdown 渲染
+    { id: 1, role: "assistant", content: "这里是全文对话。我会基于整篇论文回答总结、方法、实验与结论问题；局部翻译和解释会留在原文旁边。", plain: true },
   ]);
   const [conversations, setConversations] = useState<SavedConversation[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -1847,6 +1931,26 @@ export default function Home() {
   const authorYearRefs = useMemo(() => (references.size ? [] : parseAuthorYearReferences(paperText)), [paperText, references]);
 
   const thumbSourceKey = typeof source === "string" ? source : source ? "file" : "";
+  // 缩略图懒生成：ThumbItem 进入视口附近 → requestThumbnail 标记并通知对应 PdfPage；
+  // 监听器由 PdfPage 挂载后登记，可能晚于标记，所以登记时按 wanted 集合补触发一次；
+  // wanted 集合按文档 key 区分（与 thumbPendingRef 同款），换文档后自然重置
+  const thumbWantedRef = useRef<{ key: string; pages: Set<number> }>({ key: "", pages: new Set() });
+  const thumbListenersRef = useRef(new Map<number, () => void>());
+  const requestThumbnail = useCallback((pageNumber: number) => {
+    const wanted = thumbWantedRef.current;
+    if (wanted.key !== thumbSourceKey) { wanted.key = thumbSourceKey; wanted.pages = new Set(); }
+    wanted.pages.add(pageNumber);
+    thumbListenersRef.current.get(pageNumber)?.();
+  }, [thumbSourceKey]);
+  const registerThumbRequest = useCallback((pageNumber: number, listener: (() => void) | null) => {
+    if (listener) {
+      thumbListenersRef.current.set(pageNumber, listener);
+      const wanted = thumbWantedRef.current;
+      if (wanted.key === thumbSourceKey && wanted.pages.has(pageNumber)) listener();
+    } else {
+      thumbListenersRef.current.delete(pageNumber);
+    }
+  }, [thumbSourceKey]);
   // 缩略图先进 ref 累积，约 200ms 批量写入 state
   const handleThumbnail = useCallback((pageNumber: number, dataUrl: string) => {
     const pending = thumbPendingRef.current;
@@ -1893,6 +1997,20 @@ export default function Home() {
       window.setTimeout(() => target.classList.remove("page-flash"), 1700);
     }, 480);
   }, [goToPage]);
+
+  // 键盘翻页：←/→/PageUp/PageDown；焦点在输入控件内、带修饰键或有模态框打开时不响应
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (openModal || libraryOpen || settingsOpen || usageOpen || statsOpen) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.closest("input, textarea, select") || target.isContentEditable)) return;
+      if (event.key === "ArrowLeft" || event.key === "PageUp") { event.preventDefault(); goToPage(currentPage - 1); }
+      else if (event.key === "ArrowRight" || event.key === "PageDown") { event.preventDefault(); goToPage(currentPage + 1); }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [currentPage, goToPage, libraryOpen, openModal, settingsOpen, statsOpen, usageOpen]);
 
   // 打开/恢复论文后，等文本层渲染出来再滚动到上次阅读页
   useEffect(() => {
@@ -1981,14 +2099,17 @@ export default function Home() {
           lastSavedSnapshotRef.current = workspaceSnapshot({ paperId: paper.id, title: paper.title, meta: paper.meta, sourceKind: paper.sourceKind, sourceUrl: paper.sourceUrl || null, paperText: "", pageCount: paper.pageCount || 1, currentPage: workspace.currentPage || 1, zoom: workspace.zoom || 0.88, rightOpen: workspace.rightOpen !== false, messages: restoredMessages, conversations: restoredConversations, annotationsJson: serializePersistentAnnotations(restoredAnnotations) });
           lastSavedTextRef.current = paper.paperText || "";
           if (paper.sourceKind === "upload") {
+            skipReadyToastRef.current = true;
             setSource(`/api/papers/${paper.id}/file`);
           } else if (paper.sourceUrl) {
+            skipReadyToastRef.current = true;
             setSource(`/api/pdf?url=${encodeURIComponent(paper.sourceUrl)}`);
           } else {
             // sourceUrl 缺失时不拼 /api/pdf?url=null
             setSource(null);
-            setToast("这篇论文缺少原始链接，无法重新加载 PDF");
+            setToast({ text: "这篇论文缺少原始链接，无法重新加载 PDF", kind: "error" });
           }
+          setLoadError(null);
           setExtractingText(!paper.paperText);
         }
         setSaveStatus("saved");
@@ -2004,13 +2125,17 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => setShowReaderTip(false), 30000);
+    const timer = window.setTimeout(dismissReaderTip, 30000);
     return () => window.clearTimeout(timer);
-  }, []);
+  }, [dismissReaderTip]);
 
   const sendQuestion = useCallback(async (raw: string) => {
     const text = raw.trim();
     if (!text || loading) return;
+    // 发送前中断上一个未完成的全局流（loading 守卫下正常不会触发，防御用）
+    chatControllerRef.current?.abort();
+    const controller = new AbortController();
+    chatControllerRef.current = controller;
     const userMessage: ChatMessage = { id: Date.now(), role: "user", content: text };
     setMessages((old) => [...old, userMessage]);
     setQuestion("");
@@ -2051,12 +2176,14 @@ export default function Home() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: text, mode: "global", history: messages.slice(-10), systemPrompts: promptConfig, effort, ...(paperId ? { paperId } : {}), ...(paperId && paperText === lastSavedTextRef.current ? {} : { paperContext: paperText }) }),
+          signal: controller.signal,
         });
         if (!response.ok) {
           const payload = await response.json().catch(() => ({}));
           throw new Error(payload.error || "模型请求失败");
         }
         await consumeChatStream(response, {
+          signal: controller.signal,
           onStep: (label) => {
             steps.push(label);
             setStatusText(label);
@@ -2064,7 +2191,8 @@ export default function Home() {
           },
           onDelta: pushDelta,
         });
-        flushNow();
+        // 中断时（停止按钮或切换论文）也按 flushDelta 逻辑落地已收到内容；切换论文时控制器已被置空，旧内容不写进新论文的消息列表
+        if (!controller.signal.aborted || chatControllerRef.current === controller) flushNow();
         setLoading(false);
         setStreaming(false);
         setStatusText("");
@@ -2077,15 +2205,24 @@ export default function Home() {
         }
         const demoText = demoAnswer(text);
         for (let index = 0; index < demoText.length; index += 12) {
+          if (controller.signal.aborted) break;
           pushDelta(demoText.slice(index, index + 12));
           await new Promise((resolve) => setTimeout(resolve, 16));
         }
-        flushNow();
+        if (!controller.signal.aborted || chatControllerRef.current === controller) flushNow();
         setLoading(false);
         setStreaming(false);
         setStatusText("");
       }
     } catch (error: unknown) {
+      if (controller.signal.aborted) {
+        // 主动中断不算错误：停止按钮保留已收到内容；切换论文时控制器已置空，旧内容不落进新列表
+        if (chatControllerRef.current === controller) flushNow();
+        setLoading(false);
+        setStreaming(false);
+        setStatusText("");
+        return;
+      }
       flushNow(); // 已收到的内容先写进 state，避免丢字
       const errorText = `连接模型时遇到问题：${error instanceof Error && error.message ? error.message : "请检查 API 设置"}\n\n你可以在右上角的模型设置中检查接口地址与密钥。`;
       if (created) setMessages((old) => old.map((message) => message.id === assistantId ? { ...message, content: `${message.content}\n\n> ${errorText}` } : message));
@@ -2093,8 +2230,15 @@ export default function Home() {
       setLoading(false);
       setStreaming(false);
       setStatusText("");
+    } finally {
+      if (chatControllerRef.current === controller) chatControllerRef.current = null;
     }
   }, [config, effort, loading, messages, paperId, paperText, paperTitle, promptConfig]);
+
+  // 停止按钮：中断进行中的全局流，已收到的部分内容保留
+  const stopChatStream = useCallback(() => {
+    chatControllerRef.current?.abort();
+  }, []);
 
   const refreshHighlights = useCallback((color: HighlightColor) => {
     if (!(CSS as any).highlights || !(window as any).Highlight) return;
@@ -2357,8 +2501,8 @@ export default function Home() {
     setSelectionAnchor({ top: anchorTop, left: anchorLeft, cardTop: anchorTop + 15, cardLeft: anchorLeft + 358 > visibleRight ? Math.max(readerRef.current.scrollLeft + 14, anchorLeft - 360) : anchorLeft + 15, pageNumber });
     setSelectionPos({ x: Math.min(Math.max(rect.left + Math.min(rect.width / 2, 100), 190), window.innerWidth - 220), y: Math.max(rect.top - 58, 72) });
     setShowColors(false);
-    setShowReaderTip(false);
-  }, []);
+    dismissReaderTip();
+  }, [dismissReaderTip]);
 
   // 引用点按：与划词共用手指流程——只有「位移 < 5px 且没有产生选区」的按下才算点击
   const handleCitationClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
@@ -2432,7 +2576,7 @@ export default function Home() {
   const createAnnotation = useCallback((kind: ToolAction | "highlight", color: HighlightColor = "green") => {
     if (!selectedText || !selectionAnchor || !selectionRangeRef.current) return;
     const id = Date.now() + Math.floor(Math.random() * 1000);
-    const annotation: Annotation = { id, kind, color, text: selectedText, surrounding: selectionContext, ...selectionAnchor, pinOffsetX: 0, pinOffsetY: 0, cardOffsetX: selectionAnchor.cardLeft - selectionAnchor.left, cardOffsetY: selectionAnchor.cardTop - selectionAnchor.top, open: kind !== "highlight", loading: false, result: "", draft: "", thread: [] };
+    const annotation: Annotation = { id, kind, color, text: selectedText, surrounding: selectionContext, ...selectionAnchor, pinOffsetX: 0, pinOffsetY: 0, cardOffsetX: selectionAnchor.cardLeft - selectionAnchor.left, cardOffsetY: selectionAnchor.cardTop - selectionAnchor.top, open: kind !== "highlight", loading: false, result: "", draft: "", thread: [], fresh: true };
     annotationAnchorsRef.current.set(id, { top: selectionAnchor.top, left: selectionAnchor.left });
     addAnnotationRange(id, selectionRangeRef.current, color, kind === "highlight");
     setAnnotations((items) => [...items, annotation]);
@@ -2604,13 +2748,17 @@ export default function Home() {
     const left = pageRect.left - readerRect.left + reader.scrollLeft + context.pageX * pageRect.width;
     const top = pageRect.top - readerRect.top + reader.scrollTop + context.pageY * pageRect.height;
     const id = Date.now() + Math.floor(Math.random() * 1000);
-    const annotation: Annotation = { id, kind: "text-note", color: "yellow", text: "", surrounding: "", top, left, cardTop: top, cardLeft: left, open: true, loading: false, result: "", draft: "", thread: [], note: "", fontSize: 14, textColor: "#9a5a16", pageNumber: context.pageNumber, pageX: context.pageX, pageY: context.pageY, cardOffsetX: 0, cardOffsetY: 0 };
+    const annotation: Annotation = { id, kind: "text-note", color: "yellow", text: "", surrounding: "", top, left, cardTop: top, cardLeft: left, open: true, loading: false, result: "", draft: "", thread: [], note: "", fontSize: 14, textColor: "#9a5a16", pageNumber: context.pageNumber, pageX: context.pageX, pageY: context.pageY, cardOffsetX: 0, cardOffsetY: 0, fresh: true };
     annotationAnchorsRef.current.set(id, { top, left });
     setAnnotations((items) => [...items, annotation]);
     setPdfContextMenu(null);
   }, [pdfContextMenu]);
 
   const removeAnnotation = useCallback((id: number) => {
+    // 含 AI 回答/追问/个人笔记的批注删除前确认；纯高亮无内容的直接删
+    const target = annotations.find((item) => item.id === id);
+    const hasContent = Boolean(target && (target.note?.trim() || target.result.trim() || target.thread.length));
+    if (hasContent && !window.confirm("删除这条批注？其中的问答和笔记会一起删除。")) return;
     // 中断该批注可能还在进行的划词回答流
     inlineControllersRef.current.get(id)?.abort();
     inlineControllersRef.current.delete(id);
@@ -2629,7 +2777,7 @@ export default function Home() {
     annotationAnchorsRef.current.delete(id);
     if (stored) refreshHighlights(stored.color);
     setAnnotations((items) => items.filter((item) => item.id !== id));
-  }, [refreshHighlights]);
+  }, [annotations, refreshHighlights]);
 
   const closeAnnotation = useCallback((annotation: Annotation) => {
     const timer = flashTimersRef.current.get(annotation.id);
@@ -2663,6 +2811,9 @@ export default function Home() {
     // 切换论文时中断所有未完成的划词回答流
     inlineControllersRef.current.forEach((controller) => controller.abort());
     inlineControllersRef.current.clear();
+    // 同时中断进行中的全局对话流；置空 ref 表示是切换中断，已收到的旧内容不再落进新论文的消息列表
+    chatControllerRef.current?.abort();
+    chatControllerRef.current = null;
     flashTimersRef.current.forEach((timer) => window.clearTimeout(timer));
     flashTimersRef.current.clear();
     activeRangeIdsRef.current.clear();
@@ -2923,6 +3074,14 @@ export default function Home() {
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisibilityChange); };
   }, [performSave]);
 
+  // 有未保存内容时关闭/刷新页面前提示，避免误关丢失（自动保存每小时才兜底一次）
+  useEffect(() => {
+    if (saveStatus !== "dirty") return;
+    const onBeforeUnload = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [saveStatus]);
+
   // 阅读心跳：真实论文打开期间每 30 秒上报一次活跃时长；切到后台时用 keepalive 补最后一拍，静默失败
   useEffect(() => {
     if (!user || !paperId || !paperSourceKind) return;
@@ -2973,7 +3132,7 @@ export default function Home() {
       setLibraryPapers(Array.isArray(payload.papers) ? payload.papers : []);
       setLibraryFolders(Array.isArray(payload.folders) ? payload.folders : []);
     } catch (error: any) {
-      setToast(error?.message || "文库载入失败");
+      setToast({ text: error?.message || "文库载入失败", kind: "error" });
     } finally { setLibraryLoading(false); }
   }, []);
 
@@ -2986,7 +3145,7 @@ export default function Home() {
       if (!response.ok) throw new Error(payload.error || "无法读取用量");
       setUsageStats(payload as UsageStats);
     } catch (error: unknown) {
-      setToast(errorMessage(error, "用量读取失败"));
+      setToast({ text: errorMessage(error, "用量读取失败"), kind: "error" });
     } finally { setUsageLoading(false); }
   }, []);
 
@@ -2999,7 +3158,7 @@ export default function Home() {
       if (!response.ok) throw new Error(payload.error || "无法读取阅读统计");
       setReadingStats(payload as ReadingStats);
     } catch (error: unknown) {
-      setToast(errorMessage(error, "阅读统计读取失败"));
+      setToast({ text: errorMessage(error, "阅读统计读取失败"), kind: "error" });
     } finally { setStatsLoading(false); }
   }, []);
 
@@ -3010,10 +3169,10 @@ export default function Home() {
       if (!response.ok) throw new Error(payload.error || "文件夹创建失败");
       const folder = payload.folder as LibraryFolder;
       setLibraryFolders((folders) => [folder, ...folders]);
-      setToast(`已创建文件夹“${folder.name}”`);
+      setToast({ text: `已创建文件夹“${folder.name}”` });
       return folder;
     } catch (error: unknown) {
-      setToast(errorMessage(error, "文件夹创建失败"));
+      setToast({ text: errorMessage(error, "文件夹创建失败"), kind: "error" });
       return null;
     }
   }, []);
@@ -3024,11 +3183,11 @@ export default function Home() {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "移动论文失败");
       setLibraryPapers((papers) => papers.map((paper) => paper.id === id ? { ...paper, folderId, updatedAt: payload.paper?.updatedAt || paper.updatedAt } : paper));
-      setToast(folderId ? "论文已移入文件夹" : "论文已移到未分类");
+      setToast({ text: folderId ? "论文已移入文件夹" : "论文已移到未分类" });
       return true;
     } catch (error: unknown) {
       setLibraryPapers((papers) => [...papers]);
-      setToast(errorMessage(error, "移动论文失败"));
+      setToast({ text: errorMessage(error, "移动论文失败"), kind: "error" });
       return false;
     }
   }, []);
@@ -3039,11 +3198,76 @@ export default function Home() {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "状态更新失败");
       setLibraryPapers((papers) => papers.map((paper) => paper.id === id ? { ...paper, status, updatedAt: payload.paper?.updatedAt || paper.updatedAt } : paper));
-      setToast(`已标记为${PAPER_STATUS_OPTIONS.find((option) => option.value === status)?.label || "未读"}`);
+      setToast({ text: `已标记为${PAPER_STATUS_OPTIONS.find((option) => option.value === status)?.label || "未读"}` });
       return true;
     } catch (error: unknown) {
       setLibraryPapers((papers) => [...papers]);
-      setToast(errorMessage(error, "状态更新失败"));
+      setToast({ text: errorMessage(error, "状态更新失败"), kind: "error" });
+      return false;
+    }
+  }, []);
+
+  const deleteLibraryPaper = useCallback(async (id: string) => {
+    try {
+      const response = await fetch(`/api/papers/${encodeURIComponent(id)}`, { method: "DELETE" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || "删除论文失败");
+      setLibraryPapers((papers) => papers.filter((paper) => paper.id !== id));
+      if (id === paperId) {
+        // 删的是当前打开的论文：中断流式任务，关闭阅读区回到演示页
+        clearPaperAnnotations();
+        restoringWorkspaceRef.current = false;
+        setSource(null);
+        setPaperId(null);
+        setPaperStatus(null);
+        setPaperSourceKind(null);
+        setPaperSourceUrl(null);
+        setPaperTitle("Attention Is All You Need");
+        setPaperMeta("交互演示论文 · 打开链接后会替换为真实 PDF");
+        setPaperText(demoParagraphs.map((item) => `${item.heading || ""}\n${item.body}`).join("\n\n"));
+        setPageCount(15);
+        setCurrentPage(1);
+        setExtractingText(false);
+        setExtractProgress(null);
+        setLoadError(null);
+        setMessages([{ id: Date.now(), role: "assistant", content: "这里是全文对话。我会基于整篇论文回答总结、方法、实验与结论问题；局部翻译和解释会留在原文旁边。", plain: true }]);
+        setConversations([]);
+        setHistoryOpen(false);
+      }
+      setToast({ text: "论文已删除" });
+      return true;
+    } catch (error: unknown) {
+      setToast({ text: errorMessage(error, "删除论文失败"), kind: "error" });
+      return false;
+    }
+  }, [clearPaperAnnotations, paperId]);
+
+  const renameLibraryFolder = useCallback(async (id: string, name: string) => {
+    try {
+      const response = await fetch(`/api/folders/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "文件夹重命名失败");
+      setLibraryFolders((folders) => folders.map((folder) => folder.id === id ? { ...folder, name, updatedAt: payload.folder?.updatedAt || folder.updatedAt } : folder));
+      setToast({ text: "文件夹已重命名" });
+      return true;
+    } catch (error: unknown) {
+      setToast({ text: errorMessage(error, "文件夹重命名失败"), kind: "error" });
+      return false;
+    }
+  }, []);
+
+  const deleteLibraryFolder = useCallback(async (id: string) => {
+    try {
+      const response = await fetch(`/api/folders/${encodeURIComponent(id)}`, { method: "DELETE" });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || "文件夹删除失败");
+      setLibraryFolders((folders) => folders.filter((folder) => folder.id !== id));
+      // 论文保留，变为无文件夹
+      setLibraryPapers((papers) => papers.map((paper) => paper.folderId === id ? { ...paper, folderId: null } : paper));
+      setToast({ text: "文件夹已删除，论文保留在未分类" });
+      return true;
+    } catch (error: unknown) {
+      setToast({ text: errorMessage(error, "文件夹删除失败"), kind: "error" });
       return false;
     }
   }, []);
@@ -3084,24 +3308,34 @@ export default function Home() {
       lastSavedSnapshotRef.current = workspaceSnapshot({ paperId: paper.id, title: paper.title, meta: paper.meta, sourceKind: paper.sourceKind, sourceUrl: paper.sourceUrl || null, paperText: "", pageCount: paper.pageCount || 1, currentPage: workspace.currentPage || 1, zoom: workspace.zoom || 0.88, rightOpen: workspace.rightOpen !== false, messages: restoredMessages, conversations: restoredConversations, annotationsJson: serializePersistentAnnotations(restoredAnnotations) });
       lastSavedTextRef.current = paper.paperText || "";
       if (paper.sourceKind === "upload") {
+        skipReadyToastRef.current = true;
         setSource(`/api/papers/${paper.id}/file`);
       } else if (paper.sourceUrl) {
+        skipReadyToastRef.current = true;
         setSource(`/api/pdf?url=${encodeURIComponent(paper.sourceUrl)}`);
       } else {
         // sourceUrl 缺失时不拼 /api/pdf?url=null
         setSource(null);
       }
+      setLoadError(null);
       setExtractingText(!paper.paperText);
       setLibraryOpen(false);
-      setToast(paper.sourceKind === "upload" || paper.sourceUrl ? "已恢复论文的阅读位置、对话和批注" : "这篇论文缺少原始链接，无法重新加载 PDF");
+      setToast(paper.sourceKind === "upload" || paper.sourceUrl ? { text: "已恢复论文的阅读位置、对话和批注" } : { text: "这篇论文缺少原始链接，无法重新加载 PDF", kind: "error" });
     } catch (error: any) {
-      setToast(error?.message || "论文打开失败");
+      setToast({ text: error?.message || "论文打开失败", kind: "error" });
     } finally { setLibraryLoading(false); }
   }, [clearPaperAnnotations, paperId, performSave]);
 
   const openUrl = (raw: string) => {
     const normalized = normalizePaperUrl(raw);
-    if (!/^https?:\/\//i.test(normalized)) { setToast("请输入有效的公开链接"); return; }
+    if (!/^https?:\/\//i.test(normalized)) { setToast({ text: "请输入有效的公开链接", kind: "error" }); return; }
+    let parsed: URL;
+    try {
+      parsed = new URL(normalized);
+    } catch {
+      setToast({ text: "链接格式不正确", kind: "error" });
+      return;
+    }
     void performSave("background"); // 切换前先把当前论文存掉
     restoringWorkspaceRef.current = false;
     clearPaperAnnotations();
@@ -3112,25 +3346,28 @@ export default function Home() {
     setCurrentPage(1);
     pendingScrollPageRef.current = 1;
     setExtractingText(true);
+    setExtractProgress(null);
+    setLoadError(null);
     setPaperText("");
     setSource(`/api/pdf?url=${encodeURIComponent(normalized)}`);
     const arxivId = normalized.match(/arxiv\.org\/pdf\/([^?#/]+)/i)?.[1];
-    const urlName = decodeURIComponent(new URL(normalized).pathname.split("/").filter(Boolean).pop() || "").replace(/\.pdf$/i, "");
+    const urlName = decodeURIComponent(parsed.pathname.split("/").filter(Boolean).pop() || "").replace(/\.pdf$/i, "");
     setPaperTitle(arxivId ? `arXiv ${arxivId}` : normalizedDocumentTitle(urlName) || "正在读取论文…");
-    setPaperMeta(`${new URL(normalized).hostname} · 真实 PDF`);
+    setPaperMeta(`${parsed.hostname} · 真实 PDF`);
     setMessages([{ id: Date.now(), role: "assistant", content: "论文正在解析。文字提取完成后，我会在这里基于**全文上下文**回答问题。" }]);
     setConversations([]);
     setHistoryOpen(false);
     setOpenModal(false);
-    setToast("论文已加入阅读区");
+    setToast({ text: "论文已加入阅读区" });
   };
 
   const openFile = async (file: File) => {
-    if (!user) { setToast("请先登录再上传 PDF"); return; }
+    if (!user) { setToast({ text: "请先登录再上传 PDF", kind: "error" }); return; }
     void performSave("background"); // 切换前先把当前论文存掉
     restoringWorkspaceRef.current = false;
     setExtractingText(true);
-    setToast("正在保存并打开 PDF…");
+    setExtractProgress(null);
+    setToast({ text: "正在保存并打开 PDF…" });
     try {
       const response = await fetch("/api/papers/upload", {
         method: "POST",
@@ -3147,6 +3384,7 @@ export default function Home() {
       setPaperText("");
       setCurrentPage(1);
       pendingScrollPageRef.current = 1;
+      setLoadError(null);
       setSource(`/api/papers/${payload.paper.id}/file`);
       setPaperTitle(payload.paper.title);
       setPaperMeta(payload.paper.meta);
@@ -3154,16 +3392,18 @@ export default function Home() {
       setConversations([]);
       setHistoryOpen(false);
       setOpenModal(false);
-      setToast("PDF 已保存到你的账户");
+      setToast({ text: "PDF 已保存到你的账户" });
     } catch (error: any) {
       setExtractingText(false);
-      setToast(`上传失败：${error?.message || "请稍后重试"}`);
+      setToast({ text: `上传失败：${error?.message || "请稍后重试"}`, kind: "error" });
     }
   };
 
   const handlePdfReady = useCallback((pages: number) => {
     setPageCount(pages);
-    setToast(`真实 PDF 已打开 · ${pages} 页`);
+    // 恢复论文时已弹过“已恢复…”toast，这次就绪提示跳过，避免覆盖
+    if (skipReadyToastRef.current) { skipReadyToastRef.current = false; return; }
+    setToast({ text: `真实 PDF 已打开 · ${pages} 页` });
   }, []);
 
   const handlePaperMetadata = useCallback((title: string) => {
@@ -3181,13 +3421,18 @@ export default function Home() {
     restoringWorkspaceRef.current = false;
     setPaperText(text);
     setExtractingText(false);
+    setExtractProgress(null);
     if (!restoring) setMessages([{ id: Date.now(), role: "assistant", content: text ? `全文文字已经准备好（约 **${text.length.toLocaleString()}** 个字符）。现在可以询问整篇论文的方法、实验、结论和局限。` : "PDF 已打开，但没有提取到可搜索文字；它可能是扫描版，需要接入 OCR。" }]);
   }, []);
 
   const handlePdfError = useCallback((msg: string) => {
-    setToast(`加载失败：${msg.slice(0, 70)}`);
+    const text = msg.slice(0, 70);
+    setToast({ text: `加载失败：${text}`, kind: "error" });
     setExtractingText(false);
+    setExtractProgress(null);
     setSource(null);
+    // 保留错误占位态：阅读区显示错误页而不是静默回退演示论文，顶栏标题旁标注打开失败
+    setLoadError(text || "无法读取这份 PDF");
   }, []);
 
   const startGuestSession = async () => {
@@ -3205,14 +3450,14 @@ export default function Home() {
     }
   };
 
-  useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 2200); return () => clearTimeout(timer); }, [toast]);
+  useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(null), 2200); return () => clearTimeout(timer); }, [toast]);
 
   const startNewChat = useCallback(() => {
     // 当前对话里已有用户提问时先归档进历史，再开新对话
     setConversations((old) => archiveConversation(old, messages));
     setHistoryOpen(false);
     setMessages([{ id: Date.now(), role: "assistant", content: "新的对话已开始。我会基于整篇论文回答总结、方法、实验与结论问题。" }]);
-    setToast("已开始新对话，原对话已存入历史");
+    setToast({ text: "已开始新对话，原对话已存入历史" });
   }, [messages]);
 
   // 恢复一条历史对话：当前对话先归档，被选中的对话移出历史成为当前对话
@@ -3220,12 +3465,46 @@ export default function Home() {
     setConversations((old) => archiveConversation(old.filter((item) => item.id !== conversation.id), messages));
     setMessages(conversation.messages);
     setHistoryOpen(false);
-    setToast("已恢复这条历史对话");
+    setToast({ text: "已恢复这条历史对话" });
   }, [messages]);
 
   const deleteConversation = useCallback((id: number) => {
+    if (!window.confirm("删除这条历史对话？")) return;
     setConversations((old) => old.filter((item) => item.id !== id));
   }, []);
+
+  // 导出当前论文的批注与对话为 Markdown 文件（纯前端拼字符串，Blob 触发下载）
+  const exportNotes = useCallback(() => {
+    const kindLabels: Record<string, string> = { translate: "局部翻译", explain: "段落解释", ask: "针对这段提问", formula: "公式解释", figure: "图表解读", highlight: "高亮标记", "text-note": "PDF 文字批注" };
+    const lines: string[] = [`# ${paperTitle} · 阅读笔记`, ""];
+    if (annotations.length) {
+      lines.push("## 批注", "");
+      for (const annotation of annotations) {
+        lines.push(`### 第 ${annotation.pageNumber || 1} 页 · ${kindLabels[annotation.kind] || annotation.kind}`, "");
+        if (annotation.text.trim()) lines.push(`> ${annotation.text.replace(/\s+/g, " ").trim()}`, "");
+        if (annotation.note?.trim()) lines.push(`**笔记**：${annotation.note.trim()}`, "");
+        for (const message of annotation.thread) lines.push(`**${message.role === "user" ? "问" : "答"}**：${message.content}`, "");
+        if (!annotation.thread.length && annotation.result.trim()) lines.push(`**答**：${annotation.result.trim()}`, "");
+      }
+    }
+    const allConversations: SavedConversation[] = [...conversations];
+    if (messages.some((message) => message.role === "user")) allConversations.push({ id: 0, title: "当前对话", createdAt: Date.now(), messages });
+    if (allConversations.length) {
+      lines.push("## 全文对话", "");
+      for (const conversation of allConversations) {
+        lines.push(`### ${conversation.title}`, "");
+        for (const message of conversation.messages) lines.push(`**${message.role === "user" ? "问" : "答"}**：${message.content}`, "");
+      }
+    }
+    if (!annotations.length && !allConversations.length) { setToast({ text: "还没有可导出的批注或对话" }); return; }
+    const url = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${paperTitle.replace(/[\\/:*?"<>|]+/g, "_").slice(0, 60) || "paper"}-笔记.md`;
+    link.click();
+    URL.revokeObjectURL(url);
+    setToast({ text: "笔记已导出为 Markdown" });
+  }, [annotations, conversations, messages, paperTitle]);
 
   // 当前气泡对应的文献条目与同年条目数；未解析到时为 null，由 JSX 展示「未找到」
   let citationEntry: { text: string; page: number; index?: number } | null = null;
@@ -3251,7 +3530,7 @@ export default function Home() {
           <RailButton icon={<Receipt size={20} />} label="用量账单" onClick={showUsage} />
         </nav>
         <div className="rail-bottom">
-          <RailButton icon={<CircleHelp size={20} />} label="使用帮助" onClick={() => setToast("提示：先选中文字，再选择翻译或解释")} />
+          <RailButton icon={<CircleHelp size={20} />} label="使用帮助" onClick={() => setToast({ text: "提示：先选中文字，再选择翻译或解释" })} />
           <div className="font-menu">
             <RailButton icon={<Type size={20} />} label="界面字号" active={fontMenuOpen} onClick={() => setFontMenuOpen(!fontMenuOpen)} />
             {fontMenuOpen && <>
@@ -3278,11 +3557,13 @@ export default function Home() {
           <div className="paper-identity">
             <div className="file-badge"><FileText size={17} /></div>
             <div><h1>{paperTitle}</h1></div>
+            {loadError && <span className="load-error-badge" title={loadError}>打开失败</span>}
           </div>
           <div className="top-actions">
             <button type="button" className={`sync-status ${saveStatus}`} onClick={() => void performSave("manual")} disabled={saveStatus === "saving" || saveStatus === "loading"} title="点击立即保存；内容每小时自动保存一次，切到后台或切换论文时也会保存">{saveStatus === "error" ? <CloudOff size={14} /> : <Cloud size={14} />}<span>{saveStatus === "loading" ? "读取中" : saveStatus === "saving" ? "保存中" : saveStatus === "error" ? "保存失败 · 点击重试" : saveStatus === "dirty" ? "未保存 · 点击保存" : "本机已保存"}</span></button>
-            <button className={`model-card ${config.apiKey || config.hasApiKey ? "configured" : ""}`} onClick={() => setSettingsOpen(true)} title={config.apiKey || config.hasApiKey ? `当前模型：${config.model}（点击修改）` : "还没有配置模型，点击去设置"}>
+            <button className={`model-card ${config.apiKey || config.hasApiKey ? "configured" : ""}`} onClick={() => setSettingsOpen(true)} title={config.apiKey || config.hasApiKey ? `当前模型：${config.model}（点击修改）` : "演示模式 · 还没有配置模型，点击去设置"}>
               <span className={`status-dot ${config.apiKey || config.hasApiKey ? "online" : ""}`} />
+              <Settings size={15} className="model-card-compact-icon" />
               <span className="model-card-text">
                 <small>{config.apiKey || config.hasApiKey ? "当前模型" : "未配置模型"}</small>
                 <strong>{config.apiKey || config.hasApiKey ? config.model : "演示模式 · 点击配置"}</strong>
@@ -3301,7 +3582,7 @@ export default function Home() {
           <div className="toolbar-group"><button className="icon-button small" aria-label="缩小" title="缩小" onClick={() => setZoom(Math.max(.55, zoom - .1))}><ZoomOut size={17} /></button><button className="zoom-label" title="恢复 100% 缩放" onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button><button className="icon-button small" aria-label="放大" title="放大" onClick={() => setZoom(Math.min(1.8, zoom + .1))}><ZoomIn size={17} /></button></div>
           {source && <><div className="toolbar-divider" /><div className="toolbar-group"><button className={`icon-button small ${thumbsOpen === "show" ? "active" : ""}`} aria-label={thumbsOpen === "show" ? "隐藏缩略图" : "显示缩略图"} title={thumbsOpen === "show" ? "隐藏缩略图栏" : "显示缩略图栏"} onClick={() => setThumbsOpen(thumbsOpen === "show" ? "hide" : "show")}><PanelLeft size={17} /></button></div></>}
           <div className="toolbar-spacer" />
-          <button className={`icon-button small ${panMode ? "active" : ""}`} aria-label={panMode ? "切换到选择模式" : "切换到抓手平移模式"} title={panMode ? "选择模式：划词翻译/高亮" : "抓手模式：左键拖动平移页面"} onClick={() => { setPanMode(!panMode); setToast(panMode ? "已切回选择模式，可以划词标注" : "抓手模式：按住左键拖动页面，中键也可随时拖动"); }}><Hand size={17} /></button>
+          <button className={`icon-button small ${panMode ? "active" : ""}`} aria-label={panMode ? "切换到选择模式" : "切换到抓手平移模式"} title={panMode ? "选择模式：划词翻译/高亮" : "抓手模式：左键拖动平移页面"} onClick={() => { setPanMode(!panMode); setToast({ text: panMode ? "已切回选择模式，可以划词标注" : "抓手模式：按住左键拖动页面，中键也可随时拖动" }); }}><Hand size={17} /></button>
           {source && <button className={`icon-button small ${formulaAssist === "show" ? "active" : ""}`} aria-label={formulaAssist === "show" ? "隐藏公式按钮" : "显示公式按钮"} title={formulaAssist === "show" ? "隐藏页面上的「问公式」按钮" : "显示页面上的「问公式」按钮"} onClick={() => setFormulaAssist(formulaAssist === "show" ? "hide" : "show")}><Sparkles size={17} /></button>}
           {source && <button className={`icon-button small ${figureLasso ? "active" : ""}`} aria-label={figureLasso ? "退出框选图表" : "框选图表"} title={figureLasso ? "退出框选模式（ESC 或再次点击）" : "框选图表：在页面上拖出矩形，向 AI 询问图表内容"} onClick={() => { setFigureLasso(!figureLasso); setFigureRegion(null); setLassoRect(null); lassoStartRef.current = null; lassoRectRef.current = null; }}><Scan size={17} /></button>}
           <button className="icon-button small" aria-label="全屏" title="切换全屏" onClick={toggleFullscreen}><Maximize2 size={17} /></button>
@@ -3310,13 +3591,23 @@ export default function Home() {
         <div className="reader-main">
           {source && thumbsOpen === "show" && (
             <aside ref={thumbRailRef} className={`thumb-rail${thumbResizing ? " resizing" : ""}${thumbPanning ? " panning" : ""}`} aria-label="页面缩略图" style={{ width: thumbWidth }} onPointerDown={startThumbPan} onClickCapture={(event) => { if (thumbPanMovedRef.current) { event.preventDefault(); event.stopPropagation(); } }}>
-              {Array.from({ length: pageCount }, (_, index) => index + 1).map((page) => <ThumbItem key={page} page={page} active={currentPage === page} src={pageThumbs[page]} onJump={goToPage} />)}
+              {Array.from({ length: pageCount }, (_, index) => index + 1).map((page) => <ThumbItem key={page} page={page} active={currentPage === page} src={pageThumbs[page]} onJump={goToPage} onNear={requestThumbnail} />)}
             </aside>
           )}
           {source && thumbsOpen === "show" && <div className="thumb-resize-handle" style={{ left: thumbWidth - 4 }} onPointerDown={startThumbResize} title="拖动调整缩略图栏宽度" aria-label="拖动调整缩略图栏宽度" role="separator" aria-orientation="vertical" />}
           <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}${panMode ? " pan-mode" : ""}${readerPanning ? " panning" : ""}${figureLasso ? " figure-lasso-mode" : ""}`} ref={readerRef} onPointerDown={handleReaderPointerDown} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleSelectionStart} onClick={handleCitationClick} onScroll={() => { if (selectionPos) setSelectionPos(null); if (citationPopover) setCitationPopover(null); if (figureRegion) setFigureRegion(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); const reader = readerRef.current; if (!reader || scrollFrameRef.current) return; scrollFrameRef.current = window.requestAnimationFrame(() => { scrollFrameRef.current = 0; const probe = reader.scrollTop + 42; let visiblePage = 1; for (const [page, el] of pageElsRef.current) { if (el.offsetTop <= probe) visiblePage = page; else break; } setCurrentPage((prev) => (prev === visiblePage ? prev : visiblePage)); }); }}>
           {source ? (
-            <PdfDocument source={source} zoom={zoom} showFormula={formulaAssist === "show"} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextLayerReady={handleTextLayerReady} onTextExtracted={handleTextExtracted} onError={handlePdfError} onThumbnail={handleThumbnail} onPdfReady={handlePdfInstance} registerRef={registerPageEl} />
+            <PdfDocument source={source} zoom={zoom} showFormula={formulaAssist === "show"} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextLayerReady={handleTextLayerReady} onTextExtracted={handleTextExtracted} onExtractProgress={handleExtractProgress} onError={handlePdfError} onThumbnail={handleThumbnail} onPdfReady={handlePdfInstance} registerRef={registerPageEl} registerThumbRequest={registerThumbRequest} />
+          ) : loadError ? (
+            <div className="load-error-panel">
+              <CloudOff size={30} />
+              <strong>论文加载失败</strong>
+              <p>{loadError}</p>
+              <div className="load-error-actions">
+                <button className="primary-button" onClick={() => setOpenModal(true)}>重新打开</button>
+                <button className="secondary-button" onClick={() => setLoadError(null)}>回到演示</button>
+              </div>
+            </div>
           ) : <div style={{ transform: `scale(${zoom})`, transformOrigin: "top center", width: "fit-content", minWidth: "calc(100% + 480px)", margin: "0 auto" }}><DemoPaper /></div>}
           {selectionRects.map((rect, index) => <div key={`selection-${index}`} className="selection-overlay-rect" style={rect} aria-hidden="true" />)}
           {citationFlash.map((rect, index) => <div key={`citation-flash-${index}`} className="citation-flash-rect" style={rect} aria-hidden="true" />)}
@@ -3326,7 +3617,7 @@ export default function Home() {
           {annotations.map((annotation) => annotation.kind === "text-note" ? (
             <section key={annotation.id} className={`pdf-text-note ${draggingId === annotation.id ? "dragging" : ""}`} style={{ top: annotation.cardTop, left: annotation.cardLeft, color: annotation.textColor || "#9a5a16" }} onMouseDown={(event) => event.stopPropagation()}>
               <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")}><span><MoreHorizontal size={13} />PDF 文字批注</span><button onClick={() => removeAnnotation(annotation.id)} aria-label="删除 PDF 批注"><X size={13} /></button></header>
-              <textarea value={annotation.note || ""} onChange={(event) => updateAnnotation(annotation.id, { note: event.target.value })} placeholder="输入批注…" autoFocus style={{ fontSize: annotation.fontSize || 14, color: annotation.textColor || "#9a5a16" }} />
+              <textarea value={annotation.note || ""} onChange={(event) => updateAnnotation(annotation.id, { note: event.target.value })} placeholder="输入批注…" autoFocus={Boolean(annotation.fresh)} style={{ fontSize: annotation.fontSize || 14, color: annotation.textColor || "#9a5a16" }} />
               <footer>
                 <label>字号<select value={annotation.fontSize || 14} onChange={(event) => updateAnnotation(annotation.id, { fontSize: Number(event.target.value) })}><option value="12">12</option><option value="14">14</option><option value="16">16</option><option value="20">20</option><option value="24">24</option></select></label>
                 <div className="note-colors" aria-label="文字颜色">{["#9a5a16", "#b4233b", "#2563a7", "#237052", "#333333"].map((color) => <button key={color} className={annotation.textColor === color ? "active" : ""} style={{ background: color }} onClick={() => updateAnnotation(annotation.id, { textColor: color })} aria-label={`设置颜色 ${color}`} />)}</div>
@@ -3375,7 +3666,7 @@ export default function Home() {
                   {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />{annotation.loadingLabel || "正在结合相邻段落分析…"}</div>}
                   {annotation.kind !== "highlight" && !annotation.loading && (
                     <div className="inline-ask follow-up">
-                      <textarea rows={2} value={annotation.draft} onChange={(event) => updateAnnotation(annotation.id, { draft: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && annotation.draft.trim()) { event.preventDefault(); requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, annotation.draft, annotation.thread); } }} placeholder={annotation.thread.length ? "继续追问这段内容…" : "针对这段内容提问…"} autoFocus={annotation.kind === "ask" && annotation.thread.length === 0} />
+                      <textarea rows={2} value={annotation.draft} onChange={(event) => updateAnnotation(annotation.id, { draft: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && annotation.draft.trim()) { event.preventDefault(); requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, annotation.draft, annotation.thread); } }} placeholder={annotation.thread.length ? "继续追问这段内容…" : "针对这段内容提问…"} autoFocus={annotation.kind === "ask" && annotation.thread.length === 0 && Boolean(annotation.fresh)} />
                       <button disabled={!annotation.draft.trim()} onClick={() => requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, annotation.draft, annotation.thread)}><Send size={14} />发送</button>
                     </div>
                   )}
@@ -3385,7 +3676,7 @@ export default function Home() {
               )}
             </React.Fragment>
           ))}
-          {showReaderTip && <div className="reader-tip"><Sparkles size={14} /><span>选中论文中的任何内容，立即翻译或提问</span><button onClick={() => setShowReaderTip(false)} aria-label="关闭提示"><X size={13} /></button></div>}
+          {showReaderTip && <div className="reader-tip"><Sparkles size={14} /><span>选中论文中的任何内容，立即翻译或提问</span><button onClick={dismissReaderTip} aria-label="关闭提示"><X size={13} /></button></div>}
         </div>
         </div>
       </section>
@@ -3393,8 +3684,9 @@ export default function Home() {
       <aside className="ai-panel" aria-hidden={!rightOpen}>
         {rightOpen && <div className="panel-resize-handle" onPointerDown={startPanelResize} title="拖动调整面板宽度" aria-label="拖动调整面板宽度" role="separator" aria-orientation="vertical" />}
         <header className="ai-header">
-          <div className="ai-title"><div className="ai-glyph"><Sparkles size={17} /></div><div className="ai-title-text"><h2>全文 AI</h2><span>{extractingText ? "正在解析论文…" : paperText ? "已读入全文，随时提问" : "演示论文 · 可直接体验"}</span></div></div>
+          <div className="ai-title"><div className="ai-glyph"><Sparkles size={17} /></div><div className="ai-title-text"><h2>全文 AI</h2><span>{extractingText ? (extractProgress ? `正在解析论文… ${extractProgress.done}/${extractProgress.total} 页` : "正在解析论文…") : paperText ? "已读入全文，随时提问" : "演示论文 · 可直接体验"}</span></div></div>
           <div className="ai-header-actions">
+            <button className="icon-button small" onClick={exportNotes} aria-label="导出笔记" title="把批注和对话导出为 Markdown 文件"><Download size={15} /></button>
             <button className={`icon-button small ${historyOpen ? "active" : ""}`} onClick={() => setHistoryOpen(!historyOpen)} aria-label="历史对话" title="查看历史对话"><History size={15} /></button>
             <button className="icon-button small" onClick={startNewChat} aria-label="开始新对话" title="当前对话存入历史，开始新对话"><SquarePen size={15} /></button>
             <button className="icon-button small" onClick={() => setRightOpen(false)} aria-label="收起 AI 面板" title="收起 AI 面板"><PanelRightClose size={16} /></button>
@@ -3409,6 +3701,7 @@ export default function Home() {
           <div className="chat-stream chat-history">
             <button className="history-back" onClick={() => setHistoryOpen(false)}><ChevronLeft size={14} />返回当前对话</button>
             {conversations.length === 0 && <div className="history-empty">还没有历史对话</div>}
+            {conversations.length >= MAX_SAVED_CONVERSATIONS && <div className="history-limit-note">最多保留 {MAX_SAVED_CONVERSATIONS} 条，最旧的会被移除</div>}
             {[...conversations].reverse().map((conversation) => (
               <div key={conversation.id} className="history-row" role="button" tabIndex={0} title="恢复这条对话" onClick={() => restoreConversation(conversation)} onKeyDown={(event) => { if (event.key === "Enter") restoreConversation(conversation); }}>
                 <span className="history-row-title">{conversation.title}</span>
@@ -3424,8 +3717,8 @@ export default function Home() {
               {message.role === "assistant" && <div className="message-avatar"><Sparkles size={14} /></div>}
               <div className="message-body">
                 {message.role === "assistant" && message.steps && message.steps.length > 0 && <div className="message-steps"><Zap size={11} /><span>{message.steps.join(" → ")}</span></div>}
-                {message.role === "assistant" ? <MarkdownContent content={message.content} onPageJump={handlePageJump} /> : <p>{message.content}</p>}
-                {message.role === "assistant" && <div className="message-tools"><button aria-label="复制回答" onClick={() => navigator.clipboard.writeText(message.content)}><Copy size={13} /></button><button aria-label="有帮助"><Check size={13} /></button></div>}
+                {message.role === "assistant" ? (message.plain ? <p>{message.content}</p> : <MarkdownContent content={message.content} onPageJump={handlePageJump} />) : <p>{message.content}</p>}
+                {message.role === "assistant" && <div className="message-tools"><button aria-label="复制回答" onClick={async () => { await navigator.clipboard.writeText(message.content); setCopiedMessageId(message.id); window.setTimeout(() => setCopiedMessageId(null), 1500); }}>{copiedMessageId === message.id ? <Check size={13} /> : <Copy size={13} />}</button></div>}
               </div>
             </div>
           ))}
@@ -3434,11 +3727,14 @@ export default function Home() {
         )}
         {!historyOpen && <div className="composer-wrap">
           <div className="composer-top-row">
-            <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? "解析中" : paperText ? "上下文已就绪" : "等待文字"}</small></div>
+            <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? (extractProgress ? `已解析 ${extractProgress.done}/${extractProgress.total} 页` : "解析中") : paperText ? "上下文已就绪" : "等待文字"}</small></div>
           </div>
           <div className="composer">
             <textarea value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question); } }} placeholder="询问整篇论文…" rows={2} />
-            <div className="composer-bottom"><span>⌘ ↵</span><button onClick={() => sendQuestion(question)} disabled={!question.trim() || loading || extractingText} aria-label="发送"><Send size={16} /></button></div>
+            <div className="composer-bottom"><span>Enter 发送 · Shift+Enter 换行</span>{loading
+              ? <button onClick={stopChatStream} aria-label="停止生成" title="停止生成"><Square size={14} /></button>
+              : <button onClick={() => sendQuestion(question)} disabled={!question.trim() || extractingText} aria-label="发送"><Send size={16} /></button>}
+            </div>
           </div>
           <p className="ai-disclaimer">AI 可能会出错，请核对重要结论</p>
         </div>}
@@ -3471,7 +3767,7 @@ export default function Home() {
           <button onClick={() => setShowColors(!showColors)} className={showColors ? "active" : ""}><Palette size={15} />高亮</button>
           <span />
           <button className="menu-icon" aria-label="复制" onClick={async () => { await navigator.clipboard.writeText(selectedText); setCopied(true); setTimeout(() => setCopied(false), 1000); }}>{copied ? <Check size={15} /> : <Copy size={15} />}</button>
-          {showColors && <div className="color-picker" aria-label="选择高亮颜色">{(["yellow", "green", "blue", "rose"] as HighlightColor[]).map((color) => <button key={color} className={color} aria-label={`${color} 高亮`} onClick={() => createAnnotation("highlight", color)} />)}</div>}
+          {showColors && <div className="color-picker" aria-label="选择高亮颜色">{(["yellow", "green", "blue", "rose"] as HighlightColor[]).map((color) => <button key={color} className={color} aria-label={`${HIGHLIGHT_COLOR_LABELS[color]}高亮`} onClick={() => createAnnotation("highlight", color)} />)}</div>}
         </div>
       )}
       {citationPopover && (
@@ -3498,11 +3794,11 @@ export default function Home() {
         <button onClick={createPdfTextNote}><MessageSquareText size={15} /><span><strong>添加文字批注</strong><small>写在当前 PDF 位置</small></span></button>
       </div>}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
-      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} />}
+      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} onDeletePaper={deleteLibraryPaper} onRenameFolder={renameLibraryFolder} onDeleteFolder={deleteLibraryFolder} />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} visionConfig={visionConfig} setVisionConfig={setVisionConfig} />}
       {usageOpen && <UsageModal onClose={() => setUsageOpen(false)} stats={usageStats} loading={usageLoading} />}
       {statsOpen && <StatsModal onClose={() => setStatsOpen(false)} stats={readingStats} loading={statsLoading} onOpenPaper={(id) => { setStatsOpen(false); void openLibraryPaper(id); }} />}
-      {toast && <div className="toast"><Check size={15} />{toast}</div>}
+      {toast && <div className={`toast${toast.kind === "error" ? " error" : ""}`}>{toast.kind === "error" ? <AlertCircle size={15} /> : <Check size={15} />}{toast.text}</div>}
       {!authReady && <div className="auth-gate"><div className="auth-card"><BrandMark /><LoaderCircle className="spin" size={22} /><h2>正在确认登录状态</h2><p>正在安全地读取你的论文空间…</p></div></div>}
       {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>开始使用文枢</h2><p>暂时不配置登录也没关系，可以先用游客身份继续阅读和测试。</p><button className="primary-button wide auth-guest" onClick={startGuestSession} disabled={guestSubmitting}>{guestSubmitting ? <><LoaderCircle className="spin" size={15} />正在创建游客空间</> : "游客试用"}</button><div className="auth-divider"><span>以后再登录</span></div><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a>{authMessage && <div className="auth-message">{authMessage}</div>}<small>游客数据只绑定当前浏览器；清除 Cookie 后无法恢复，也不能跨设备同步。</small></div></div>}
     </main>

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireAppUser } from "../../server-user";
 
 const MAX_PDF_BYTES = 60 * 1024 * 1024;
+const MAX_REDIRECTS = 5;
 
 // SSRF 防护：arxiv 白名单直接放行；其余主机名若是内网/保留 IP 字面量则拒绝，公网域名放行
 function isAllowedHost(hostname: string) {
@@ -28,7 +29,21 @@ export async function GET(request: NextRequest) {
   if (url.protocol !== "https:") return NextResponse.json({ error: "仅支持 HTTPS 地址" }, { status: 400 });
   if (!isAllowedHost(url.hostname)) return NextResponse.json({ error: "不允许访问该地址" }, { status: 403 });
   try {
-    const response = await fetch(url.toString(), { headers: { "User-Agent": "WenshuPaper/1.0" }, redirect: "follow" });
+    // 手动跟随重定向（最多 5 跳）：每一跳重新校验协议与主机，防止 302 跳到内网/元数据地址
+    let current = url;
+    let response: Response | undefined;
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      response = await fetch(current.toString(), { headers: { "User-Agent": "WenshuPaper/1.0" }, redirect: "manual" });
+      if (response.status < 300 || response.status >= 400) break;
+      const location = response.headers.get("location");
+      if (!location) break;
+      if (hop === MAX_REDIRECTS) return NextResponse.json({ error: "重定向次数过多" }, { status: 502 });
+      let next: URL;
+      try { next = new URL(location, current); } catch { return NextResponse.json({ error: "论文源站返回无效重定向" }, { status: 502 }); }
+      if (next.protocol !== "https:" || !isAllowedHost(next.hostname)) return NextResponse.json({ error: "不允许访问该地址" }, { status: 403 });
+      current = next;
+    }
+    if (!response) return NextResponse.json({ error: "无法获取该论文，请尝试上传 PDF" }, { status: 502 });
     if (!response.ok) return NextResponse.json({ error: `论文源站返回 ${response.status}` }, { status: 502 });
     const length = Number(response.headers.get("content-length") || 0);
     if (length > MAX_PDF_BYTES) return NextResponse.json({ error: "PDF 超过 60MB" }, { status: 413 });

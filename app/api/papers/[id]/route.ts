@@ -1,7 +1,9 @@
+import { env } from "cloudflare:workers";
 import { and, eq } from "drizzle-orm";
 import { getDb } from "../../../../db";
 import { paperFolders, papers } from "../../../../db/schema";
 import { requireAppUser } from "../../../server-user";
+import { sanitizeObjectKey } from "../../../object-key";
 
 export async function PATCH(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const user = await requireAppUser();
@@ -33,4 +35,22 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
   }
   await db.update(papers).set(updates).where(and(eq(papers.id, id), eq(papers.userId, user.id)));
   return Response.json({ saved: true, paper: { id, ...updates } });
+}
+
+export async function DELETE(_request: Request, { params }: { params: Promise<{ id: string }> }) {
+  const user = await requireAppUser();
+  if (!user) return Response.json({ error: "需要登录" }, { status: 401 });
+  const { id } = await params;
+  const db = getDb();
+  const [paper] = await db.select({ id: papers.id, objectKey: papers.objectKey }).from(papers).where(and(eq(papers.id, id), eq(papers.userId, user.id))).limit(1);
+  if (!paper) return Response.json({ error: "论文不存在" }, { status: 404 });
+
+  // paperStates / readingSessions 均 onDelete cascade，随论文一并删除
+  await db.delete(papers).where(and(eq(papers.id, id), eq(papers.userId, user.id)));
+  if (paper.objectKey) {
+    const bucket = (env as unknown as { FILES?: R2Bucket }).FILES;
+    // 与备份恢复同一约定：key 越权时重写到本用户目录，绝不删他人对象
+    if (bucket) await bucket.delete(await sanitizeObjectKey(user.id, paper.objectKey));
+  }
+  return Response.json({ ok: true });
 }

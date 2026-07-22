@@ -10,10 +10,10 @@ export async function POST(request: NextRequest) {
     const user = await requireAppUser();
     if (!user) return NextResponse.json({ ok: false, error: "需要登录" }, { status: 401 });
     const body = await request.json();
-    const { endpoint, apiKey, model } = body;
+    const { endpoint, apiKey, model, vision } = body;
     const db = getDb();
     const [savedSettings] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
-    const { endpoint: resolvedEndpoint, model: resolvedModel, apiKey: resolvedApiKey } = await resolveModelConfig(savedSettings, { endpoint, apiKey, model });
+    const { endpoint: resolvedEndpoint, model: resolvedModel, apiKey: resolvedApiKey } = await resolveModelConfig(savedSettings, { endpoint, apiKey, model }, { vision: Boolean(vision) });
     if (!resolvedEndpoint || !resolvedModel) return NextResponse.json({ ok: false, error: "请先填写 Base URL 和模型" }, { status: 400 });
     if (!resolvedApiKey) return NextResponse.json({ ok: false, error: "请先填写 API Key" }, { status: 400 });
     let target: URL;

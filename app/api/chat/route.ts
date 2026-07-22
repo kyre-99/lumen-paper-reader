@@ -330,7 +330,12 @@ export async function POST(request: NextRequest) {
     const chunkKey = chunkCacheKey(fromClient ? "" : paperIdText, paperUpdatedAt, resolvedPaperContext);
     const [savedSettings] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
     const { endpoint: resolvedEndpoint, model: resolvedModel, apiKey: resolvedApiKey } = await resolveModelConfig(savedSettings, { endpoint, apiKey, model }, { vision: Boolean(imageDataUrl) });
-    if (!resolvedEndpoint || !resolvedApiKey || !resolvedModel || !question) return NextResponse.json({ error: "模型配置不完整，请先在 AI 设置中保存" }, { status: 400 });
+    if (!resolvedEndpoint || !resolvedApiKey || !resolvedModel || !question) {
+      const error = imageDataUrl && !resolvedApiKey && resolvedEndpoint
+        ? "图表理解模型缺少 API Key，请在设置的「图表理解模型」中填写对应服务商的密钥"
+        : "模型配置不完整，请先在 AI 设置中保存";
+      return NextResponse.json({ error }, { status: 400 });
+    }
     const target = chatCompletionsUrl(resolvedEndpoint);
     const isInline = mode === "inline";
     const level: Effort = effort === "high" || effort === "max" ? effort : "medium";

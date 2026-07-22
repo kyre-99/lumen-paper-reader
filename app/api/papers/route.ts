@@ -14,6 +14,7 @@ export async function GET() {
       title: papers.title,
       meta: papers.meta,
       sourceKind: papers.sourceKind,
+      sourceUrl: papers.sourceUrl,
       pageCount: papers.pageCount,
       status: papers.status,
       createdAt: papers.createdAt,

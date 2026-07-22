@@ -173,7 +173,7 @@ const PAPER_STATUS_OPTIONS: Array<{ value: PaperStatus; label: string }> = [
   { value: "reading", label: "阅读中" },
   { value: "done", label: "已阅读" },
 ];
-type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; sourceKind: PaperSourceKind; pageCount: number; status: PaperStatus; createdAt: string; updatedAt: string };
+type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; sourceKind: PaperSourceKind; sourceUrl: string | null; pageCount: number; status: PaperStatus; createdAt: string; updatedAt: string };
 type LibraryFolder = { id: string; name: string; createdAt?: string; updatedAt: string };
 type UsageStats = {
   totalCalls: number; promptTokens: number; completionTokens: number; totalTokens: number;
@@ -1012,7 +1012,7 @@ const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, s
   );
 });
 
-const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula, onTextLayerReady, onTextExtracted, onExtractProgress, onError, onThumbnail, onPdfReady, registerRef, registerThumbRequest }: { source: string | Uint8Array; zoom: number; showFormula: boolean; onReady: (pages: number) => void; onMetadata: (title: string) => void; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onTextExtracted: (text: string) => void; onExtractProgress?: (done: number, total: number) => void; onError: (message: string) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void; onPdfReady?: (pdf: PdfDocumentLike | null) => void; registerRef?: (pageNumber: number, el: HTMLElement | null) => void; registerThumbRequest?: (pageNumber: number, listener: (() => void) | null) => void }) {
+const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula, onReady, onMetadata, onFormula, onTextLayerReady, onTextExtracted, onExtractProgress, onError, onThumbnail, onPdfReady, registerRef, registerThumbRequest, skipExtraction }: { source: string | Uint8Array; zoom: number; showFormula: boolean; onReady: (pages: number) => void; onMetadata: (title: string) => void; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onTextExtracted: (text: string) => void; onExtractProgress?: (done: number, total: number) => void; onError: (message: string) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void; onPdfReady?: (pdf: PdfDocumentLike | null) => void; registerRef?: (pageNumber: number, el: HTMLElement | null) => void; registerThumbRequest?: (pageNumber: number, listener: (() => void) | null) => void; skipExtraction?: boolean }) {
   const [pdf, setPdf] = useState<any>(null);
   // scale=1 的第 1 页尺寸，作为未渲染页占位高度的初始估算（拿到前按 A4 估算）
   const [baseSize, setBaseSize] = useState({ width: 595, height: 842 });
@@ -1038,6 +1038,11 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
           const metadata = await loaded.getMetadata().catch(() => null) as { info?: { Title?: unknown }; metadata?: { get?: (key: string) => unknown } } | null;
           const metadataTitle = normalizedDocumentTitle(metadata?.info?.Title || metadata?.metadata?.get?.("dc:title"));
           if (metadataTitle && !cancelled) onMetadata(metadataTitle);
+          // 恢复已存过全文的论文时跳过重复提取：同样的 PDF 文本相同，省去每次切换最多 80 页的 worker 工作量
+          if (skipExtraction) return;
+          // 让出约 400ms 给首屏页面渲染进 worker 队列，再开始大段提取，避免提取任务挡住新论文的第一屏
+          await new Promise((resolve) => setTimeout(resolve, 400));
+          if (cancelled) return;
           const pageTexts: string[] = [];
           const limit = Math.min(loaded.numPages, 80);
           const extractPageText = async (pageNumber: number) => {
@@ -1085,6 +1090,8 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
       onPdfReady?.(null);
       task?.destroy?.();
     };
+  // skipExtraction 只在加载时读取一次（提取完成后 paperText 变非空会把它变成 true，但绝不能因此重载文档）
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [source, onReady, onMetadata, onTextExtracted, onExtractProgress, onError, onPdfReady]);
 
   if (!pdf) {
@@ -1209,23 +1216,26 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
                   <div key={paper.id} className={`library-item ${paper.id === activePaperId ? "active" : ""}`}>
                     <button className="library-paper-button" onClick={() => onOpenPaper(paper.id)}>
                       <span className="library-file"><FileText size={18} /></span>
-                      <span className="library-copy"><strong>{paper.title}</strong><small>{paper.meta || `${paper.pageCount} 页`} · {new Date(paper.updatedAt).toLocaleDateString("zh-CN")}</small></span>
+                      <span className="library-copy"><strong>{paper.title}</strong></span>
                       <span className="library-open">{paper.id === activePaperId ? "正在阅读" : "打开"}</span>
                     </button>
-                    <label className={`library-status-select ${paper.status || "unread"}`} title="阅读状态">
-                      <span className="status-dot-lib" aria-hidden="true" />
-                      <select aria-label={`设置《${paper.title}》的阅读状态`} value={paper.status || "unread"} onChange={(event) => void onSetStatus(paper.id, event.target.value as PaperStatus)}>
-                        {PAPER_STATUS_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                      </select>
-                    </label>
-                    <label className="library-folder-select" title="移动到文件夹">
-                      <FolderOpen size={12} />
-                      <select aria-label={`移动《${paper.title}》到文件夹`} value={paper.folderId || ""} onChange={(event) => void onMovePaper(paper.id, event.target.value || null)}>
-                        <option value="">未分类</option>
-                        {folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
-                      </select>
-                    </label>
                     <button className="folder-action library-delete" aria-label={`删除《${paper.title}》`} title="删除论文（对话和批注一起删除）" onClick={() => { if (window.confirm(`确定删除《${paper.title}》吗？对话和批注会一起删除，无法恢复。`)) void onDeletePaper(paper.id); }}><Trash2 size={14} /></button>
+                    <div className="library-meta-row">
+                      <small>{paper.meta || `${paper.pageCount} 页`} · {new Date(paper.updatedAt).toLocaleDateString("zh-CN")}</small>
+                      <label className={`library-status-select ${paper.status || "unread"}`} title="阅读状态">
+                        <span className="status-dot-lib" aria-hidden="true" />
+                        <select aria-label={`设置《${paper.title}》的阅读状态`} value={paper.status || "unread"} onChange={(event) => void onSetStatus(paper.id, event.target.value as PaperStatus)}>
+                          {PAPER_STATUS_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                        </select>
+                      </label>
+                      <label className="library-folder-select" title="移动到文件夹">
+                        <FolderOpen size={12} />
+                        <select aria-label={`移动《${paper.title}》到文件夹`} value={paper.folderId || ""} onChange={(event) => void onMovePaper(paper.id, event.target.value || null)}>
+                          <option value="">未分类</option>
+                          {folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+                        </select>
+                      </label>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -1382,6 +1392,11 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
   const [saveError, setSaveError] = useState("");
   const [testState, setTestState] = useState<"idle" | "testing" | "ok" | "fail">("idle");
   const [testMessage, setTestMessage] = useState("");
+  const [visionTestState, setVisionTestState] = useState<"idle" | "testing" | "ok" | "fail">("idle");
+  const [visionTestMessage, setVisionTestMessage] = useState("");
+  // 已保存的 key 在输入框里以掩码实体显示；聚焦进入编辑态时清空，避免掩码被当成新 key 提交
+  const [mainKeyEditing, setMainKeyEditing] = useState(false);
+  const [visionKeyEditing, setVisionKeyEditing] = useState(false);
   const syncLoadedRef = useRef(false);
   const [syncConfig, setSyncConfig] = useState({ endpoint: "", username: "", password: "", remotePath: "lumen-backup", hasPassword: false, configured: false, lastBackupAt: null as string | null });
   const [syncTestState, setSyncTestState] = useState<"idle" | "testing" | "ok" | "fail">("idle");
@@ -1430,6 +1445,29 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
     setTestState("idle");
     setTestMessage("");
     setConfig(next);
+  };
+  const testVisionConnection = async () => {
+    if (visionTestState === "testing") return;
+    setVisionTestState("testing");
+    setVisionTestMessage("");
+    try {
+      const response = await fetch("/api/models/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ vision: true, endpoint: visionConfig.endpoint || config.endpoint || undefined, apiKey: visionConfig.apiKey || undefined, model: visionConfig.model || config.model || undefined }),
+      });
+      const payload = await response.json();
+      if (payload.ok) {
+        setVisionTestState("ok");
+        setVisionTestMessage(`连接成功，模型可用（${payload.latencyMs} ms）`);
+      } else {
+        setVisionTestState("fail");
+        setVisionTestMessage(payload.error || "连接失败，请检查配置");
+      }
+    } catch {
+      setVisionTestState("fail");
+      setVisionTestMessage("网络错误，无法完成测试");
+    }
   };
   const saveSettings = async () => {
     setSaveState("saving");
@@ -1584,7 +1622,12 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
             </select>
           </label>
           {usesCustomModel && <label className="field-label custom-model-field">自定义模型名称<input value={config.model} onChange={(event) => updateConfig({ ...config, model: event.target.value })} placeholder="输入接口支持的模型 ID" autoFocus /></label>}
-          <label className="field-label">API Key<input type="password" value={config.apiKey} onChange={(e) => updateConfig({ ...config, apiKey: e.target.value })} placeholder={config.hasApiKey ? "************" : "输入 API Key"} /></label>
+          <label className="field-label">API Key<input type="password" value={config.apiKey || (config.hasApiKey && !mainKeyEditing ? "••••••••••••" : "")} onFocus={() => setMainKeyEditing(true)} onBlur={() => setMainKeyEditing(false)} onChange={(e) => updateConfig({ ...config, apiKey: e.target.value })} placeholder={config.hasApiKey ? "已保存，输入新密钥可更换" : "输入 API Key"} /></label>
+          {config.apiKey
+            ? <div className="settings-note key-status"><Check size={14} />新密钥已填写，点下方「保存设置」后生效，加密保存。</div>
+            : config.hasApiKey
+              ? <div className="settings-note key-status"><Check size={14} />已保存 API Key（加密存储），AI 功能可用。输入新密钥可更换。</div>
+              : <div className="settings-note key-status warn"><AlertCircle size={14} />还没有保存 API Key，当前是演示模式，AI 回答为示例内容。</div>}
           <div className="test-row">
             <button type="button" className="test-button" onClick={testConnection} disabled={testState === "testing" || !config.endpoint.trim() || !config.model.trim()}>
               {testState === "testing" ? <><LoaderCircle className="spin" size={14} />正在测试连接…</> : <><Zap size={14} />测试连接</>}
@@ -1592,12 +1635,19 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
             {testState === "ok" && <span className="test-result ok"><span className="test-dot" />{testMessage}</span>}
             {testState === "fail" && <span className="test-result fail"><span className="test-dot" />{testMessage}</span>}
           </div>
-          {!config.hasApiKey && <div className="settings-note"><Check size={14} />密钥会加密保存在本机，之后无需重复填写。</div>}
           <div className="sync-section-title">图表理解模型（多模态）</div>
           <p className="vision-section-hint">用于框选图表问答，需支持图像输入（如 gpt-4.1-mini、qwen-vl-max）。</p>
           <label className="field-label">API Base URL<input value={visionConfig.endpoint} onChange={(e) => setVisionConfig({ ...visionConfig, endpoint: e.target.value })} placeholder="留空则使用主模型配置" /></label>
-          <label className="field-label">API Key<input type="password" value={visionConfig.apiKey} onChange={(e) => setVisionConfig({ ...visionConfig, apiKey: e.target.value })} placeholder={visionConfig.hasApiKey ? "************" : "留空则使用主模型配置"} /></label>
+          <label className="field-label">API Key<input type="password" value={visionConfig.apiKey || (visionConfig.hasApiKey && !visionKeyEditing ? "••••••••••••" : "")} onFocus={() => setVisionKeyEditing(true)} onBlur={() => setVisionKeyEditing(false)} onChange={(e) => setVisionConfig({ ...visionConfig, apiKey: e.target.value })} placeholder={visionConfig.hasApiKey ? "已保存，输入新密钥可更换" : "留空则使用主模型配置"} /></label>
+          {visionConfig.hasApiKey && !visionConfig.apiKey && <div className="settings-note"><Check size={14} />已保存图表理解模型的密钥。</div>}
           <label className="field-label">模型名<input value={visionConfig.model} onChange={(e) => setVisionConfig({ ...visionConfig, model: e.target.value })} placeholder="留空则使用主模型配置" /></label>
+          <div className="test-row">
+            <button type="button" className="test-button" onClick={testVisionConnection} disabled={visionTestState === "testing"}>
+              {visionTestState === "testing" ? <><LoaderCircle className="spin" size={14} />正在测试连接…</> : <><Zap size={14} />测试图表模型连接</>}
+            </button>
+            {visionTestState === "ok" && <span className="test-result ok"><span className="test-dot" />{visionTestMessage}</span>}
+            {visionTestState === "fail" && <span className="test-result fail"><span className="test-dot" />{visionTestMessage}</span>}
+          </div>
         </div> : tab === "sync" ? <div className="settings-pane">
           <div className="sync-section-title">云同步</div>
           <label className="field-label">WebDAV 地址<input value={syncConfig.endpoint} onChange={(event) => updateSync({ ...syncConfig, endpoint: event.target.value })} placeholder="https://dav.jianguoyun.com/dav/" /></label>
@@ -2993,7 +3043,14 @@ export default function Home() {
       window.requestAnimationFrame(realignAnnotations);
     };
     restoreRanges();
-    const observer = new MutationObserver(restoreRanges);
+    // DOM 变动在加载/滚动期间非常高频，按 150ms 合并触发，避免每次变动都对所有批注做全文查找
+    let scheduled = false;
+    const throttledRestore = () => {
+      if (scheduled) return;
+      scheduled = true;
+      window.setTimeout(() => { scheduled = false; restoreRanges(); }, 150);
+    };
+    const observer = new MutationObserver(throttledRestore);
     observer.observe(reader, { childList: true, subtree: true });
     const timer = window.setTimeout(() => observer.disconnect(), 15000);
     return () => { observer.disconnect(); window.clearTimeout(timer); };
@@ -3336,6 +3393,14 @@ export default function Home() {
       setToast({ text: "链接格式不正确", kind: "error" });
       return;
     }
+    // 同链接去重：已在文库里的论文直接打开原有记录，保留阅读进度、对话和批注
+    const existingByUrl = libraryPapers.find((paper) => paper.sourceUrl === normalized);
+    if (existingByUrl) {
+      setOpenModal(false);
+      setToast({ text: "这篇论文已在文库中，已为你打开原有记录" });
+      void openLibraryPaper(existingByUrl.id);
+      return;
+    }
     void performSave("background"); // 切换前先把当前论文存掉
     restoringWorkspaceRef.current = false;
     clearPaperAnnotations();
@@ -3363,6 +3428,15 @@ export default function Home() {
 
   const openFile = async (file: File) => {
     if (!user) { setToast({ text: "请先登录再上传 PDF", kind: "error" }); return; }
+    // 同名上传去重：文件名（去 .pdf）与文库中已上传论文标题一致时，直接打开原有记录
+    const uploadTitle = file.name.replace(/\.pdf$/i, "").trim().toLowerCase();
+    const existingUpload = libraryPapers.find((paper) => paper.sourceKind === "upload" && paper.title.trim().toLowerCase() === uploadTitle);
+    if (existingUpload) {
+      setOpenModal(false);
+      setToast({ text: "同名 PDF 已在文库中，已为你打开原有记录" });
+      void openLibraryPaper(existingUpload.id);
+      return;
+    }
     void performSave("background"); // 切换前先把当前论文存掉
     restoringWorkspaceRef.current = false;
     setExtractingText(true);
@@ -3597,7 +3671,7 @@ export default function Home() {
           {source && thumbsOpen === "show" && <div className="thumb-resize-handle" style={{ left: thumbWidth - 4 }} onPointerDown={startThumbResize} title="拖动调整缩略图栏宽度" aria-label="拖动调整缩略图栏宽度" role="separator" aria-orientation="vertical" />}
           <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}${panMode ? " pan-mode" : ""}${readerPanning ? " panning" : ""}${figureLasso ? " figure-lasso-mode" : ""}`} ref={readerRef} onPointerDown={handleReaderPointerDown} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleSelectionStart} onClick={handleCitationClick} onScroll={() => { if (selectionPos) setSelectionPos(null); if (citationPopover) setCitationPopover(null); if (figureRegion) setFigureRegion(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); const reader = readerRef.current; if (!reader || scrollFrameRef.current) return; scrollFrameRef.current = window.requestAnimationFrame(() => { scrollFrameRef.current = 0; const probe = reader.scrollTop + 42; let visiblePage = 1; for (const [page, el] of pageElsRef.current) { if (el.offsetTop <= probe) visiblePage = page; else break; } setCurrentPage((prev) => (prev === visiblePage ? prev : visiblePage)); }); }}>
           {source ? (
-            <PdfDocument source={source} zoom={zoom} showFormula={formulaAssist === "show"} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextLayerReady={handleTextLayerReady} onTextExtracted={handleTextExtracted} onExtractProgress={handleExtractProgress} onError={handlePdfError} onThumbnail={handleThumbnail} onPdfReady={handlePdfInstance} registerRef={registerPageEl} registerThumbRequest={registerThumbRequest} />
+            <PdfDocument source={source} zoom={zoom} showFormula={formulaAssist === "show"} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextLayerReady={handleTextLayerReady} onTextExtracted={handleTextExtracted} onExtractProgress={handleExtractProgress} onError={handlePdfError} onThumbnail={handleThumbnail} onPdfReady={handlePdfInstance} registerRef={registerPageEl} registerThumbRequest={registerThumbRequest} skipExtraction={Boolean(paperText)} />
           ) : loadError ? (
             <div className="load-error-panel">
               <CloudOff size={30} />

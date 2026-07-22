@@ -247,7 +247,7 @@ function errorMessage(error: unknown, fallback: string) {
 
 // 判断按下位置是否适合直接触发平移：文字上保持划词选择，按钮/输入框/批注卡片保持原有交互，空白区域才允许左键拖动
 function isReaderPanSafeTarget(target: HTMLElement) {
-  return !target.closest(".textLayer span, .demo-paper p, .demo-paper h1, .demo-paper h2, .demo-paper .authors, .demo-paper .formula-card, .pdf-text-note, [class*='annotation'], button, a, input, textarea, select, label, .reader-tip");
+  return !target.closest(".textLayer span, .demo-paper p, .demo-paper h1, .demo-paper h2, .demo-paper .authors, .demo-paper .formula-card, .inline-card, .pdf-text-note, .citation-popover, .pdf-context-menu, .selection-menu, .figure-lasso-actions, .formula-assist, [class*='annotation'], button, a, input, textarea, select, label, .reader-tip");
 }
 
 function titleFromFirstPage(text: string) {
@@ -434,6 +434,28 @@ function textOffsetAtX(node: Text, x: number) {
   return node.data.length;
 }
 
+// 每个文本层是否为双栏排版的判定缓存。只有双栏页面才按「指针所在侧」过滤列；
+// 单栏论文里短行（宽度不足页面 65%）会被误判成栏，导致光标被甩到页面另一侧、选区突然暴涨
+const columnLayoutCache = new WeakMap<Element, boolean>();
+
+function isTwoColumnText(root: Element, rootRect: DOMRect) {
+  const cached = columnLayoutCache.get(root);
+  if (cached !== undefined) return cached;
+  // 双栏特征：大量行的左边缘聚集在两个相距很远的 x 位置（左栏边与右栏边）
+  const bins = new Map<number, number>();
+  for (const span of Array.from(root.querySelectorAll("span"))) {
+    if (span.getAttribute("role") === "img") continue;
+    const rect = span.getBoundingClientRect();
+    if (!rect.width || !rect.height || rect.width > rootRect.width * .7) continue;
+    const bin = Math.round((rect.left - rootRect.left) / 24);
+    bins.set(bin, (bins.get(bin) || 0) + 1);
+  }
+  const clusters = [...bins.entries()].filter(([, count]) => count >= 4).map(([bin]) => bin).sort((a, b) => a - b);
+  const twoColumn = clusters.length >= 2 && (clusters[clusters.length - 1] - clusters[0]) * 24 > rootRect.width * .3;
+  columnLayoutCache.set(root, twoColumn);
+  return twoColumn;
+}
+
 function textCaretFromPoint(root: Element, x: number, y: number): TextCaret | null {
   const caretDocument = document as Document & {
     caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
@@ -443,21 +465,22 @@ function textCaretFromPoint(root: Element, x: number, y: number): TextCaret | nu
   const legacyRange = position ? null : caretDocument.caretRangeFromPoint?.(x, y);
   const nativeNode = position?.offsetNode || legacyRange?.startContainer;
   const nativeOffset = position?.offset ?? legacyRange?.startOffset;
+  const rootRect = root.getBoundingClientRect();
+  const twoColumn = isTwoColumnText(root, rootRect);
+  const pointerSide = x < rootRect.left + rootRect.width / 2 ? -1 : 1;
   if (nativeNode?.nodeType === Node.TEXT_NODE && root.contains(nativeNode)) {
     const textNode = nativeNode as Text;
-    const span = textNode.parentElement;
-    const rootRect = root.getBoundingClientRect();
-    const spanRect = span?.getBoundingClientRect();
-    const pointerSide = x < rootRect.left + rootRect.width / 2 ? -1 : 1;
-    const spanSide = spanRect && spanRect.left + spanRect.width / 2 < rootRect.left + rootRect.width / 2 ? -1 : 1;
-    const isNarrowColumnText = Boolean(spanRect && spanRect.width < rootRect.width * .65);
-    if (!isNarrowColumnText || pointerSide === spanSide || Math.abs(x - (rootRect.left + rootRect.width / 2)) < rootRect.width * .04) {
-      return { node: textNode, offset: Math.min(textNode.data.length, Math.max(0, Number(nativeOffset) || 0)) };
+    let accept = true;
+    if (twoColumn) {
+      const span = textNode.parentElement;
+      const spanRect = span?.getBoundingClientRect();
+      const spanSide = spanRect && spanRect.left + spanRect.width / 2 < rootRect.left + rootRect.width / 2 ? -1 : 1;
+      const isNarrowColumnText = Boolean(spanRect && spanRect.width < rootRect.width * .65);
+      accept = !isNarrowColumnText || pointerSide === spanSide || Math.abs(x - (rootRect.left + rootRect.width / 2)) < rootRect.width * .04;
     }
+    if (accept) return { node: textNode, offset: Math.min(textNode.data.length, Math.max(0, Number(nativeOffset) || 0)) };
   }
 
-  const rootRect = root.getBoundingClientRect();
-  const pointerSide = x < rootRect.left + rootRect.width / 2 ? -1 : 1;
   let closest: { node: Text; rect: DOMRect; score: number } | null = null;
   for (const span of Array.from(root.querySelectorAll("span"))) {
     if (span.getAttribute("role") === "img") continue;
@@ -465,8 +488,10 @@ function textCaretFromPoint(root: Element, x: number, y: number): TextCaret | nu
     if (!node) continue;
     const rect = span.getBoundingClientRect();
     if (!rect.width || !rect.height) continue;
-    const spanSide = rect.left + rect.width / 2 < rootRect.left + rootRect.width / 2 ? -1 : 1;
-    if (rect.width < rootRect.width * .65 && spanSide !== pointerSide) continue;
+    if (twoColumn) {
+      const spanSide = rect.left + rect.width / 2 < rootRect.left + rootRect.width / 2 ? -1 : 1;
+      if (rect.width < rootRect.width * .65 && spanSide !== pointerSide) continue;
+    }
     const dx = x < rect.left ? rect.left - x : x > rect.right ? x - rect.right : 0;
     const dy = y < rect.top ? rect.top - y : y > rect.bottom ? y - rect.bottom : 0;
     const score = dy * 4 + dx;
@@ -1899,6 +1924,12 @@ export default function Home() {
   const citationFlashTimerRef = useRef<number | null>(null);
   const selectionFrameRef = useRef(0);
   const scrollFrameRef = useRef(0);
+  // 全文 AI 聊天流：新消息/流式增量到达时自动滚到底部；
+  // chatStickRef 记录用户是否停留在底部附近——上滑阅读历史时暂停自动滚动，回到底部附近（80px 内）自动恢复
+  const chatStreamRef = useRef<HTMLDivElement>(null);
+  const chatStickRef = useRef(true);
+  // 悬浮卡片同理：记录每张卡片是否停留在底部附近（默认跟随），用户上滑时暂停自动滚动
+  const inlineCardStickRef = useRef(new Map<number, boolean>());
   // 页码→页面元素注册表（PdfPage 挂载时登记）：滚动时按 Map 顺序查当前页，不再每帧全量 querySelectorAll
   const pageElsRef = useRef(new Map<number, HTMLElement>());
   const registerPageEl = useCallback((page: number, el: HTMLElement | null) => {
@@ -2187,6 +2218,7 @@ export default function Home() {
     const controller = new AbortController();
     chatControllerRef.current = controller;
     const userMessage: ChatMessage = { id: Date.now(), role: "user", content: text };
+    chatStickRef.current = true; // 自己发问时强制回到底部跟随新回复
     setMessages((old) => [...old, userMessage]);
     setQuestion("");
     setLoading(true);
@@ -2290,12 +2322,18 @@ export default function Home() {
     chatControllerRef.current?.abort();
   }, []);
 
+  // 消息更新（含流式增量、加载状态变化）时，若用户停留在底部附近则跟随滚到最新消息
+  useEffect(() => {
+    const stream = chatStreamRef.current;
+    if (stream && chatStickRef.current) stream.scrollTop = stream.scrollHeight;
+  }, [messages, loading, statusText]);
+
   const refreshHighlights = useCallback((color: HighlightColor) => {
     if (!(CSS as any).highlights || !(window as any).Highlight) return;
     if (!document.getElementById("lumen-highlight-styles")) {
       const style = document.createElement("style");
       style.id = "lumen-highlight-styles";
-      style.textContent = "::highlight(lumen-yellow){background:rgba(244,207,86,.48)}::highlight(lumen-green){background:rgba(100,190,151,.40)}::highlight(lumen-blue){background:rgba(104,168,226,.36)}::highlight(lumen-rose){background:rgba(226,126,151,.34)}";
+      style.textContent = "::highlight(lumen-yellow){background:rgba(244,207,86,.30)}::highlight(lumen-green){background:rgba(100,190,151,.26)}::highlight(lumen-blue){background:rgba(104,168,226,.24)}::highlight(lumen-rose){background:rgba(226,126,151,.22)}";
       document.head.appendChild(style);
     }
     const ranges = [...annotationRangesRef.current.entries()].filter(([id, item]) => item.color === color && (item.persistent || activeRangeIdsRef.current.has(id))).map(([, item]) => item.range);
@@ -2412,6 +2450,15 @@ export default function Home() {
     return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", end); window.removeEventListener("pointercancel", end); };
   }, [updateAnnotation]);
 
+  // 流式更新后把卡片滚到最新内容；force 用于用户刚提问时强制跟随。rAF 等到 DOM 更新后再量高度
+  const scrollInlineCardToBottom = useCallback((id: number, force = false) => {
+    window.requestAnimationFrame(() => {
+      const card = readerRef.current?.querySelector<HTMLElement>(`.inline-card[data-annotation-id="${id}"]`);
+      if (!card) return;
+      if (force || (inlineCardStickRef.current.get(id) ?? true)) card.scrollTop = card.scrollHeight;
+    });
+  }, []);
+
   const requestInlineAnswer = useCallback(async (id: number, action: ToolAction, text: string, surrounding: string, customQuestion?: string, history: ChatMessage[] = [], imageDataUrl?: string) => {
     const prompt = customQuestion || (action === "translate" ? "请将选中的内容准确翻译成中文，保留公式与专业术语，并简短标注关键术语。" : action === "formula" ? "请逐项解释这个公式：说明每个符号、公式的直觉含义、它在论文中的作用，以及阅读时应注意的假设。" : action === "figure" ? "请解读这张图表/表格：说明它的构成、坐标轴与单位、主要趋势、关键数值，以及它支持的结论。" : "请直观解释选中内容的含义、它在本段中的作用，以及读者容易误解的地方。");
     const userMessage: ChatMessage = { id: Date.now(), role: "user", content: customQuestion || (action === "translate" ? "翻译这段内容" : action === "formula" ? "解释这个公式" : action === "figure" ? "解读这张图表" : action === "explain" ? "解释这段内容" : prompt) };
@@ -2421,6 +2468,7 @@ export default function Home() {
     const controller = new AbortController();
     inlineControllersRef.current.set(id, controller);
     updateAnnotation(id, { loading: true, result: "", draft: "", thread: nextThread });
+    scrollInlineCardToBottom(id, true); // 用户刚提问，强制跟随到最新回复
     try {
       if (config.apiKey || config.hasApiKey) {
         const response = await fetch("/api/chat", {
@@ -2442,6 +2490,7 @@ export default function Home() {
           if (controller.signal.aborted || !answer) return;
           if (!created) { created = true; updateAnnotation(id, { loading: false }); }
           updateAnnotation(id, { thread: [...nextThread, { id: assistantMsgId, role: "assistant", content: answer }] });
+          scrollInlineCardToBottom(id);
         };
         await consumeChatStream(response, {
           signal: controller.signal,
@@ -2460,15 +2509,17 @@ export default function Home() {
         if (controller.signal.aborted) return;
         const answer = demoAnswer(prompt, text);
         updateAnnotation(id, { loading: false, result: answer, draft: "", thread: [...nextThread, { id: Date.now() + 1, role: "assistant", content: answer }] });
+        scrollInlineCardToBottom(id);
       }
     } catch (error: any) {
       if (controller.signal.aborted) return; // 批注已删除或论文已切换，静默退出
       const errorText = `连接模型时遇到问题：${error?.message || "请检查 API 设置"}`;
       updateAnnotation(id, { loading: false, result: errorText, thread: [...nextThread, { id: Date.now() + 1, role: "assistant", content: errorText }] });
+      scrollInlineCardToBottom(id);
     } finally {
       if (inlineControllersRef.current.get(id) === controller) inlineControllersRef.current.delete(id);
     }
-  }, [config, inlineEffort, paperId, paperText, paperTitle, promptConfig, updateAnnotation]);
+  }, [config, inlineEffort, paperId, paperText, paperTitle, promptConfig, updateAnnotation, scrollInlineCardToBottom]);
 
   const handleSelectionStart = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     citationDownRef.current = null;
@@ -3710,7 +3761,7 @@ export default function Home() {
                 {annotation.kind === "translate" ? <Languages size={14} /> : annotation.kind === "figure" ? <Scan size={14} /> : annotation.kind === "formula" || annotation.kind === "explain" ? <Sparkles size={14} /> : annotation.kind === "ask" ? <MessageSquareText size={14} /> : <Highlighter size={14} />}
               </button>
               {annotation.open && (
-                <section className={`inline-card ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`} style={{ top: annotation.cardTop, left: annotation.cardLeft, width: annotation.cardWidth, ...(annotation.cardHeight ? { height: annotation.cardHeight, maxHeight: "none" as const } : {}) }} onMouseDown={(event) => event.stopPropagation()}>
+                <section className={`inline-card ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`} data-annotation-id={annotation.id} style={{ top: annotation.cardTop, left: annotation.cardLeft, width: annotation.cardWidth, ...(annotation.cardHeight ? { height: annotation.cardHeight, maxHeight: "none" as const } : {}) }} onMouseDown={(event) => event.stopPropagation()} onScroll={(event) => { const el = event.currentTarget; inlineCardStickRef.current.set(annotation.id, el.scrollHeight - el.scrollTop - el.clientHeight < 80); }}>
                   <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")} title="拖动移动悬浮卡片">
                     <div className="inline-card-title">
                       <MoreHorizontal className="drag-grip" size={15} />
@@ -3785,7 +3836,7 @@ export default function Home() {
             ))}
           </div>
         ) : (
-        <div className="chat-stream">
+        <div className="chat-stream" ref={chatStreamRef} onScroll={(event) => { const el = event.currentTarget; chatStickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; }}>
           {messages.map((message, messageIndex) => (
             <div key={message.id} className={`message ${message.role}${streaming && message.role === "assistant" && messageIndex === messages.length - 1 ? " streaming" : ""}`}>
               {message.role === "assistant" && <div className="message-avatar"><Sparkles size={14} /></div>}

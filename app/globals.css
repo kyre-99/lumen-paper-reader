@@ -151,12 +151,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .reader-viewport::-webkit-scrollbar-thumb, .chat-stream::-webkit-scrollbar-thumb { background: #c6d1ca; border: 3px solid transparent; border-radius: 8px; background-clip: content-box; }
 .reader-viewport::-webkit-scrollbar-thumb:hover, .chat-stream::-webkit-scrollbar-thumb:hover { background: #a9bcb2; border: 3px solid transparent; background-clip: content-box; }
 .reader-viewport::-webkit-scrollbar-track, .chat-stream::-webkit-scrollbar-track { background: transparent; }
-.reader-viewport .textLayer { cursor: grab; }
+/* 普通模式不显示手型，避免整个页面看起来像「只能拖动」；文字以外的空白区域左键仍可拖动平移 */
 .reader-viewport .textLayer span { cursor: text; }
-.reader-viewport .demo-paper { cursor: grab; }
 .reader-viewport .demo-paper p, .reader-viewport .demo-paper h1, .reader-viewport .demo-paper h2 { cursor: text; }
-.reader-viewport.pan-mode { cursor: grab; }
-.reader-viewport.pan-mode .textLayer span, .reader-viewport.pan-mode .demo-paper { cursor: grab; user-select: none; }
+.reader-viewport.pan-mode, .reader-viewport.pan-mode .textLayer { cursor: grab; }
+.reader-viewport.pan-mode .textLayer span, .reader-viewport.pan-mode .demo-paper, .reader-viewport.pan-mode .demo-paper p, .reader-viewport.pan-mode .demo-paper h1, .reader-viewport.pan-mode .demo-paper h2 { cursor: grab; user-select: none; }
 .reader-viewport.panning, .reader-viewport.panning * { cursor: grabbing !important; user-select: none; }
 .reader-viewport.figure-lasso-mode, .reader-viewport.figure-lasso-mode .textLayer, .reader-viewport.figure-lasso-mode .textLayer span, .reader-viewport.figure-lasso-mode canvas { cursor: crosshair !important; }
 .reader-viewport.figure-lasso-mode .textLayer span { user-select: none; }
@@ -200,7 +199,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .textLayer ::selection { background: rgba(82, 151, 126, .3); color: transparent; }
 .reader-viewport.custom-selection-active .textLayer ::selection { background: transparent; }
 .textLayer br::selection { background: transparent; }
-.selection-overlay-rect { position: absolute; z-index: 6; pointer-events: none; box-sizing: border-box; border-radius: 2px; background: linear-gradient(90deg, rgba(88,176,134,.4), rgba(72,156,119,.34)); mix-blend-mode: multiply; box-shadow: 0 0 0 .5px rgba(72,156,119,.12); animation: rect-in .12s ease both; }
+.selection-overlay-rect { position: absolute; z-index: 6; pointer-events: none; box-sizing: border-box; border-radius: 2px; background: linear-gradient(90deg, rgba(88,176,134,.22), rgba(72,156,119,.18)); mix-blend-mode: multiply; box-shadow: 0 0 0 .5px rgba(72,156,119,.08); animation: rect-in .12s ease both; }
 @keyframes rect-in { from { opacity: .3; } }
 .formula-assist { position: absolute; z-index: 7; min-width: 27px; height: 27px; display: flex; align-items: center; gap: 0; padding: 0 7px; overflow: hidden; transform: translateY(-50%); border: 1px solid rgba(117,157,141,.55); border-radius: 14px; background: rgba(255,255,255,.78); color: var(--green); box-shadow: 0 5px 16px rgba(31,50,41,.10); opacity: .28; backdrop-filter: blur(8px); cursor: pointer; transition: opacity .18s var(--ease-out), min-width .26s var(--ease-spring), gap .26s var(--ease-spring), background .18s var(--ease-out), box-shadow .2s var(--ease-out); }
 .formula-assist span { max-width: 0; overflow: hidden; white-space: nowrap; font-size: 9px; font-weight: 650; transition: max-width .26s var(--ease-spring); }
@@ -422,7 +421,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .vision-hint .vision-hint-close:hover { background: #f0dfb4; }
 .inline-result { font-size: 11px; line-height: 1.62; }
 .inline-result h3 { margin: 10px 0 6px; font-size: 12px; }.inline-result p { margin: 6px 0; }.inline-result ul, .inline-result ol { margin: 6px 0; padding-left: 18px; }.inline-result blockquote { max-height: none; }
-.inline-thread { display: flex; flex-direction: column; gap: 8px; max-height: 210px; overflow-y: auto; padding: 2px 1px 7px; }
+/* 对话区不再单独限高滚动：嵌套滚动条会截获滚轮、手感割裂，统一由卡片自身的一条滚动条滚动 */
+.inline-thread { display: flex; flex-direction: column; gap: 8px; padding: 2px 1px 7px; }
 .inline-message { max-width: 92%; padding: 7px 9px; border-radius: 9px; font-size: 10px; line-height: 1.55; animation: msg-in .28s var(--ease-out) both; }
 .inline-message p { margin: 0 0 5px; }.inline-message p:last-child { margin-bottom: 0; }
 .inline-message.user { align-self: flex-end; background: #e9efec; border-radius: 9px 9px 3px 9px; color: #405049; }

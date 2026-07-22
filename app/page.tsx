@@ -903,15 +903,20 @@ const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, s
       const canvas = canvasRef.current;
       const textContainer = textRef.current;
       if (!canvas || !textContainer) return;
-      const outputScale = Math.min(window.devicePixelRatio || 1, 2);
-      canvas.width = Math.floor(viewport.width * outputScale);
-      canvas.height = Math.floor(viewport.height * outputScale);
+      // 低 dpr 屏幕（Windows 100%/125% 缩放下 dpr=1~1.5）按 1:1 渲染文字会发虚：
+      // 至少 2 倍超采样再缩回显示，接近浏览器自带 PDF 查看器的清晰度；
+      // 同时限制画布总像素，防止超高缩放时画布超出浏览器面积/显存限制
+      const outputScale = Math.min(Math.max(window.devicePixelRatio || 1, 2), 2.5);
+      const pixelCap = Math.sqrt((4096 * 4096) / Math.max(1, viewport.width * viewport.height));
+      const finalScale = Math.max(1, Math.min(outputScale, pixelCap));
+      canvas.width = Math.floor(viewport.width * finalScale);
+      canvas.height = Math.floor(viewport.height * finalScale);
       canvas.style.width = `${viewport.width}px`;
       canvas.style.height = `${viewport.height}px`;
       setMeasured({ width: viewport.width / (1.25 * zoom), height: viewport.height / (1.25 * zoom) });
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
-      renderTask = page.render({ canvasContext: ctx, viewport, transform: outputScale === 1 ? null : [outputScale, 0, 0, outputScale, 0, 0] });
+      renderTask = page.render({ canvasContext: ctx, viewport, transform: finalScale === 1 ? null : [finalScale, 0, 0, finalScale, 0, 0] });
       await renderTask.promise;
       if (cancelled) return;
       textContainer.replaceChildren();

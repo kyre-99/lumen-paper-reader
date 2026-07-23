@@ -9,6 +9,7 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   CircleHelp,
   Cloud,
   CloudOff,
@@ -20,6 +21,7 @@ import {
   Highlighter,
   Hand,
   History,
+  Keyboard,
   Languages,
   Library,
   Link2,
@@ -28,6 +30,7 @@ import {
   Maximize2,
   MessageSquareText,
   Minus,
+  Moon,
   MoreHorizontal,
   PanelLeft,
   Palette,
@@ -36,11 +39,13 @@ import {
   Plus,
   Receipt,
   Scan,
+  Search,
   Send,
   Settings,
   Sparkles,
   Square,
   SquarePen,
+  Sun,
   Trash2,
   Type,
   Upload,
@@ -162,6 +167,8 @@ type Annotation = {
   // 本次会话内新建标记：只有新建批注的输入框自动聚焦，恢复工作区渲染的不抢焦点（持久化时剥离）
   fresh?: boolean;
 };
+// 批注类型的中文标签（右侧「笔记」汇总面板用）
+const ANNOTATION_KIND_LABELS: Record<Annotation["kind"], string> = { translate: "翻译", explain: "解释", ask: "提问", formula: "公式", figure: "图表", highlight: "高亮", "text-note": "批注" };
 type FormulaAnchor = { text: string; label?: string; pageNumber: number; pageX: number; pageY: number; regionX: number; regionY: number; regionWidth: number; regionHeight: number };
 // 框选图表的选区：region* 为相对页面的归一化坐标，barX/barY 为操作条的屏幕坐标
 type FigureRegionSelection = { pageNumber: number; regionX: number; regionY: number; regionWidth: number; regionHeight: number; barX: number; barY: number };
@@ -733,10 +740,10 @@ function demoAnswer(prompt: string, context?: string) {
 // Markdown/KaTeX 依赖较重，拆到 markdown-content.tsx 按需加载，不进首屏 bundle；
 // 加载期间先用纯文本占位（whitespace-pre-wrap），内容始终可读
 const MarkdownContentLazy = React.lazy(() => import("./markdown-content"));
-const MarkdownContent = React.memo(function MarkdownContent({ content, compact = false, onPageJump }: { content: string; compact?: boolean; onPageJump?: (page: number) => void }) {
+const MarkdownContent = React.memo(function MarkdownContent({ content, compact = false, maxPage, onPageJump }: { content: string; compact?: boolean; maxPage?: number; onPageJump?: (page: number) => void }) {
   return (
     <React.Suspense fallback={<div className={`markdown-content${compact ? " compact" : ""}`} style={{ whiteSpace: "pre-wrap" }}>{content}</div>}>
-      <MarkdownContentLazy content={content} compact={compact} onPageJump={onPageJump} />
+      <MarkdownContentLazy content={content} compact={compact} maxPage={maxPage} onPageJump={onPageJump} />
     </React.Suspense>
   );
 });
@@ -820,6 +827,7 @@ type PdfDocumentLike = { getPage: (pageNumber: number) => Promise<PdfPageLike> }
 type PdfPageLike = {
   getViewport: (input: { scale: number }) => { width: number; height: number };
   render: (input: Record<string, unknown>) => { promise: Promise<void>; cancel?: () => void };
+  getTextContent: () => Promise<{ items: Array<{ str?: unknown }> }>;
 };
 
 // 框选图表截图：按选区最长边约 1400px 渲染（缩放钳制 1-4 倍），白底 JPEG；渲染失败返回空串
@@ -1765,6 +1773,21 @@ export default function Home() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [uiFontSize, setUiFontSize] = useStoredPref<"compact" | "standard" | "large" | "xlarge">("lumen-ui-font-size", "standard", UI_FONT_SIZES);
   const [rightOpen, setRightOpen] = useState(true);
+  // 深色模式：localStorage 优先，缺省跟随系统 prefers-color-scheme；切换时才写回（未手动选择前保持跟随系统）
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    if (typeof window === "undefined") return "light";
+    const saved = window.localStorage.getItem("wenshu-theme");
+    if (saved === "light" || saved === "dark") return saved;
+    return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  });
+  useEffect(() => { document.documentElement.dataset.theme = theme; }, [theme]);
+  const toggleTheme = useCallback(() => {
+    setTheme((current) => {
+      const next = current === "dark" ? "light" : "dark";
+      window.localStorage.setItem("wenshu-theme", next);
+      return next;
+    });
+  }, []);
   const [panelWidth, setPanelWidth] = useState(394);
   const [panelResizing, setPanelResizing] = useState(false);
   const panelResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -1954,6 +1977,13 @@ export default function Home() {
   const thumbFlushTimerRef = useRef<number | null>(null);
   const textLayerReadyCountRef = useRef(0);
   const textLayerFlushTimerRef = useRef<number | null>(null);
+  // 论文内搜索：按页提取的文本缓存（按文档 key 区分，换论文自然重置）、丢弃过期搜索的序号、跳匹配后的待定位标记
+  const searchTextCacheRef = useRef<{ key: string; pages: Map<number, string> }>({ key: "", pages: new Map() });
+  const searchSeqRef = useRef(0);
+  const searchScrollPendingRef = useRef(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  // 右侧提问输入框：/ 快捷键聚焦用
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   // 自动保存：自增序号用于丢弃过期响应，快照用于跳过未变更的写回
   const saveSeqRef = useRef(0);
   const lastSavedSnapshotRef = useRef("");
@@ -1996,6 +2026,16 @@ export default function Home() {
   ]);
   const [conversations, setConversations] = useState<SavedConversation[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
+  // 右侧面板 tab：「对话」/「笔记」（批注汇总）；笔记 tab 内的类型筛选
+  const [panelTab, setPanelTab] = useState<"chat" | "notes">("chat");
+  const [notesFilter, setNotesFilter] = useState<"all" | "highlight" | "note" | "ai">("all");
+  // 论文内搜索：matches 为命中的 {页码, 页内第几个} 列表，active 为当前所在下标
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchMatches, setSearchMatches] = useState<Array<{ page: number; ordinal: number }>>([]);
+  const [searchActive, setSearchActive] = useState(0);
+  // 快捷键帮助浮层（? 开关）
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
   // 文本层就绪批量上报：约 200ms 合并成一次 textLayerVersion 递增，避免每页一次整树渲染
   const handleTextLayerReady = useCallback(() => {
@@ -2084,6 +2124,20 @@ export default function Home() {
     }, 480);
   }, [goToPage]);
 
+  // 笔记面板点击条目：跳到批注所在页，并给对应的 inline 卡片 / 文字批注 / 图钉加一圈临时闪烁描边
+  const jumpToAnnotation = useCallback((annotation: Annotation) => {
+    setCurrentPage(annotation.pageNumber);
+    scrollToPage(annotation.pageNumber, "auto");
+    window.setTimeout(() => {
+      // 优先闪已打开的 inline 卡片/文字批注；批注收起着闪锚点图钉
+      const target = readerRef.current?.querySelector(`.inline-card[data-annotation-id="${annotation.id}"], .pdf-text-note[data-annotation-id="${annotation.id}"]`)
+        || readerRef.current?.querySelector(`[data-annotation-id="${annotation.id}"]`);
+      if (!target) return;
+      target.classList.add("annotation-flash");
+      window.setTimeout(() => target.classList.remove("annotation-flash"), 1900);
+    }, 120);
+  }, [scrollToPage]);
+
   // 键盘翻页：←/→/PageUp/PageDown；焦点在输入控件内、带修饰键或有模态框打开时不响应
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -2097,6 +2151,164 @@ export default function Home() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [currentPage, goToPage, libraryOpen, openModal, settingsOpen, statsOpen, usageOpen]);
+
+  // ===== 论文内全文搜索 =====
+  // 换论文时清空搜索状态（与页码输入框同款的渲染期同步写法）
+  const searchDocKey = typeof source === "string" ? source : source ? "file" : "";
+  const [searchSyncedKey, setSearchSyncedKey] = useState(searchDocKey);
+  if (searchSyncedKey !== searchDocKey) {
+    setSearchSyncedKey(searchDocKey);
+    if (searchQuery || searchMatches.length) {
+      setSearchQuery("");
+      setSearchMatches([]);
+      setSearchActive(0);
+    }
+    // 换论文时笔记面板自动切回「对话」tab
+    if (panelTab !== "chat") setPanelTab("chat");
+  }
+
+  const openSearch = useCallback(() => {
+    setSearchOpen(true);
+    window.setTimeout(() => { searchInputRef.current?.focus(); searchInputRef.current?.select(); }, 30);
+  }, []);
+
+  // 跳到第 index 个匹配：先滚到目标页（占位元素也带 data-page-number，虚拟化下同样成立），
+  // 等该页 textLayer 就绪后由下方高亮效果把命中 span 滚到视口中央
+  const jumpToSearchMatch = useCallback((index: number, matches: Array<{ page: number; ordinal: number }>) => {
+    const match = matches[index];
+    if (!match) return;
+    setSearchActive(index);
+    setCurrentPage(match.page);
+    scrollToPage(match.page, "auto");
+    searchScrollPendingRef.current = true;
+  }, [scrollToPage]);
+
+  const stepSearch = useCallback((delta: number) => {
+    if (!searchMatches.length) return;
+    jumpToSearchMatch((searchActive + delta + searchMatches.length) % searchMatches.length, searchMatches);
+  }, [searchActive, searchMatches, jumpToSearchMatch]);
+
+  // 页面虚拟化，不能依赖 DOM 搜索：用 pdfjs 按页提取文本（结果进缓存，二次搜索即时），
+  // 大小写不敏感匹配出 {页码, 页内第几个} 列表；序号机制丢弃被新搜索覆盖的过期结果
+  const runSearch = useCallback(async (rawQuery: string) => {
+    const seq = ++searchSeqRef.current;
+    const query = rawQuery.trim().toLowerCase();
+    const pdf = pdfRef.current;
+    if (!query || !pdf) { setSearchMatches([]); setSearchActive(0); return; }
+    const cache = searchTextCacheRef.current;
+    if (cache.key !== searchDocKey) { cache.key = searchDocKey; cache.pages = new Map(); }
+    const matches: Array<{ page: number; ordinal: number }> = [];
+    // 每批 6 页并发提取，与全文提取同款节奏；批间检查序号
+    for (let batchStart = 1; batchStart <= pageCount; batchStart += 6) {
+      await Promise.all(Array.from({ length: Math.min(6, pageCount - batchStart + 1) }, (_, index) => (async () => {
+        const pageNumber = batchStart + index;
+        let text = cache.pages.get(pageNumber);
+        if (text === undefined) {
+          try {
+            const page = await pdf.getPage(pageNumber);
+            const content = await page.getTextContent();
+            text = content.items.map((item) => String(item.str || "")).join(" ");
+          } catch { text = ""; }
+          cache.pages.set(pageNumber, text);
+        }
+        const lower = text.toLowerCase();
+        let ordinal = 0;
+        let hit = lower.indexOf(query);
+        while (hit >= 0) {
+          matches.push({ page: pageNumber, ordinal });
+          ordinal += 1;
+          hit = lower.indexOf(query, hit + query.length);
+        }
+      })()));
+      if (searchSeqRef.current !== seq) return;
+    }
+    matches.sort((a, b) => a.page - b.page || a.ordinal - b.ordinal);
+    setSearchMatches(matches);
+    if (matches.length) jumpToSearchMatch(0, matches);
+    else setSearchActive(0);
+  }, [pageCount, searchDocKey, jumpToSearchMatch]);
+
+  // 输入停顿约 220ms 后再跑搜索，避免逐字符触发全页文本提取
+  useEffect(() => {
+    if (!searchOpen) return;
+    const timer = window.setTimeout(() => void runSearch(searchQuery), 220);
+    return () => window.clearTimeout(timer);
+  }, [searchOpen, searchQuery, runSearch]);
+
+  // 把当前搜索的命中标到已渲染的 textLayer 上：含查询串的 span 加 .search-hit，当前匹配加 .search-hit-active。
+  // textLayer 随缩放/虚拟化重建，所以挂在 textLayerVersion 上，每次重建后重放一遍；
+  // 页内序号按 span 级命中数近似对应（跨 span 的命中无法整段高亮，序号可能轻微漂移）
+  useEffect(() => {
+    const reader = readerRef.current;
+    if (!reader) return;
+    reader.querySelectorAll(".search-hit").forEach((el) => el.classList.remove("search-hit", "search-hit-active"));
+    const query = searchQuery.trim().toLowerCase();
+    if (!searchOpen || !query || !searchMatches.length) return;
+    const active = searchMatches[Math.min(searchActive, searchMatches.length - 1)];
+    for (const page of new Set(searchMatches.map((match) => match.page))) {
+      const layer = pageElsRef.current.get(page)?.querySelector(".textLayer");
+      if (!layer) continue;
+      let occurrence = 0;
+      for (const span of Array.from(layer.querySelectorAll("span"))) {
+        const text = (span.textContent || "").toLowerCase();
+        let hit = text.indexOf(query);
+        if (hit < 0) continue;
+        while (hit >= 0) {
+          if (page === active.page && occurrence === active.ordinal) {
+            span.classList.add("search-hit-active");
+            // 跳转后把命中滚到视口中央；目标页尚未渲染时标记保留，textLayer 重建后补滚
+            if (searchScrollPendingRef.current) {
+              searchScrollPendingRef.current = false;
+              span.scrollIntoView({ block: "center" });
+            }
+          }
+          occurrence += 1;
+          hit = text.indexOf(query, hit + query.length);
+        }
+        span.classList.add("search-hit");
+      }
+    }
+  }, [searchOpen, searchQuery, searchMatches, searchActive, textLayerVersion]);
+
+  // / 快捷键：聚焦右侧提问框；面板收起时先展开（动画约 .34s，等展开完再聚焦）
+  const focusComposer = useCallback(() => {
+    if (!rightOpen) setRightOpen(true);
+    if (historyOpen) setHistoryOpen(false);
+    window.setTimeout(() => composerRef.current?.focus(), rightOpen ? 30 : 380);
+  }, [rightOpen, historyOpen]);
+
+  // 全局快捷键：Ctrl/Cmd+F 搜索、/ 聚焦提问、? 快捷键帮助、Esc 按层级关闭最上层浮层
+  // （搜索框 → 引用气泡 → 划词工具条/右键菜单 → 帮助浮层）；
+  // 焦点在输入控件内时除 Esc 与 Ctrl/Cmd+F 外都不触发；模态框打开时让模态自己的 Esc 处理接管
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (openModal || libraryOpen || settingsOpen || usageOpen || statsOpen) return;
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "f") {
+        if (!source) return; // 演示页没有可检索的 PDF，把浏览器自带查找留给用户
+        event.preventDefault();
+        setShortcutsOpen(false);
+        openSearch();
+        return;
+      }
+      if (event.key === "Escape") {
+        if (searchOpen) { setSearchOpen(false); return; }
+        if (citationPopover) { setCitationPopover(null); return; }
+        if (selectionPos) { setSelectionPos(null); setSelectionRects([]); window.getSelection()?.removeAllRanges(); return; }
+        if (pdfContextMenu) { setPdfContextMenu(null); return; }
+        if (shortcutsOpen) { setShortcutsOpen(false); return; }
+        return;
+      }
+      // 帮助浮层打开时，其余按键不穿透到阅读器
+      if (shortcutsOpen) { if (event.key === "?") setShortcutsOpen(false); return; }
+      const target = event.target as HTMLElement | null;
+      if (target && (target.closest("input, textarea, select") || target.isContentEditable)) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      if (event.key === "/") { event.preventDefault(); focusComposer(); }
+      else if (event.key === "?") { event.preventDefault(); setShortcutsOpen((open) => !open); }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [citationPopover, focusComposer, libraryOpen, openModal, openSearch, pdfContextMenu, searchOpen, selectionPos, settingsOpen, shortcutsOpen, source, statsOpen, usageOpen]);
 
   // 打开/恢复论文后，等文本层渲染出来再滚动到上次阅读页
   useEffect(() => {
@@ -2662,14 +2874,6 @@ export default function Home() {
       }, 2100);
     }, 380);
   }, [scrollToPage]);
-
-  // ESC 关闭引用气泡；缩放会重排文本层，直接收起
-  useEffect(() => {
-    if (!citationPopover) return;
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setCitationPopover(null); };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [citationPopover]);
 
   // 缩放会重排文本层：渲染期间检测到 zoom 变化就收起气泡与闪烁（与页码输入框同款同步写法）
   const [citationZoomSyncedTo, setCitationZoomSyncedTo] = useState(zoom);
@@ -3636,6 +3840,15 @@ export default function Home() {
     setToast({ text: "笔记已导出为 Markdown" });
   }, [annotations, conversations, messages, paperTitle]);
 
+  // 笔记面板：按筛选条件过滤后按页码升序（同页按创建先后）
+  const visibleNotes = annotations
+    .filter((annotation) => notesFilter === "all"
+      || (notesFilter === "highlight" && annotation.kind === "highlight")
+      || (notesFilter === "note" && annotation.kind === "text-note")
+      || (notesFilter === "ai" && annotation.kind !== "highlight" && annotation.kind !== "text-note"))
+    .slice()
+    .sort((a, b) => a.pageNumber - b.pageNumber || a.id - b.id);
+
   // 当前气泡对应的文献条目与同年条目数；未解析到时为 null，由 JSX 展示「未找到」
   let citationEntry: { text: string; page: number; index?: number } | null = null;
   let citationSameYearCount = 0;
@@ -3661,6 +3874,7 @@ export default function Home() {
         </nav>
         <div className="rail-bottom">
           <RailButton icon={<CircleHelp size={20} />} label="使用帮助" onClick={() => setToast({ text: "提示：先选中文字，再选择翻译或解释" })} />
+          <RailButton icon={theme === "dark" ? <Sun size={20} /> : <Moon size={20} />} label={theme === "dark" ? "切换浅色模式" : "切换深色模式"} onClick={toggleTheme} />
           <div className="font-menu">
             <RailButton icon={<Type size={20} />} label="界面字号" active={fontMenuOpen} onClick={() => setFontMenuOpen(!fontMenuOpen)} />
             {fontMenuOpen && <>
@@ -3711,12 +3925,24 @@ export default function Home() {
           <div className="toolbar-divider" />
           <div className="toolbar-group"><button className="icon-button small" aria-label="缩小" title="缩小" onClick={() => setZoom(Math.max(.55, zoom - .1))}><ZoomOut size={17} /></button><button className="zoom-label" title="恢复 100% 缩放" onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button><button className="icon-button small" aria-label="放大" title="放大" onClick={() => setZoom(Math.min(1.8, zoom + .1))}><ZoomIn size={17} /></button></div>
           {source && <><div className="toolbar-divider" /><div className="toolbar-group"><button className={`icon-button small ${thumbsOpen === "show" ? "active" : ""}`} aria-label={thumbsOpen === "show" ? "隐藏缩略图" : "显示缩略图"} title={thumbsOpen === "show" ? "隐藏缩略图栏" : "显示缩略图栏"} onClick={() => setThumbsOpen(thumbsOpen === "show" ? "hide" : "show")}><PanelLeft size={17} /></button></div></>}
+          {source && <><div className="toolbar-divider" /><div className="toolbar-group"><button className={`icon-button small ${searchOpen ? "active" : ""}`} aria-label="在论文中搜索" title="在论文中搜索（Ctrl/⌘+F）" onClick={() => (searchOpen ? setSearchOpen(false) : openSearch())}><Search size={17} /></button></div></>}
           <div className="toolbar-spacer" />
           <button className={`icon-button small ${panMode ? "active" : ""}`} aria-label={panMode ? "切换到选择模式" : "切换到抓手平移模式"} title={panMode ? "选择模式：划词翻译/高亮" : "抓手模式：左键拖动平移页面"} onClick={() => { setPanMode(!panMode); setToast({ text: panMode ? "已切回选择模式，可以划词标注" : "抓手模式：按住左键拖动页面，中键也可随时拖动" }); }}><Hand size={17} /></button>
           {source && <button className={`icon-button small ${formulaAssist === "show" ? "active" : ""}`} aria-label={formulaAssist === "show" ? "隐藏公式按钮" : "显示公式按钮"} title={formulaAssist === "show" ? "隐藏页面上的「问公式」按钮" : "显示页面上的「问公式」按钮"} onClick={() => setFormulaAssist(formulaAssist === "show" ? "hide" : "show")}><Sparkles size={17} /></button>}
           {source && <button className={`icon-button small ${figureLasso ? "active" : ""}`} aria-label={figureLasso ? "退出框选图表" : "框选图表"} title={figureLasso ? "退出框选模式（ESC 或再次点击）" : "框选图表：在页面上拖出矩形，向 AI 询问图表内容"} onClick={() => { setFigureLasso(!figureLasso); setFigureRegion(null); setLassoRect(null); lassoStartRef.current = null; lassoRectRef.current = null; }}><Scan size={17} /></button>}
           <button className="icon-button small" aria-label="全屏" title="切换全屏" onClick={toggleFullscreen}><Maximize2 size={17} /></button>
         </div>
+
+        {searchOpen && (
+          <div className="search-bar" role="search">
+            <Search size={15} />
+            <input ref={searchInputRef} value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); stepSearch(event.shiftKey ? -1 : 1); } }} placeholder="在论文中搜索…" aria-label="在论文中搜索" />
+            <span className="search-count">{searchQuery.trim() ? (searchMatches.length ? `${searchActive + 1} / ${searchMatches.length}` : "无结果") : ""}</span>
+            <button className="icon-button small" onClick={() => stepSearch(-1)} disabled={!searchMatches.length} aria-label="上一个匹配" title="上一个（Shift+Enter）"><ChevronUp size={15} /></button>
+            <button className="icon-button small" onClick={() => stepSearch(1)} disabled={!searchMatches.length} aria-label="下一个匹配" title="下一个（Enter）"><ChevronDown size={15} /></button>
+            <button className="icon-button small" onClick={() => setSearchOpen(false)} aria-label="关闭搜索" title="关闭（Esc）"><X size={15} /></button>
+          </div>
+        )}
 
         <div className="reader-main">
           {source && thumbsOpen === "show" && (
@@ -3745,7 +3971,7 @@ export default function Home() {
             <div key={`formula-region-${annotation.id}`} className={`formula-annotation-region${annotation.kind === "figure" ? " figure" : ""}`} style={{ left: annotation.formulaRegionLeft, top: annotation.formulaRegionTop, width: annotation.formulaRegionPixelWidth, height: annotation.formulaRegionPixelHeight }} aria-hidden="true" />
           ))}
           {annotations.map((annotation) => annotation.kind === "text-note" ? (
-            <section key={annotation.id} className={`pdf-text-note ${draggingId === annotation.id ? "dragging" : ""}`} style={{ top: annotation.cardTop, left: annotation.cardLeft, color: annotation.textColor || "#9a5a16" }} onMouseDown={(event) => event.stopPropagation()}>
+            <section key={annotation.id} className={`pdf-text-note ${draggingId === annotation.id ? "dragging" : ""}`} data-annotation-id={annotation.id} style={{ top: annotation.cardTop, left: annotation.cardLeft, color: annotation.textColor || "#9a5a16" }} onMouseDown={(event) => event.stopPropagation()}>
               <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")}><span><MoreHorizontal size={13} />PDF 文字批注</span><button onClick={() => removeAnnotation(annotation.id)} aria-label="删除 PDF 批注"><X size={13} /></button></header>
               <textarea value={annotation.note || ""} onChange={(event) => updateAnnotation(annotation.id, { note: event.target.value })} placeholder="输入批注…" autoFocus={Boolean(annotation.fresh)} style={{ fontSize: annotation.fontSize || 14, color: annotation.textColor || "#9a5a16" }} />
               <footer>
@@ -3757,6 +3983,7 @@ export default function Home() {
             <React.Fragment key={annotation.id}>
               <button
                 className={`annotation-pin ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`}
+                data-annotation-id={annotation.id}
                 style={{ top: annotation.top, left: annotation.left }}
                 onPointerDown={(event) => startAnnotationDrag(event, annotation, "pin")}
                 onClick={() => annotation.open ? closeAnnotation(annotation) : openAnnotationFromPin(annotation)}
@@ -3792,7 +4019,7 @@ export default function Home() {
                     </div>
                   )}
                   {annotation.kind === "highlight" && <><p className="highlight-saved"><Check size={14} />已保存为{annotation.color === "yellow" ? "黄色" : annotation.color === "green" ? "绿色" : annotation.color === "blue" ? "蓝色" : "玫红色"}高亮</p><label className="highlight-note"><span>个人批注</span><textarea value={annotation.note || ""} onChange={(event) => updateAnnotation(annotation.id, { note: event.target.value })} placeholder="记录你对这段内容的想法…" rows={3} /></label></>}
-                  {annotation.thread.length > 0 && <div className="inline-thread">{annotation.thread.map((message) => <div key={message.id} className={`inline-message ${message.role}`}>{message.role === "assistant" ? <MarkdownContent content={message.content} compact onPageJump={handlePageJump} /> : <p>{message.content}</p>}</div>)}</div>}
+                  {annotation.thread.length > 0 && <div className="inline-thread">{annotation.thread.map((message) => <div key={message.id} className={`inline-message ${message.role}`}>{message.role === "assistant" ? <MarkdownContent content={message.content} compact maxPage={pageCount} onPageJump={handlePageJump} /> : <p>{message.content}</p>}</div>)}</div>}
                   {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />{annotation.loadingLabel || "正在结合相邻段落分析…"}</div>}
                   {annotation.kind !== "highlight" && !annotation.loading && (
                     <div className="inline-ask follow-up">
@@ -3817,17 +4044,45 @@ export default function Home() {
           <div className="ai-title"><div className="ai-glyph"><Sparkles size={17} /></div><div className="ai-title-text"><h2>全文 AI</h2><span>{extractingText ? (extractProgress ? `正在解析论文… ${extractProgress.done}/${extractProgress.total} 页` : "正在解析论文…") : paperText ? "已读入全文，随时提问" : "演示论文 · 可直接体验"}</span></div></div>
           <div className="ai-header-actions">
             <button className="icon-button small" onClick={exportNotes} aria-label="导出笔记" title="把批注和对话导出为 Markdown 文件"><Download size={15} /></button>
-            <button className={`icon-button small ${historyOpen ? "active" : ""}`} onClick={() => setHistoryOpen(!historyOpen)} aria-label="历史对话" title="查看历史对话"><History size={15} /></button>
+            <button className={`icon-button small ${historyOpen ? "active" : ""}`} onClick={() => { setPanelTab("chat"); setHistoryOpen(!historyOpen); }} aria-label="历史对话" title="查看历史对话"><History size={15} /></button>
             <button className="icon-button small" onClick={startNewChat} aria-label="开始新对话" title="当前对话存入历史，开始新对话"><SquarePen size={15} /></button>
             <button className="icon-button small" onClick={() => setRightOpen(false)} aria-label="收起 AI 面板" title="收起 AI 面板"><PanelRightClose size={16} /></button>
           </div>
         </header>
-        {!historyOpen && <div className="quick-actions">
+        <div className="panel-tabs">
+          <button className={panelTab === "chat" ? "active" : ""} onClick={() => setPanelTab("chat")}>对话</button>
+          <button className={panelTab === "notes" ? "active" : ""} onClick={() => setPanelTab("notes")}>笔记{annotations.length > 0 && <span className="panel-tab-count">{annotations.length}</span>}</button>
+        </div>
+        {panelTab === "chat" && !historyOpen && <div className="quick-actions">
           <button onClick={() => sendQuestion("请用三点总结这篇论文的核心贡献。")}>总结全文</button>
           <button onClick={() => sendQuestion("请解释这篇论文最重要的方法，并给出直觉理解。")}>解释方法</button>
           <button onClick={() => sendQuestion("请列出阅读这篇论文前需要了解的概念。")}>前置知识</button>
         </div>}
-        {historyOpen ? (
+        {panelTab === "notes" ? (
+          <div className="notes-panel">
+            <div className="notes-filters">
+              {([["all", "全部"], ["highlight", "高亮"], ["note", "批注"], ["ai", "AI 卡片"]] as const).map(([value, label]) => (
+                <button key={value} className={notesFilter === value ? "active" : ""} onClick={() => setNotesFilter(value)}>{label}</button>
+              ))}
+            </div>
+            {visibleNotes.length === 0 ? (
+              <div className="library-empty notes-empty"><Highlighter size={26} /><strong>{annotations.length ? "这个分类下还没有笔记" : "还没有笔记"}</strong><p>{annotations.length ? "切换到「全部」看看其他类型的笔记。" : "选中论文里的文字，划词翻译、高亮或提问后会出现在这里。"}</p></div>
+            ) : (
+              <div className="notes-list">
+                {visibleNotes.map((annotation) => (
+                  <div key={annotation.id} className="note-row" role="button" tabIndex={0} title="跳到原文位置" onClick={() => jumpToAnnotation(annotation)} onKeyDown={(event) => { if (event.key === "Enter") jumpToAnnotation(annotation); }}>
+                    <span className={`note-dot ${annotation.color}`} />
+                    <div className="note-row-body">
+                      <div className="note-row-head"><strong>{ANNOTATION_KIND_LABELS[annotation.kind]}</strong><span>第 {annotation.pageNumber} 页</span></div>
+                      <p>{(annotation.kind === "text-note" ? annotation.note : annotation.text || annotation.result)?.replace(/\s+/g, " ").trim() || "（暂无内容）"}</p>
+                    </div>
+                    <button className="note-row-delete" aria-label="删除这条笔记" title="删除这条笔记" onClick={(event) => { event.stopPropagation(); removeAnnotation(annotation.id); }}><Trash2 size={13} /></button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : historyOpen ? (
           <div className="chat-stream chat-history">
             <button className="history-back" onClick={() => setHistoryOpen(false)}><ChevronLeft size={14} />返回当前对话</button>
             {conversations.length === 0 && <div className="history-empty">还没有历史对话</div>}
@@ -3847,7 +4102,7 @@ export default function Home() {
               {message.role === "assistant" && <div className="message-avatar"><Sparkles size={14} /></div>}
               <div className="message-body">
                 {message.role === "assistant" && message.steps && message.steps.length > 0 && <div className="message-steps"><Zap size={11} /><span>{message.steps.join(" → ")}</span></div>}
-                {message.role === "assistant" ? (message.plain ? <p>{message.content}</p> : <MarkdownContent content={message.content} onPageJump={handlePageJump} />) : <p>{message.content}</p>}
+                {message.role === "assistant" ? (message.plain ? <p>{message.content}</p> : <MarkdownContent content={message.content} maxPage={pageCount} onPageJump={handlePageJump} />) : <p>{message.content}</p>}
                 {message.role === "assistant" && <div className="message-tools"><button aria-label="复制回答" onClick={async () => { await navigator.clipboard.writeText(message.content); setCopiedMessageId(message.id); window.setTimeout(() => setCopiedMessageId(null), 1500); }}>{copiedMessageId === message.id ? <Check size={13} /> : <Copy size={13} />}</button></div>}
               </div>
             </div>
@@ -3855,12 +4110,12 @@ export default function Home() {
           {loading && !streaming && <div className="message assistant"><div className="message-avatar"><Sparkles size={14} /></div><div className="thinking-wrap"><div className="thinking"><span /><span /><span /></div>{statusText && <div className="thinking-status"><Zap size={11} />{statusText}</div>}</div></div>}
         </div>
         )}
-        {!historyOpen && <div className="composer-wrap">
+        {panelTab === "chat" && !historyOpen && <div className="composer-wrap">
           <div className="composer-top-row">
             <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? (extractProgress ? `已解析 ${extractProgress.done}/${extractProgress.total} 页` : "解析中") : paperText ? "上下文已就绪" : "等待文字"}</small></div>
           </div>
           <div className="composer">
-            <textarea value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question); } }} placeholder="询问整篇论文…" rows={2} />
+            <textarea ref={composerRef} value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question); } }} placeholder="询问整篇论文…" rows={2} />
             <div className="composer-bottom"><span>Enter 发送 · Shift+Enter 换行</span>{loading
               ? <button onClick={stopChatStream} aria-label="停止生成" title="停止生成"><Square size={14} /></button>
               : <button onClick={() => sendQuestion(question)} disabled={!question.trim() || extractingText} aria-label="发送"><Send size={16} /></button>}
@@ -3923,6 +4178,24 @@ export default function Home() {
       {pdfContextMenu && <div className="pdf-context-menu" style={{ left: pdfContextMenu.x, top: pdfContextMenu.y }} onMouseDown={(event) => event.stopPropagation()}>
         <button onClick={createPdfTextNote}><MessageSquareText size={15} /><span><strong>添加文字批注</strong><small>写在当前 PDF 位置</small></span></button>
       </div>}
+      {shortcutsOpen && (
+        <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShortcutsOpen(false); }}>
+          <div className="modal-card shortcuts-card" role="dialog" aria-modal="true" aria-label="键盘快捷键">
+            <button className="icon-button modal-close" onClick={() => setShortcutsOpen(false)} aria-label="关闭" title="关闭（Esc）"><X size={16} /></button>
+            <div className="modal-icon"><Keyboard size={20} /></div>
+            <h2>键盘快捷键</h2>
+            <p>双手不离开键盘，也能读完一篇论文。</p>
+            <ul className="shortcut-list">
+              <li><span className="shortcut-keys"><kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>⌘</kbd>+<kbd>F</kbd></span><em>在论文中搜索</em></li>
+              <li><span className="shortcut-keys"><kbd>/</kbd></span><em>聚焦提问输入框</em></li>
+              <li><span className="shortcut-keys"><kbd>←</kbd> / <kbd>→</kbd></span><em>上一页 / 下一页</em></li>
+              <li><span className="shortcut-keys"><kbd>Enter</kbd> / <kbd>Shift</kbd>+<kbd>Enter</kbd></span><em>搜索时：下一个 / 上一个匹配</em></li>
+              <li><span className="shortcut-keys"><kbd>Esc</kbd></span><em>关闭当前浮层</em></li>
+              <li><span className="shortcut-keys"><kbd>?</kbd></span><em>打开 / 关闭本帮助</em></li>
+            </ul>
+          </div>
+        </div>
+      )}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
       {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} onDeletePaper={deleteLibraryPaper} onRenameFolder={renameLibraryFolder} onDeleteFolder={deleteLibraryFolder} />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} visionConfig={visionConfig} setVisionConfig={setVisionConfig} />}

@@ -1,10 +1,26 @@
 @echo off
-chcp 65001 >nul
 cd /d "%~dp0"
+
+REM Çé¿ö 1£º·þÎñÒÑÔÚ½¡¿µÔËÐÐ£¨±ÈÈçÖØ¸´Ë«»÷£©¡ª¡ªÖ±½Ó´ò¿ªä¯ÀÀÆ÷£¬²»ÖØ¸´Æô¶¯
+curl -sf -o nul --max-time 2 http://localhost:3939/ >nul 2>&1
+if not errorlevel 1 (
+  echo ÎÄÊà·þÎñÒÑÔÚÔËÐÐ£¬Ö±½ÓÎªÄã´ò¿ªä¯ÀÀÆ÷¡£
+  start "" http://localhost:3939/
+  timeout /t 3 >nul
+  exit /b 0
+)
+
+REM Çé¿ö 2£º¶Ë¿Ú±»ÉÏ´Î²ÐÁôµÄÒì³£½ø³Ì£¨½©Ê¬£©Õ¼ÓÃ¡ª¡ªÏÈÇåÀíÔÙÆô¶¯
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":3939 " ^| findstr "LISTENING"') do (
+  echo ¼ì²âµ½ 3939 ¶Ë¿Ú±»Òì³£²ÐÁô½ø³ÌÕ¼ÓÃ£¬ÕýÔÚ×Ô¶¯ÇåÀí...
+  taskkill /PID %%a /F >nul 2>&1
+)
+
+REM Çé¿ö 3£ºÕý³£Æô¶¯
 echo ============================================
-echo   æ–‡æž¢ Wenshu é˜…è¯»å™¨å¯åŠ¨ä¸­...
-echo   æœåŠ¡å°±ç»ªåŽæµè§ˆå™¨ä¼šè‡ªåŠ¨æ‰“å¼€ã€‚
-echo   å…³é—­æœ¬çª—å£å³å¯åœæ­¢é˜…è¯»å™¨ã€‚
+echo   ÎÄÊà Wenshu ÔÄ¶ÁÆ÷Æô¶¯ÖÐ...
+echo   ·þÎñ¾ÍÐ÷ºóä¯ÀÀÆ÷»á×Ô¶¯´ò¿ª¡£
+echo   ¹Ø±Õ±¾´°¿Ú¼´¿ÉÍ£Ö¹ÔÄ¶ÁÆ÷¡£
 echo ============================================
 echo.
 start "" /min powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\open-browser.ps1"

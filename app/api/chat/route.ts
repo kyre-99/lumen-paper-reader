@@ -59,10 +59,14 @@ function chunkPaper(fullText: string): Chunk[] {
     const lines = body.split("\n").map((line) => line.trim()).filter(Boolean);
     let buffer: string[] = [];
     let heading = "";
+    // 相邻分块回叠约 160 字符：关键句被切在两个分块边界时，两半至少有一块能完整检出
+    let overlap = "";
     const flush = () => {
-      const text = buffer.join(" ").replace(/\s+/g, " ").trim();
+      const bodyText = buffer.join(" ").replace(/\s+/g, " ").trim();
       buffer = [];
+      const text = (overlap + bodyText).trim();
       if (text.length > 40) chunks.push({ id: id++, page, heading, text });
+      overlap = bodyText ? `${bodyText.slice(-160)} ` : "";
     };
     for (const line of lines) {
       const looksHeading = line.length <= 80 && !/[.。;；,，:：]$/.test(line) && /[A-Za-z\u4e00-\u9fff]/.test(line);
@@ -167,6 +171,26 @@ function cleanHistory(history: unknown, limit: number) {
     .map((item) => ({ role: item.role, content: item.content.slice(0, 12000) }));
 }
 
+// 给检索规划器的对话背景：最近三轮的简短摘录，用于消解"它/这个/上述"等追问指代
+function historyDigest(history: Array<{ role: string; content: string }>) {
+  return history
+    .slice(-6)
+    .map((item) => `${item.role === "user" ? "问" : "答"}：${item.content.slice(0, 200)}`)
+    .join("\n");
+}
+
+// 组装参考片段：按分块边界截断，不把最后一块拦腰切断；至少保留一块
+function buildReference(gathered: Map<number, Chunk>, budget: number) {
+  const ordered = [...gathered.values()].sort((a, b) => a.page - b.page || a.id - b.id);
+  let out = "";
+  for (const chunk of ordered) {
+    const block = `【P${chunk.page}${chunk.heading ? ` · ${chunk.heading}` : ""}】${chunk.text}\n\n`;
+    if (out && out.length + block.length > budget) break;
+    out += block;
+  }
+  return out.trim();
+}
+
 async function complete(target: URL, apiKey: string, payload: Record<string, unknown>, meter?: TokenMeter): Promise<string> {
   const response = await fetch(target.toString(), {
     method: "POST",
@@ -218,14 +242,14 @@ async function* streamCompletion(target: URL, apiKey: string, payload: Record<st
   }
 }
 
-async function planRetrieval(target: URL, apiKey: string, model: string, question: string, meter?: TokenMeter) {
+async function planRetrieval(target: URL, apiKey: string, model: string, question: string, historyContext: string, meter?: TokenMeter) {
   const content = await complete(target, apiKey, {
     model,
     temperature: 0,
     max_tokens: 220,
     messages: [
-      { role: "system", content: `你是检索规划器。用户正在阅读一篇英文论文并提问。输出 JSON：{"queries":["..."],"broad":false}。queries 给 3-5 个检索词，中英文都要有，英文用论文中最可能出现的专业术语；broad 仅当问题要求总结/概括/评价整篇论文时为 true。只输出 JSON。` },
-      { role: "user", content: question },
+      { role: "system", content: `你是检索规划器。用户正在阅读一篇英文论文并提问。输出 JSON：{"queries":["..."],"broad":false}。queries 给 3-5 个检索词，中英文都要有，英文用论文中最可能出现的专业术语；broad 仅当问题要求总结/概括/评价整篇论文时为 true。若问题带"它/这个/上述/他们"等指代，先结合对话记录把指代还原成具体内容，再生成检索词。只输出 JSON。` },
+      { role: "user", content: `${historyContext ? `对话记录：\n${historyContext}\n\n` : ""}当前问题：${question}` },
     ],
   }, meter);
   const parsed = parseJsonObject(content);
@@ -293,7 +317,8 @@ async function runAgentLoop(
       found.forEach((chunk) => gathered.set(chunk.id, chunk));
       send({ type: "step", label: `阅读 ${wanted.map((page) => `P${page}`).join("、")} 的完整内容` });
       messages.push({ role: "assistant", content: reply });
-      messages.push({ role: "user", content: found.length ? `已把 ${pagesLabel(found)} 的完整片段加入资料。继续 search/read，或 answer。` : "这些页已经在资料里了。继续 search/read，或 answer。" });
+      // 附上内容预览，让 Agent 能据此判断资料是否足够，而不是只看页码盲猜
+      messages.push({ role: "user", content: found.length ? `已把 ${pagesLabel(found)} 的完整片段加入资料。内容预览：\n${found.map((chunk) => `#${chunk.id} P${chunk.page}\n${chunk.text.slice(0, 300)}`).join("\n")}\n\n继续 search/read，或 answer。` : "这些页已经在资料里了。继续 search/read，或 answer。" });
     } else {
       return;
     }
@@ -343,6 +368,9 @@ export async function POST(request: NextRequest) {
     const globalPrompt = String(systemPrompts?.global || savedSettings?.globalSystemPrompt || DEFAULT_PROMPTS.global).trim().slice(0, 12000) || DEFAULT_PROMPTS.global;
     const inlinePrompt = String(systemPrompts?.inline || savedSettings?.inlineSystemPrompt || DEFAULT_PROMPTS.inline).trim().slice(0, 12000) || DEFAULT_PROMPTS.inline;
     const historyMessages = cleanHistory(history, 10);
+    // 参考片段预算随对话历史长度收缩：历史最多挤占 1 万字符，保底 8000
+    const historyChars = historyMessages.reduce((sum, item) => sum + item.content.length, 0);
+    const referenceBudget = Math.max(8000, MAX_REFERENCE_CHARS - Math.min(historyChars, 10000));
     const meter: TokenMeter = { prompt: 0, completion: 0 };
 
     const encoder = new TextEncoder();
@@ -373,7 +401,7 @@ export async function POST(request: NextRequest) {
             if (chunks.length && level !== "medium") {
               let queries = [questionText, String(selectedText).slice(0, 120)];
               try {
-                const plan = await planRetrieval(target, resolvedApiKey, resolvedModel, questionText, meter);
+                const plan = await planRetrieval(target, resolvedApiKey, resolvedModel, questionText, historyDigest(historyMessages), meter);
                 if (plan.queries.length) queries = plan.queries;
               } catch { /* 检索规划失败时退回原问题 */ }
               send({ type: "step", label: `在全文中检索：${queries.slice(0, 2).join(" / ")}` });
@@ -384,11 +412,10 @@ export async function POST(request: NextRequest) {
                 await runAgentLoop(target, resolvedApiKey, resolvedModel, questionText, chunks, gathered, send, meter);
               }
             }
-            const reference = [...gathered.values()]
-              .sort((a, b) => a.page - b.page || a.id - b.id)
-              .map((chunk) => `【P${chunk.page}${chunk.heading ? ` · ${chunk.heading}` : ""}】${chunk.text}`)
-              .join("\n\n")
-              .slice(0, MAX_REFERENCE_CHARS);
+            // 全局锚点：非快速档时始终带上论文开头（摘要/引言），保证回答有全局语境；
+            // 快速档刻意只用选区+相邻原文，不注入额外内容
+            if (chunks.length && level !== "medium" && !gathered.has(chunks[0].id)) gathered.set(chunks[0].id, chunks[0]);
+            const reference = buildReference(gathered, referenceBudget);
             const referenceBlock = reference ? `\n\n另外，我还从论文其他位置检索到这些相关内容：\n<paper_reference>\n${reference}\n</paper_reference>` : "";
             const messages = [
               { role: "system", content: renderSystemPrompt(inlinePrompt, title) + INLINE_CONTRACT },
@@ -407,7 +434,7 @@ export async function POST(request: NextRequest) {
               // medium（快速档）：零额外模型调用，直接用原问题做本地检索，保证最快最便宜
               if (level !== "medium") {
                 try {
-                  const plan = await planRetrieval(target, resolvedApiKey, resolvedModel, questionText, meter);
+                  const plan = await planRetrieval(target, resolvedApiKey, resolvedModel, questionText, historyDigest(historyMessages), meter);
                   if (plan.queries.length) queries = plan.queries;
                   broad = broad || plan.broad;
                 } catch { /* 检索规划失败时退回原问题 */ }
@@ -439,11 +466,9 @@ export async function POST(request: NextRequest) {
               }
             }
 
-            const reference = [...gathered.values()]
-              .sort((a, b) => a.page - b.page || a.id - b.id)
-              .map((chunk) => `【P${chunk.page}${chunk.heading ? ` · ${chunk.heading}` : ""}】${chunk.text}`)
-              .join("\n\n")
-              .slice(0, MAX_REFERENCE_CHARS);
+            // 全局锚点：无论问题多具体，始终带上论文开头（摘要/引言），保证回答有全局语境
+            if (chunks.length && !gathered.has(chunks[0].id)) gathered.set(chunks[0].id, chunks[0]);
+            const reference = buildReference(gathered, referenceBudget);
             const messages = [
               { role: "system", content: renderSystemPrompt(globalPrompt, title) + ANSWER_CONTRACT },
               ...historyMessages,

@@ -44,9 +44,15 @@ export default defineConfig(async () => {
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
   return {
-    server: isCodexSeatbeltSandbox
-      ? { watch: { useFsEvents: false, usePolling: true } }
-      : undefined,
+    // 端口在 package.json 的 dev/start 脚本里通过 -p 3939 固定（vinext CLI
+    // 不读 vite 配置的 server.port）。这里只锁 strictPort：端口被占时直接
+    // 报错退出而不是顺延，避免服务悄悄跑到别的端口导致 PWA 失联。
+    server: {
+      strictPort: true,
+      ...(isCodexSeatbeltSandbox
+        ? { watch: { useFsEvents: false, usePolling: true } }
+        : {}),
+    },
     plugins: [
       vinext(),
       sites(),

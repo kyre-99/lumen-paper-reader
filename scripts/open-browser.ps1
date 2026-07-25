@@ -1,5 +1,5 @@
-# 等待本地服务就绪后自动打开浏览器（端口被占用时 vinext 会顺延，故扫描 3000-3005）
-$ports = 3000..3005
+# 等待本地服务就绪后自动打开浏览器（端口固定为 3939，见 vite.config.ts strictPort）
+$ports = @(3939)
 $deadline = (Get-Date).AddMinutes(2)
 
 while ((Get-Date) -lt $deadline) {

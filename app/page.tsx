@@ -3107,6 +3107,15 @@ export default function Home() {
     updateAnnotation(annotation.id, { open: false });
   }, [refreshHighlights, updateAnnotation]);
 
+  // 左键点击阅读区其他位置时收起展开的批注卡片，省去专门点关闭按钮
+  // （卡片自身的 mousedown 已 stopPropagation 不会走到这里；批注图标有自己的开合逻辑，排除）
+  const handleReaderMouseDown = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.button === 0 && !(event.target as HTMLElement).closest(".inline-card, .annotation-pin")) {
+      annotations.forEach((annotation) => { if (annotation.open) closeAnnotation(annotation); });
+    }
+    handleSelectionStart(event);
+  }, [annotations, closeAnnotation, handleSelectionStart]);
+
   const openAnnotationFromPin = useCallback((annotation: Annotation) => {
     if (lastDraggedPinRef.current === annotation.id) return;
     const reader = readerRef.current;
@@ -3970,7 +3979,7 @@ export default function Home() {
             </aside>
           )}
           {source && thumbsOpen === "show" && <div className="thumb-resize-handle" style={{ left: thumbWidth - 4 }} onPointerDown={startThumbResize} title="拖动调整缩略图栏宽度" aria-label="拖动调整缩略图栏宽度" role="separator" aria-orientation="vertical" />}
-          <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}${panMode ? " pan-mode" : ""}${readerPanning ? " panning" : ""}${figureLasso ? " figure-lasso-mode" : ""}`} ref={readerRef} onPointerDown={handleReaderPointerDown} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleSelectionStart} onClick={handleCitationClick} onScroll={() => { if (selectionPos) setSelectionPos(null); if (citationPopover) setCitationPopover(null); if (figureRegion) setFigureRegion(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); const reader = readerRef.current; if (!reader || scrollFrameRef.current) return; scrollFrameRef.current = window.requestAnimationFrame(() => { scrollFrameRef.current = 0; const probe = reader.scrollTop + 42; let visiblePage = 1; for (const [page, el] of pageElsRef.current) { if (el.offsetTop <= probe) visiblePage = page; else break; } setCurrentPage((prev) => (prev === visiblePage ? prev : visiblePage)); }); }}>
+          <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}${panMode ? " pan-mode" : ""}${readerPanning ? " panning" : ""}${figureLasso ? " figure-lasso-mode" : ""}`} ref={readerRef} onPointerDown={handleReaderPointerDown} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleReaderMouseDown} onClick={handleCitationClick} onScroll={() => { if (selectionPos) setSelectionPos(null); if (citationPopover) setCitationPopover(null); if (figureRegion) setFigureRegion(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); const reader = readerRef.current; if (!reader || scrollFrameRef.current) return; scrollFrameRef.current = window.requestAnimationFrame(() => { scrollFrameRef.current = 0; const probe = reader.scrollTop + 42; let visiblePage = 1; for (const [page, el] of pageElsRef.current) { if (el.offsetTop <= probe) visiblePage = page; else break; } setCurrentPage((prev) => (prev === visiblePage ? prev : visiblePage)); }); }}>
           {source ? (
             <PdfDocument source={source} zoom={zoom} showFormula={formulaAssist === "show"} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextLayerReady={handleTextLayerReady} onTextExtracted={handleTextExtracted} onExtractProgress={handleExtractProgress} onError={handlePdfError} onThumbnail={handleThumbnail} onPdfReady={handlePdfInstance} registerRef={registerPageEl} registerThumbRequest={registerThumbRequest} skipExtraction={Boolean(paperText)} />
           ) : loadError ? (

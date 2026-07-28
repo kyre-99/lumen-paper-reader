@@ -1197,7 +1197,7 @@ function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => voi
   );
 }
 
-function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpenPaper, onAddPaper, onCreateFolder, onMovePaper, onSetStatus, onDeletePaper, onRenameFolder, onDeleteFolder }: { onClose: () => void; papers: LibraryPaper[]; folders: LibraryFolder[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void; onCreateFolder: (name: string) => Promise<LibraryFolder | null>; onMovePaper: (paperId: string, folderId: string | null) => Promise<boolean>; onSetStatus: (paperId: string, status: PaperStatus) => Promise<boolean>; onDeletePaper: (id: string) => Promise<boolean>; onRenameFolder: (id: string, name: string) => Promise<boolean>; onDeleteFolder: (id: string) => Promise<boolean> }) {
+function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpenPaper, onAddPaper, onCreateFolder, onMovePaper, onSetStatus, onDeletePaper, onRenamePaper, onRenameFolder, onDeleteFolder }: { onClose: () => void; papers: LibraryPaper[]; folders: LibraryFolder[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void; onCreateFolder: (name: string) => Promise<LibraryFolder | null>; onMovePaper: (paperId: string, folderId: string | null) => Promise<boolean>; onSetStatus: (paperId: string, status: PaperStatus) => Promise<boolean>; onDeletePaper: (id: string) => Promise<boolean>; onRenamePaper: (id: string, title: string) => Promise<boolean>; onRenameFolder: (id: string, name: string) => Promise<boolean>; onDeleteFolder: (id: string) => Promise<boolean> }) {
   const [activeFolder, setActiveFolder] = useState("all");
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [folderName, setFolderName] = useState("");
@@ -1257,6 +1257,7 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
                       <span className="library-copy"><strong>{paper.title}</strong></span>
                       <span className="library-open">{paper.id === activePaperId ? "正在阅读" : "打开"}</span>
                     </button>
+                    <button className="folder-action" aria-label={`重命名《${paper.title}》`} title="重命名论文（自动识别的标题有误时可以手动改）" onClick={() => { const title = window.prompt("论文标题", paper.title)?.trim(); if (title && title !== paper.title) void onRenamePaper(paper.id, title); }}><SquarePen size={14} /></button>
                     <button className="folder-action library-delete" aria-label={`删除《${paper.title}》`} title="删除论文（对话和批注一起删除）" onClick={() => { if (window.confirm(`确定删除《${paper.title}》吗？对话和批注会一起删除，无法恢复。`)) void onDeletePaper(paper.id); }}><Trash2 size={14} /></button>
                     <div className="library-meta-row">
                       <small>{paper.meta || `${paper.pageCount} 页`} · {new Date(paper.updatedAt).toLocaleDateString("zh-CN")}</small>
@@ -2799,6 +2800,8 @@ export default function Home() {
     if (!readerRef.current?.contains(range.commonAncestorContainer)) { setSelectionRects([]); return; }
     const readerRect = readerRef.current.getBoundingClientRect();
     const node = range.commonAncestorContainer.nodeType === Node.TEXT_NODE ? range.commonAncestorContainer.parentElement : range.commonAncestorContainer as HTMLElement;
+    // 在批注卡片/气泡等浮层内部划词时不弹出工具栏，避免对翻译结果再套一层「翻译/解释」
+    if (node?.closest?.(".inline-card, .pdf-text-note, .citation-popover, .pdf-context-menu, .selection-menu, .figure-lasso-actions, .formula-assist")) { setSelectionRects([]); return; }
     const contextRoot = node?.closest?.(".pdf-page, .demo-paper") as HTMLElement | null;
     const pageRect = contextRoot?.getBoundingClientRect();
     const rects = tightRangeClientRects(range, contextRoot);
@@ -3524,6 +3527,22 @@ export default function Home() {
     }
   }, []);
 
+  const renameLibraryPaper = useCallback(async (id: string, title: string) => {
+    try {
+      const response = await fetch(`/api/papers/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "论文重命名失败");
+      setLibraryPapers((papers) => papers.map((paper) => paper.id === id ? { ...paper, title, updatedAt: payload.paper?.updatedAt || paper.updatedAt } : paper));
+      // 改的是当前打开的论文：同步顶栏标题，否则下次工作区保存会把旧标题写回去
+      if (id === paperId) setPaperTitle(title);
+      setToast({ text: "论文已重命名" });
+      return true;
+    } catch (error: unknown) {
+      setToast({ text: errorMessage(error, "论文重命名失败"), kind: "error" });
+      return false;
+    }
+  }, [paperId]);
+
   const deleteLibraryPaper = useCallback(async (id: string) => {
     try {
       const response = await fetch(`/api/papers/${encodeURIComponent(id)}`, { method: "DELETE" });
@@ -4197,7 +4216,7 @@ export default function Home() {
         </div>
       )}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
-      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} onDeletePaper={deleteLibraryPaper} onRenameFolder={renameLibraryFolder} onDeleteFolder={deleteLibraryFolder} />}
+      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} onDeletePaper={deleteLibraryPaper} onRenamePaper={renameLibraryPaper} onRenameFolder={renameLibraryFolder} onDeleteFolder={deleteLibraryFolder} />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} visionConfig={visionConfig} setVisionConfig={setVisionConfig} />}
       {usageOpen && <UsageModal onClose={() => setUsageOpen(false)} stats={usageStats} loading={usageLoading} />}
       {statsOpen && <StatsModal onClose={() => setStatsOpen(false)} stats={readingStats} loading={statsLoading} onOpenPaper={(id) => { setStatsOpen(false); void openLibraryPaper(id); }} />}

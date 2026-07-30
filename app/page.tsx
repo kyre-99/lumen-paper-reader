@@ -448,13 +448,35 @@ const columnLayoutCache = new WeakMap<Element, boolean>();
 function isTwoColumnText(root: Element, rootRect: DOMRect) {
   const cached = columnLayoutCache.get(root);
   if (cached !== undefined) return cached;
+  // 先把文本片段合并成视觉行，按「行左边缘」聚类：标题/作者被拆成的碎片、缩进的摘要块
+  // 不会制造虚假的第二列簇；接近整页高的旋转水印（arXiv 侧边条）也直接排除
+  const lines: { top: number; bottom: number; left: number; right: number }[] = [];
+  const rects = Array.from(root.querySelectorAll("span"))
+    .filter((span) => span.getAttribute("role") !== "img")
+    .map((span) => span.getBoundingClientRect())
+    .filter((rect) => rect.width > 0 && rect.height > 0 && rect.height < rootRect.height * .4)
+    .sort((a, b) => a.top - b.top || a.left - b.left);
+  for (const rect of rects) {
+    const line = lines.find((item) => {
+      const verticalOverlap = Math.min(item.bottom, rect.bottom) - Math.max(item.top, rect.top);
+      const horizontalGap = Math.max(rect.left - item.right, item.left - rect.right, 0);
+      // 垂直重叠才算同一行；水平间隔过大（双栏的栏间距）必须拆成两条线，否则左右栏会并成一整行
+      return verticalOverlap > Math.min(item.bottom - item.top, rect.bottom - rect.top) * .5 && horizontalGap <= Math.max(4, Math.min(item.bottom - item.top, rect.bottom - rect.top) * .8);
+    });
+    if (line) {
+      line.top = Math.min(line.top, rect.top);
+      line.bottom = Math.max(line.bottom, rect.bottom);
+      line.left = Math.min(line.left, rect.left);
+      line.right = Math.max(line.right, rect.right);
+    } else {
+      lines.push({ top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right });
+    }
+  }
   // 双栏特征：大量行的左边缘聚集在两个相距很远的 x 位置（左栏边与右栏边）
   const bins = new Map<number, number>();
-  for (const span of Array.from(root.querySelectorAll("span"))) {
-    if (span.getAttribute("role") === "img") continue;
-    const rect = span.getBoundingClientRect();
-    if (!rect.width || !rect.height || rect.width > rootRect.width * .7) continue;
-    const bin = Math.round((rect.left - rootRect.left) / 24);
+  for (const line of lines) {
+    if (line.right - line.left > rootRect.width * .7) continue;
+    const bin = Math.round((line.left - rootRect.left) / 24);
     bins.set(bin, (bins.get(bin) || 0) + 1);
   }
   const clusters = [...bins.entries()].filter(([, count]) => count >= 4).map(([bin]) => bin).sort((a, b) => a - b);
@@ -488,23 +510,31 @@ function textCaretFromPoint(root: Element, x: number, y: number): TextCaret | nu
     if (accept) return { node: textNode, offset: Math.min(textNode.data.length, Math.max(0, Number(nativeOffset) || 0)) };
   }
 
-  let closest: { node: Text; rect: DOMRect; score: number } | null = null;
+  // 先按垂直距离锁定最近的文本行，再只在这一行内按水平距离选片段。
+  // 单栏论文里大多数行是整页宽的：若用 dy/dx 混合打分，指针横向越过短行（段落末行、标题）
+  // 时相邻整宽行总分更低，端点会被甩到别的行；行优先可以让端点稳稳钳在该行末尾
+  let bestDy = Infinity;
+  const candidates: { node: Text; dx: number }[] = [];
   for (const span of Array.from(root.querySelectorAll("span"))) {
     if (span.getAttribute("role") === "img") continue;
     const node = Array.from(span.childNodes).find((child): child is Text => child.nodeType === Node.TEXT_NODE && Boolean(child.textContent));
     if (!node) continue;
     const rect = span.getBoundingClientRect();
     if (!rect.width || !rect.height) continue;
+    // 跳过接近整页高的旋转水印（如 arXiv 侧边条）：它在任何 y 都「命中」，会把端点劫持到页边
+    if (rect.height > rootRect.height * .4) continue;
     if (twoColumn) {
       const spanSide = rect.left + rect.width / 2 < rootRect.left + rootRect.width / 2 ? -1 : 1;
       if (rect.width < rootRect.width * .65 && spanSide !== pointerSide) continue;
     }
     const dx = x < rect.left ? rect.left - x : x > rect.right ? x - rect.right : 0;
     const dy = y < rect.top ? rect.top - y : y > rect.bottom ? y - rect.bottom : 0;
-    const score = dy * 4 + dx;
-    if (!closest || score < closest.score) closest = { node, rect, score };
+    if (dy < bestDy) { bestDy = dy; candidates.length = 0; }
+    if (dy <= bestDy + 1.5) candidates.push({ node, dx });
   }
-  if (!closest) return null;
+  if (!candidates.length) return null;
+  let closest = candidates[0];
+  for (const candidate of candidates) if (candidate.dx < closest.dx) closest = candidate;
   return { node: closest.node, offset: textOffsetAtX(closest.node, x) };
 }
 

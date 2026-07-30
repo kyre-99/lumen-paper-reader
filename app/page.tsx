@@ -441,48 +441,50 @@ function textOffsetAtX(node: Text, x: number) {
   return node.data.length;
 }
 
-// 每个文本层是否为双栏排版的判定缓存。只有双栏页面才按「指针所在侧」过滤列；
-// 单栏论文里短行（宽度不足页面 65%）会被误判成栏，导致光标被甩到页面另一侧、选区突然暴涨
-const columnLayoutCache = new WeakMap<Element, boolean>();
+// 划词端点定位的统一几何模型：把文本片段合并成视觉行（垂直重叠且水平相连的片段算一行，
+// 双栏的栏间距会自然把两栏拆成不同的行），缓存相对文本层左上角的坐标——滚动不变；
+// 缩放会重排文本，宽度签名变化时重建。端点定位不再依赖「单栏/双栏」排版分类，
+// 单栏、双栏、缩进摘要、图文混排等各类模板行为一致
+type VisualLineSpan = { node: Text; left: number; right: number };
+type VisualLine = { top: number; bottom: number; left: number; right: number; spans: VisualLineSpan[] };
+const visualLineCache = new WeakMap<Element, { width: number; lines: VisualLine[] }>();
 
-function isTwoColumnText(root: Element, rootRect: DOMRect) {
-  const cached = columnLayoutCache.get(root);
-  if (cached !== undefined) return cached;
-  // 先把文本片段合并成视觉行，按「行左边缘」聚类：标题/作者被拆成的碎片、缩进的摘要块
-  // 不会制造虚假的第二列簇；接近整页高的旋转水印（arXiv 侧边条）也直接排除
-  const lines: { top: number; bottom: number; left: number; right: number }[] = [];
-  const rects = Array.from(root.querySelectorAll("span"))
-    .filter((span) => span.getAttribute("role") !== "img")
-    .map((span) => span.getBoundingClientRect())
-    .filter((rect) => rect.width > 0 && rect.height > 0 && rect.height < rootRect.height * .4)
-    .sort((a, b) => a.top - b.top || a.left - b.left);
-  for (const rect of rects) {
-    const line = lines.find((item) => {
-      const verticalOverlap = Math.min(item.bottom, rect.bottom) - Math.max(item.top, rect.top);
-      const horizontalGap = Math.max(rect.left - item.right, item.left - rect.right, 0);
-      // 垂直重叠才算同一行；水平间隔过大（双栏的栏间距）必须拆成两条线，否则左右栏会并成一整行
-      return verticalOverlap > Math.min(item.bottom - item.top, rect.bottom - rect.top) * .5 && horizontalGap <= Math.max(4, Math.min(item.bottom - item.top, rect.bottom - rect.top) * .8);
+function visualLinesOf(root: Element, rootRect: DOMRect): VisualLine[] {
+  const cached = visualLineCache.get(root);
+  if (cached && cached.width === rootRect.width) return cached.lines;
+  const raw: (VisualLineSpan & { top: number; bottom: number })[] = [];
+  for (const span of Array.from(root.querySelectorAll("span"))) {
+    if (span.getAttribute("role") === "img") continue;
+    const node = Array.from(span.childNodes).find((child): child is Text => child.nodeType === Node.TEXT_NODE && Boolean(child.textContent));
+    if (!node) continue;
+    const rect = span.getBoundingClientRect();
+    if (!rect.width || !rect.height) continue;
+    // 排除接近整页高的旋转水印（如 arXiv 侧边条）：它在任何 y 都「命中」，会把端点劫持到页边
+    if (rect.height > rootRect.height * .4) continue;
+    raw.push({ node, left: rect.left - rootRect.left, right: rect.right - rootRect.left, top: rect.top - rootRect.top, bottom: rect.bottom - rootRect.top });
+  }
+  raw.sort((a, b) => a.top - b.top || a.left - b.left);
+  const lines: VisualLine[] = [];
+  for (const item of raw) {
+    const line = lines.find((candidate) => {
+      const verticalOverlap = Math.min(candidate.bottom, item.bottom) - Math.max(candidate.top, item.top);
+      const horizontalGap = Math.max(item.left - candidate.right, candidate.left - item.right, 0);
+      const minHeight = Math.min(candidate.bottom - candidate.top, item.bottom - item.top);
+      return verticalOverlap > minHeight * .5 && horizontalGap <= Math.max(4, minHeight * .8);
     });
     if (line) {
-      line.top = Math.min(line.top, rect.top);
-      line.bottom = Math.max(line.bottom, rect.bottom);
-      line.left = Math.min(line.left, rect.left);
-      line.right = Math.max(line.right, rect.right);
+      line.top = Math.min(line.top, item.top);
+      line.bottom = Math.max(line.bottom, item.bottom);
+      line.left = Math.min(line.left, item.left);
+      line.right = Math.max(line.right, item.right);
+      line.spans.push({ node: item.node, left: item.left, right: item.right });
     } else {
-      lines.push({ top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right });
+      lines.push({ top: item.top, bottom: item.bottom, left: item.left, right: item.right, spans: [{ node: item.node, left: item.left, right: item.right }] });
     }
   }
-  // 双栏特征：大量行的左边缘聚集在两个相距很远的 x 位置（左栏边与右栏边）
-  const bins = new Map<number, number>();
-  for (const line of lines) {
-    if (line.right - line.left > rootRect.width * .7) continue;
-    const bin = Math.round((line.left - rootRect.left) / 24);
-    bins.set(bin, (bins.get(bin) || 0) + 1);
-  }
-  const clusters = [...bins.entries()].filter(([, count]) => count >= 4).map(([bin]) => bin).sort((a, b) => a - b);
-  const twoColumn = clusters.length >= 2 && (clusters[clusters.length - 1] - clusters[0]) * 24 > rootRect.width * .3;
-  columnLayoutCache.set(root, twoColumn);
-  return twoColumn;
+  for (const line of lines) line.spans.sort((a, b) => a.left - b.left);
+  visualLineCache.set(root, { width: rootRect.width, lines });
+  return lines;
 }
 
 function textCaretFromPoint(root: Element, x: number, y: number): TextCaret | null {
@@ -495,47 +497,39 @@ function textCaretFromPoint(root: Element, x: number, y: number): TextCaret | nu
   const nativeNode = position?.offsetNode || legacyRange?.startContainer;
   const nativeOffset = position?.offset ?? legacyRange?.startOffset;
   const rootRect = root.getBoundingClientRect();
-  const twoColumn = isTwoColumnText(root, rootRect);
-  const pointerSide = x < rootRect.left + rootRect.width / 2 ? -1 : 1;
+  const lines = visualLinesOf(root, rootRect);
   if (nativeNode?.nodeType === Node.TEXT_NODE && root.contains(nativeNode)) {
     const textNode = nativeNode as Text;
-    let accept = true;
-    if (twoColumn) {
-      const span = textNode.parentElement;
-      const spanRect = span?.getBoundingClientRect();
-      const spanSide = spanRect && spanRect.left + spanRect.width / 2 < rootRect.left + rootRect.width / 2 ? -1 : 1;
-      const isNarrowColumnText = Boolean(spanRect && spanRect.width < rootRect.width * .65);
-      accept = !isNarrowColumnText || pointerSide === spanSide || Math.abs(x - (rootRect.left + rootRect.width / 2)) < rootRect.width * .04;
+    const offset = Math.min(textNode.data.length, Math.max(0, Number(nativeOffset) || 0));
+    if (!lines.length) return { node: textNode, offset };
+    // 有行模型时，原生光标必须命中指针附近的片段才采信：避免浏览器把间隙中的指针
+    // 吸附到远处（双栏另一列、整页高的水印）的文本上
+    const hitRect = textNode.parentElement?.getBoundingClientRect();
+    if (hitRect && hitRect.height <= rootRect.height * .4 && x >= hitRect.left - 6 && x <= hitRect.right + 6 && y >= hitRect.top - 6 && y <= hitRect.bottom + 6) {
+      return { node: textNode, offset };
     }
-    if (accept) return { node: textNode, offset: Math.min(textNode.data.length, Math.max(0, Number(nativeOffset) || 0)) };
   }
-
-  // 先按垂直距离锁定最近的文本行，再只在这一行内按水平距离选片段。
-  // 单栏论文里大多数行是整页宽的：若用 dy/dx 混合打分，指针横向越过短行（段落末行、标题）
-  // 时相邻整宽行总分更低，端点会被甩到别的行；行优先可以让端点稳稳钳在该行末尾
+  if (!lines.length) return null;
+  // 先按垂直距离锁定最近的视觉行（容差 1.5px 内取水平最近者），再在行内按 x 定位：
+  // 指针越过短行末尾时钳在该行末尾；栏间距、页边空白处选最近的行，全模板行为一致
+  const xr = x - rootRect.left;
+  const yr = y - rootRect.top;
   let bestDy = Infinity;
-  const candidates: { node: Text; dx: number }[] = [];
-  for (const span of Array.from(root.querySelectorAll("span"))) {
-    if (span.getAttribute("role") === "img") continue;
-    const node = Array.from(span.childNodes).find((child): child is Text => child.nodeType === Node.TEXT_NODE && Boolean(child.textContent));
-    if (!node) continue;
-    const rect = span.getBoundingClientRect();
-    if (!rect.width || !rect.height) continue;
-    // 跳过接近整页高的旋转水印（如 arXiv 侧边条）：它在任何 y 都「命中」，会把端点劫持到页边
-    if (rect.height > rootRect.height * .4) continue;
-    if (twoColumn) {
-      const spanSide = rect.left + rect.width / 2 < rootRect.left + rootRect.width / 2 ? -1 : 1;
-      if (rect.width < rootRect.width * .65 && spanSide !== pointerSide) continue;
-    }
-    const dx = x < rect.left ? rect.left - x : x > rect.right ? x - rect.right : 0;
-    const dy = y < rect.top ? rect.top - y : y > rect.bottom ? y - rect.bottom : 0;
+  const candidates: { line: VisualLine; dx: number }[] = [];
+  for (const line of lines) {
+    const dx = xr < line.left ? line.left - xr : xr > line.right ? xr - line.right : 0;
+    const dy = yr < line.top ? line.top - yr : yr > line.bottom ? yr - line.bottom : 0;
     if (dy < bestDy) { bestDy = dy; candidates.length = 0; }
-    if (dy <= bestDy + 1.5) candidates.push({ node, dx });
+    if (dy <= bestDy + 1.5) candidates.push({ line, dx });
   }
   if (!candidates.length) return null;
   let closest = candidates[0];
   for (const candidate of candidates) if (candidate.dx < closest.dx) closest = candidate;
-  return { node: closest.node, offset: textOffsetAtX(closest.node, x) };
+  for (const span of closest.line.spans) {
+    if (xr <= span.right) return { node: span.node, offset: textOffsetAtX(span.node, x) };
+  }
+  const last = closest.line.spans[closest.line.spans.length - 1];
+  return { node: last.node, offset: last.node.data.length };
 }
 
 function rangeFromPointerPoints(root: Element, start: { x: number; y: number }, end: { x: number; y: number }) {

@@ -61,12 +61,18 @@ export default defineConfig(async () => {
     plugins: [
       vinext(),
       sites(),
-      cloudflare({
-        viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
-        config: isDeploy
-          ? { main: localBindingConfig.main } // 绑定与 compatibility_flags 由根目录 wrangler.jsonc 提供，避免重复
-          : localBindingConfig,
-      }),
+      // 开发模式必须显式指定 wrangler.local.jsonc：否则插件会自动合并根目录
+      // wrangler.jsonc（生产配置），compatibility_flags 与绑定重复，本地直接起不来。
+      // 部署构建反过来：只给入口，绑定与 flag 由根目录 wrangler.jsonc 提供
+      isDeploy
+        ? cloudflare({
+            viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
+            config: { main: localBindingConfig.main },
+          })
+        : cloudflare({
+            viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
+            configPath: "wrangler.local.jsonc",
+          }),
     ],
   };
 });

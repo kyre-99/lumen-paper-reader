@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createSupabaseServerClient } from "../../../../supabase-auth";
+import { isEmailAllowed } from "../../access";
 
 export async function POST(request: NextRequest) {
   const payload = await request.json().catch(() => ({})) as { email?: string; token?: string };
@@ -8,6 +9,7 @@ export async function POST(request: NextRequest) {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || token.length < 6) {
     return NextResponse.json({ error: "请输入邮件中的验证码" }, { status: 400 });
   }
+  if (!isEmailAllowed(email)) return NextResponse.json({ error: "该邮箱没有访问权限" }, { status: 403 });
   const supabase = await createSupabaseServerClient();
   const { data, error } = await supabase.auth.verifyOtp({ email, token, type: "email" });
   if (error || !data.user) return NextResponse.json({ error: error?.message || "验证码无效或已过期" }, { status: 400 });

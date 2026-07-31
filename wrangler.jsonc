@@ -12,9 +12,6 @@
   "images": {
     "binding": "IMAGES"
   },
-  "vars": {
-    "LOCAL_ONLY": "false"
-  },
   "d1_databases": [
     {
       "binding": "DB",

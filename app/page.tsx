@@ -1,5 +1,14 @@
 "use client";
 
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (container: HTMLElement, options: { sitekey: string; callback?: (token: string) => void; "expired-callback"?: () => void; "error-callback"?: () => void }) => string;
+      reset: (widgetId?: string) => void;
+    };
+  }
+}
+
 import {
   AlertCircle,
   BookOpen,
@@ -1790,12 +1799,17 @@ type VisionConfig = { endpoint: string; model: string; apiKey: string; hasApiKey
 export default function Home() {
   const [user, setUser] = useState<SessionUser | null>(null);
   const [authReady, setAuthReady] = useState(false);
+  const [guestDisabled, setGuestDisabled] = useState(false);
   const [authMessage, setAuthMessage] = useState("");
   const [guestSubmitting, setGuestSubmitting] = useState(false);
   const [emailAddress, setEmailAddress] = useState("");
   const [emailCode, setEmailCode] = useState("");
   const [emailStage, setEmailStage] = useState<"input" | "code">("input");
   const [emailSubmitting, setEmailSubmitting] = useState(false);
+  const [turnstileSite, setTurnstileSite] = useState("");
+  const [turnstileToken, setTurnstileToken] = useState("");
+  const turnstileContainerRef = useRef<HTMLDivElement>(null);
+  const turnstileWidgetRef = useRef<string | null>(null);
   const [accountOpen, setAccountOpen] = useState(false);
   const [fontMenuOpen, setFontMenuOpen] = useState(false);
   const [saveStatus, setSaveStatus] = useState<"loading" | "saved" | "saving" | "error" | "dirty">("loading");
@@ -2390,7 +2404,7 @@ export default function Home() {
         const sessionResponse = await fetch("/api/session", { cache: "no-store" });
         const sessionPayload = await sessionResponse.json();
         if (!sessionResponse.ok) {
-          if (!cancelled) { setUser(null); setAuthReady(true); setHydrated(true); setSaveStatus("error"); }
+          if (!cancelled) { setUser(null); setGuestDisabled(Boolean(sessionPayload.guestDisabled)); setTurnstileSite(String(sessionPayload.turnstileSiteKey || "")); setAuthReady(true); setHydrated(true); setSaveStatus("error"); }
           return;
         }
         if (cancelled) return;
@@ -3867,17 +3881,42 @@ export default function Home() {
     setEmailSubmitting(true);
     setAuthMessage("");
     try {
-      const response = await fetch("/api/auth/email", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: emailAddress }) });
+      const response = await fetch("/api/auth/email", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: emailAddress, turnstileToken }) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "验证码发送失败");
       setEmailStage("code");
       setAuthMessage("验证邮件已发送：点击邮件里的确认链接即可登录；若邮件中有验证码，也可在下方输入");
     } catch (error: any) {
       setAuthMessage(error?.message || "验证码发送失败");
+      // turnstile token 一次性，失败后重置组件让用户重新验证
+      if (turnstileWidgetRef.current !== null) { window.turnstile?.reset(turnstileWidgetRef.current); setTurnstileToken(""); }
     } finally {
       setEmailSubmitting(false);
     }
   };
+
+  // 登录页的人机验证（Cloudflare Turnstile）：仅在服务端配置了 site key 时加载，
+  // 脚本懒加载并按显式模式渲染到登录卡片里
+  useEffect(() => {
+    if (user || !turnstileSite || emailStage !== "input") return;
+    let cancelled = false;
+    const render = () => {
+      if (cancelled || !turnstileContainerRef.current || !window.turnstile || turnstileWidgetRef.current !== null) return;
+      turnstileWidgetRef.current = window.turnstile.render(turnstileContainerRef.current, {
+        sitekey: turnstileSite,
+        callback: (token: string) => setTurnstileToken(token),
+        "expired-callback": () => setTurnstileToken(""),
+        "error-callback": () => setTurnstileToken(""),
+      });
+    };
+    if (window.turnstile) { render(); return; }
+    const script = document.createElement("script");
+    script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+    script.async = true;
+    script.onload = render;
+    document.head.appendChild(script);
+    return () => { cancelled = true; };
+  }, [user, turnstileSite, emailStage]);
 
   const verifyEmailCode = async () => {
     if (emailSubmitting) return;
@@ -4315,11 +4354,12 @@ export default function Home() {
       {statsOpen && <StatsModal onClose={() => setStatsOpen(false)} stats={readingStats} loading={statsLoading} onOpenPaper={(id) => { setStatsOpen(false); void openLibraryPaper(id); }} />}
       {toast && <div className={`toast${toast.kind === "error" ? " error" : ""}`}>{toast.kind === "error" ? <AlertCircle size={15} /> : <Check size={15} />}{toast.text}</div>}
       {!authReady && <div className="auth-gate"><div className="auth-card"><BrandMark /><LoaderCircle className="spin" size={22} /><h2>正在确认登录状态</h2><p>正在安全地读取你的论文空间…</p></div></div>}
-      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>开始使用文枢</h2><p>用邮箱接收验证码登录，论文、批注和对话会跨设备同步；也可以先用游客身份体验。</p>
+      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>开始使用文枢</h2><p>{guestDisabled ? "用邮箱接收验证码登录，论文、批注和对话会跨设备同步。" : "用邮箱接收验证码登录，论文、批注和对话会跨设备同步；也可以先用游客身份体验。"}</p>
         {emailStage === "input" ? (
           <div className="auth-email-form">
             <label><Mail size={14} /><input type="email" value={emailAddress} onChange={(event) => setEmailAddress(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void sendEmailCode(); }} placeholder="输入邮箱，接收登录验证码" autoFocus /></label>
-            <button className="primary-button wide" onClick={() => void sendEmailCode()} disabled={emailSubmitting || !emailAddress.trim()}>{emailSubmitting ? <><LoaderCircle className="spin" size={15} />正在发送…</> : "发送验证码"}</button>
+            {turnstileSite && <div ref={turnstileContainerRef} className="auth-turnstile" />}
+            <button className="primary-button wide" onClick={() => void sendEmailCode()} disabled={emailSubmitting || !emailAddress.trim() || (Boolean(turnstileSite) && !turnstileToken)}>{emailSubmitting ? <><LoaderCircle className="spin" size={15} />正在发送…</> : "发送验证码"}</button>
           </div>
         ) : (
           <div className="auth-email-form auth-code-form">
@@ -4328,7 +4368,7 @@ export default function Home() {
             <button className="auth-back" onClick={() => { setEmailStage("input"); setEmailCode(""); setAuthMessage(""); }}>换个邮箱重新发送</button>
           </div>
         )}
-        <div className="auth-divider"><span>其他方式</span></div><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a><button className="primary-button wide auth-guest" onClick={startGuestSession} disabled={guestSubmitting}>{guestSubmitting ? <><LoaderCircle className="spin" size={15} />正在创建游客空间</> : "游客试用"}</button>{authMessage && <div className="auth-message">{authMessage}</div>}<small>游客数据只绑定当前浏览器；清除 Cookie 后无法恢复，也不能跨设备同步。</small></div></div>}
+        <div className="auth-divider"><span>其他方式</span></div><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a>{!guestDisabled && <button className="primary-button wide auth-guest" onClick={startGuestSession} disabled={guestSubmitting}>{guestSubmitting ? <><LoaderCircle className="spin" size={15} />正在创建游客空间</> : "游客试用"}</button>}{authMessage && <div className="auth-message">{authMessage}</div>}{!guestDisabled && <small>游客数据只绑定当前浏览器；清除 Cookie 后无法恢复，也不能跨设备同步。</small>}</div></div>}
     </main>
   );
 }

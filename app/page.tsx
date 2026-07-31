@@ -1473,6 +1473,7 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
   const [localImportState, setLocalImportState] = useState<"idle" | "running" | "fail">("idle");
   const [localMessage, setLocalMessage] = useState("");
   const localFileRef = useRef<HTMLInputElement>(null);
+  const importModeRef = useRef<"merge" | "overwrite">("merge");
   const providerModels = MODEL_PRESETS[config.provider]?.models || [];
   const usesCustomModel = !providerModels.includes(config.model);
   useEffect(() => {
@@ -1623,13 +1624,15 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
       setBackupMessage((error instanceof Error ? error.message : "") || "备份失败，请稍后重试");
     }
   };
-  const restoreNow = async () => {
+  const restoreNow = async (mode: "merge" | "overwrite") => {
     if (restoreState === "running") return;
-    if (!window.confirm("恢复会用远端备份覆盖当前所有论文和阅读记录，确定继续吗？")) return;
+    if (!window.confirm(mode === "merge"
+      ? "合并恢复：保留本地和远端两边的全部论文，同一篇冲突时取最新版本，本地内容不会被删除。确定继续吗？"
+      : "覆盖恢复：先删除当前所有论文和阅读记录，再用远端备份整体替换。此操作不可撤销，确定继续吗？")) return;
     setRestoreState("running");
     setRestoreMessage("");
     try {
-      const response = await fetch("/api/sync/pull", { method: "POST" });
+      const response = await fetch("/api/sync/pull", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode }) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "恢复失败");
       window.location.reload();
@@ -1645,14 +1648,16 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
     link.download = "";
     link.click();
   };
-  // 本地导入：确认覆盖后上传备份文件，成功后刷新重新水合
-  const importLocalBackup = async (file: File) => {
+  // 本地导入：按所选模式（合并/覆盖）确认后上传备份文件，成功后刷新重新水合
+  const importLocalBackup = async (file: File, mode: "merge" | "overwrite") => {
     if (localImportState === "running") return;
-    if (!window.confirm("导入会用备份文件覆盖当前所有论文和阅读记录，确定继续吗？")) return;
+    if (!window.confirm(mode === "merge"
+      ? "合并导入：保留本地和备份文件两边的全部论文，同一篇冲突时取最新版本，本地内容不会被删除。确定继续吗？"
+      : "覆盖导入：先删除当前所有论文和阅读记录，再用备份文件整体替换。此操作不可撤销，确定继续吗？")) return;
     setLocalImportState("running");
     setLocalMessage("");
     try {
-      const response = await fetch("/api/sync/local", { method: "POST", headers: { "Content-Type": "application/json" }, body: file });
+      const response = await fetch(`/api/sync/local?mode=${mode}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: file });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "导入失败");
       window.location.reload();
@@ -1735,23 +1740,29 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
             <button type="button" className="test-button" onClick={backupNow} disabled={!syncConfig.configured || backupState === "running" || restoreState === "running"}>
               {backupState === "running" ? <><LoaderCircle className="spin" size={14} />正在备份…</> : <><Cloud size={14} />立即备份</>}
             </button>
-            <button type="button" className="test-button" onClick={restoreNow} disabled={!syncConfig.configured || restoreState === "running" || backupState === "running"}>
-              {restoreState === "running" ? <><LoaderCircle className="spin" size={14} />正在恢复…</> : <><Upload size={14} />从备份恢复</>}
+            <button type="button" className="test-button" onClick={() => void restoreNow("merge")} disabled={!syncConfig.configured || restoreState === "running" || backupState === "running"} title="保留本地和远端两边的论文，冲突时取最新版本">
+              {restoreState === "running" ? <><LoaderCircle className="spin" size={14} />正在恢复…</> : <><Upload size={14} />合并恢复</>}
+            </button>
+            <button type="button" className="test-button" onClick={() => void restoreNow("overwrite")} disabled={!syncConfig.configured || restoreState === "running" || backupState === "running"} title="删除本地全部论文和阅读记录，用远端备份整体替换">
+              <Upload size={14} />覆盖恢复
             </button>
           </div>
           {backupMessage && <span className={`test-result ${backupState === "ok" ? "ok" : "fail"}`}><span className="test-dot" />{backupMessage}</span>}
           {restoreMessage && <span className="test-result fail"><span className="test-dot" />{restoreMessage}</span>}
           {syncConfig.lastBackupAt && <div className="settings-note"><Check size={14} />上次备份：{new Date(syncConfig.lastBackupAt).toLocaleString("zh-CN")}</div>}
           {!syncConfig.configured && <div className="settings-note"><Check size={14} />支持坚果云（https://dav.jianguoyun.com/dav/）、Nextcloud 等 WebDAV 网盘，配置后可将论文库备份到云端并在新设备恢复。</div>}
-          {syncConfig.configured && <div className="settings-note"><Check size={14} />立即备份 / 从备份恢复使用已保存的配置；恢复会覆盖本地全部论文和阅读记录。</div>}
+          {syncConfig.configured && <div className="settings-note"><Check size={14} />合并恢复会把云端备份与本地论文合并（两边都保留，冲突取最新）；覆盖恢复会删除本地后用备份整体替换。</div>}
           <div className="sync-section-title">本地同步</div>
-          <div className="settings-note"><Check size={14} />把全部论文、阅读记录和已上传的 PDF 原件导出为一个备份文件，换设备后用导入恢复。</div>
+          <div className="settings-note"><Check size={14} />把全部论文、阅读记录和已上传的 PDF 原件导出为一个备份文件；换设备或多台电脑合并时用合并导入，两边内容都会保留。</div>
           <div className="test-row">
             <button type="button" className="test-button" onClick={exportLocalBackup}><Download size={14} />导出备份</button>
-            <button type="button" className="test-button" onClick={() => localFileRef.current?.click()} disabled={localImportState === "running"}>
-              {localImportState === "running" ? <><LoaderCircle className="spin" size={14} />正在导入…</> : <><Upload size={14} />导入备份</>}
+            <button type="button" className="test-button" onClick={() => { importModeRef.current = "merge"; localFileRef.current?.click(); }} disabled={localImportState === "running"} title="保留本地和备份文件两边的论文，冲突时取最新版本">
+              {localImportState === "running" ? <><LoaderCircle className="spin" size={14} />正在导入…</> : <><Upload size={14} />合并导入</>}
             </button>
-            <input ref={localFileRef} type="file" accept="application/json,.json" hidden onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importLocalBackup(file); }} />
+            <button type="button" className="test-button" onClick={() => { importModeRef.current = "overwrite"; localFileRef.current?.click(); }} disabled={localImportState === "running"} title="删除本地全部论文和阅读记录，用备份文件整体替换">
+              <Upload size={14} />覆盖导入
+            </button>
+            <input ref={localFileRef} type="file" accept="application/json,.json" hidden onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importLocalBackup(file, importModeRef.current); }} />
           </div>
           {localMessage && <span className="test-result fail"><span className="test-dot" />{localMessage}</span>}
         </div> : <div className="settings-pane prompt-pane">
@@ -2695,7 +2706,7 @@ export default function Home() {
   // 流式更新后把卡片滚到最新内容；force 用于用户刚提问时强制跟随。rAF 等到 DOM 更新后再量高度
   const scrollInlineCardToBottom = useCallback((id: number, force = false) => {
     window.requestAnimationFrame(() => {
-      const card = readerRef.current?.querySelector<HTMLElement>(`.inline-card[data-annotation-id="${id}"]`);
+      const card = readerRef.current?.querySelector<HTMLElement>(`.inline-card[data-annotation-id="${id}"] .inline-card-body`);
       if (!card) return;
       if (force || (inlineCardStickRef.current.get(id) ?? true)) card.scrollTop = card.scrollHeight;
     });
@@ -3427,7 +3438,16 @@ export default function Home() {
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisibilityChange); };
   }, [performSave]);
 
-  // 有未保存内容时关闭/刷新页面前提示，避免误关丢失（自动保存每小时才兜底一次）
+  // 动态自动保存：侧边栏对话、悬浮栏批注、阅读位置等内容每次变化后，静默 8 秒自动落盘；
+  // 流式输出（全文问答/划词回答）期间不打扰，结束后再补一次。快照无变化时 performSave 会跳过，不产生请求
+  useEffect(() => {
+    if (!hydrated || !user || !paperId || !paperSourceKind) return;
+    if (loading || streaming || anyAnnotationLoading) return;
+    const timer = window.setTimeout(() => { void performSave("auto"); }, 8000);
+    return () => window.clearTimeout(timer);
+  }, [annotations, conversations, currentPage, messages, pageCount, paperMeta, paperText, paperTitle, rightOpen, zoom, hydrated, user, paperId, paperSourceKind, loading, streaming, anyAnnotationLoading, performSave]);
+
+  // 有未保存内容时关闭/刷新页面前提示，避免误关丢失（防抖自动保存有几秒窗口期）
   useEffect(() => {
     if (saveStatus !== "dirty") return;
     const onBeforeUnload = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
@@ -3956,7 +3976,7 @@ export default function Home() {
             {loadError && <span className="load-error-badge" title={loadError}>打开失败</span>}
           </div>
           <div className="top-actions">
-            <button type="button" className={`sync-status ${saveStatus}`} onClick={() => void performSave("manual")} disabled={saveStatus === "saving" || saveStatus === "loading"} title="点击立即保存；内容每小时自动保存一次，切到后台或切换论文时也会保存">{saveStatus === "error" ? <CloudOff size={14} /> : <Cloud size={14} />}<span>{saveStatus === "loading" ? "读取中" : saveStatus === "saving" ? "保存中" : saveStatus === "error" ? "保存失败 · 点击重试" : saveStatus === "dirty" ? "未保存 · 点击保存" : "本机已保存"}</span></button>
+            <button type="button" className={`sync-status ${saveStatus}`} onClick={() => void performSave("manual")} disabled={saveStatus === "saving" || saveStatus === "loading"} title="点击立即保存；内容变化后几秒内自动保存，切到后台或切换论文时也会保存">{saveStatus === "error" ? <CloudOff size={14} /> : <Cloud size={14} />}<span>{saveStatus === "loading" ? "读取中" : saveStatus === "saving" ? "保存中" : saveStatus === "error" ? "保存失败 · 点击重试" : saveStatus === "dirty" ? "未保存 · 点击保存" : "本机已保存"}</span></button>
             <button className={`model-card ${config.apiKey || config.hasApiKey ? "configured" : ""}`} onClick={() => setSettingsOpen(true)} title={config.apiKey || config.hasApiKey ? `当前模型：${config.model}（点击修改）` : "演示模式 · 还没有配置模型，点击去设置"}>
               <span className={`status-dot ${config.apiKey || config.hasApiKey ? "online" : ""}`} />
               <Settings size={15} className="model-card-compact-icon" />
@@ -4045,7 +4065,7 @@ export default function Home() {
                 {annotation.kind === "translate" ? <Languages size={14} /> : annotation.kind === "figure" ? <Scan size={14} /> : annotation.kind === "formula" || annotation.kind === "explain" ? <Sparkles size={14} /> : annotation.kind === "ask" ? <MessageSquareText size={14} /> : <Highlighter size={14} />}
               </button>
               {annotation.open && (
-                <section className={`inline-card ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`} data-annotation-id={annotation.id} style={{ top: annotation.cardTop, left: annotation.cardLeft, width: annotation.cardWidth, ...(annotation.cardHeight ? { height: annotation.cardHeight, maxHeight: "none" as const } : {}) }} onMouseDown={(event) => event.stopPropagation()} onScroll={(event) => { const el = event.currentTarget; inlineCardStickRef.current.set(annotation.id, el.scrollHeight - el.scrollTop - el.clientHeight < 80); }}>
+                <section className={`inline-card ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`} data-annotation-id={annotation.id} style={{ top: annotation.cardTop, left: annotation.cardLeft, width: annotation.cardWidth, ...(annotation.cardHeight ? { height: annotation.cardHeight, maxHeight: "none" as const } : {}) }} onMouseDown={(event) => event.stopPropagation()}>
                   <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")} title="拖动移动悬浮卡片">
                     <div className="inline-card-title">
                       <MoreHorizontal className="drag-grip" size={15} />
@@ -4057,6 +4077,7 @@ export default function Home() {
                       <button onClick={() => closeAnnotation(annotation)} aria-label="收起批注" title="收起批注"><X size={15} /></button>
                     </div>
                   </header>
+                  <div className="inline-card-body" onScroll={(event) => { const el = event.currentTarget; inlineCardStickRef.current.set(annotation.id, el.scrollHeight - el.scrollTop - el.clientHeight < 80); }}>
                   {annotation.kind === "figure" ? (
                     annotation.figureImage
                       // eslint-disable-next-line @next/next/no-img-element
@@ -4079,6 +4100,7 @@ export default function Home() {
                       <button disabled={!annotation.draft.trim()} onClick={() => requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, annotation.draft, annotation.thread)}><Send size={14} />发送</button>
                     </div>
                   )}
+                  </div>
                   <footer><button onClick={() => navigator.clipboard.writeText(annotation.result || annotation.text)}><Copy size={13} />复制</button><button className="delete-note" onClick={() => removeAnnotation(annotation.id)}>删除标记</button></footer>
                   <div className="card-resize-strip"><button className="card-resize-handle" onPointerDown={(event) => startAnnotationResize(event, annotation)} aria-label="拖动调整卡片大小" title="拖动调整大小" /></div>
                 </section>

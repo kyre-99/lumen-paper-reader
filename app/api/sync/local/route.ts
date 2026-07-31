@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { requireAppUser } from "../../../server-user";
 import { sanitizeObjectKey } from "../../../object-key";
-import { buildSnapshot, isSyncSnapshot, restoreSnapshot } from "../snapshot";
+import { buildSnapshot, isSyncSnapshot, mergeSnapshot, restoreSnapshot } from "../snapshot";
 
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const MAX_IMPORT_BYTES = 100 * 1024 * 1024;
@@ -45,29 +45,38 @@ export async function GET() {
   });
 }
 
-// 导入：解析备份文件，覆盖式恢复（与 WebDAV 恢复同一套逻辑）
+// 导入：解析备份文件，默认覆盖式恢复；?mode=merge 时与本地合并（并集，冲突取最新）
 export async function POST(request: Request) {
   const user = await requireAppUser();
   if (!user) return Response.json({ error: "需要登录" }, { status: 401 });
   if (Number(request.headers.get("content-length") || 0) > MAX_IMPORT_BYTES) {
     return Response.json({ error: "备份文件超过 100MB，暂不支持导入" }, { status: 413 });
   }
+  const merge = new URL(request.url).searchParams.get("mode") === "merge";
   const body = await request.json().catch(() => null) as unknown;
   if (!isSyncSnapshot(body)) return Response.json({ error: "备份文件格式不支持" }, { status: 400 });
 
+  let restoredPaperIds: string[] | null = null;
+  let summary = null;
   try {
-    await restoreSnapshot(user.id, body);
+    if (merge) {
+      summary = await mergeSnapshot(user.id, body);
+      restoredPaperIds = summary.restoredPaperIds;
+    } else {
+      await restoreSnapshot(user.id, body);
+    }
   } catch (error) {
     return Response.json({ error: `导入失败：${(error instanceof Error ? error.message : "") || "数据库写入失败"}` }, { status: 500 });
   }
 
-  // 把内嵌的 PDF 写回 R2
+  // 把内嵌的 PDF 写回 R2；合并模式下只写回「新增或快照胜出」的论文，本地较新的 PDF 不动
   const bucket = (env as unknown as { FILES?: R2Bucket }).FILES;
   const embedded = (body as { files?: unknown }).files;
   let files = 0;
   let missing = 0;
   if (bucket && Array.isArray(embedded)) {
     for (const item of embedded as Array<{ paperId?: unknown; objectKey?: unknown; base64?: unknown }>) {
+      if (restoredPaperIds && !restoredPaperIds.includes(String(item?.paperId || "").slice(0, 64))) continue;
       const objectKey = await sanitizeObjectKey(user.id, String(item?.objectKey || ""));
       const base64 = typeof item?.base64 === "string" ? item.base64 : "";
       if (!objectKey || !base64) { missing++; continue; }
@@ -80,5 +89,5 @@ export async function POST(request: Request) {
     }
   }
 
-  return Response.json({ ok: true, papers: body.papers.length, files, missing });
+  return Response.json({ ok: true, papers: body.papers.length, files, missing, ...(summary ? { summary } : {}) });
 }

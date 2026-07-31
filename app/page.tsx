@@ -27,6 +27,7 @@ import {
   Link2,
   LoaderCircle,
   LogOut,
+  Mail,
   Maximize2,
   MessageSquareText,
   Minus,
@@ -1791,6 +1792,10 @@ export default function Home() {
   const [authReady, setAuthReady] = useState(false);
   const [authMessage, setAuthMessage] = useState("");
   const [guestSubmitting, setGuestSubmitting] = useState(false);
+  const [emailAddress, setEmailAddress] = useState("");
+  const [emailCode, setEmailCode] = useState("");
+  const [emailStage, setEmailStage] = useState<"input" | "code">("input");
+  const [emailSubmitting, setEmailSubmitting] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
   const [fontMenuOpen, setFontMenuOpen] = useState(false);
   const [saveStatus, setSaveStatus] = useState<"loading" | "saved" | "saving" | "error" | "dirty">("loading");
@@ -3856,6 +3861,39 @@ export default function Home() {
     }
   };
 
+  // 邮箱验证码登录：/api/auth/email 发码，/api/auth/email/verify 校验（会话 cookie 由服务端写）
+  const sendEmailCode = async () => {
+    if (emailSubmitting) return;
+    setEmailSubmitting(true);
+    setAuthMessage("");
+    try {
+      const response = await fetch("/api/auth/email", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: emailAddress }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "验证码发送失败");
+      setEmailStage("code");
+      setAuthMessage("验证邮件已发送：点击邮件里的确认链接即可登录；若邮件中有验证码，也可在下方输入");
+    } catch (error: any) {
+      setAuthMessage(error?.message || "验证码发送失败");
+    } finally {
+      setEmailSubmitting(false);
+    }
+  };
+
+  const verifyEmailCode = async () => {
+    if (emailSubmitting) return;
+    setEmailSubmitting(true);
+    setAuthMessage("");
+    try {
+      const response = await fetch("/api/auth/email/verify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: emailAddress, token: emailCode }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "验证码无效或已过期");
+      window.location.assign("/");
+    } catch (error: any) {
+      setAuthMessage(error?.message || "验证码无效或已过期");
+      setEmailSubmitting(false);
+    }
+  };
+
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(null), 2200); return () => clearTimeout(timer); }, [toast]);
 
   const startNewChat = useCallback(() => {
@@ -4277,7 +4315,20 @@ export default function Home() {
       {statsOpen && <StatsModal onClose={() => setStatsOpen(false)} stats={readingStats} loading={statsLoading} onOpenPaper={(id) => { setStatsOpen(false); void openLibraryPaper(id); }} />}
       {toast && <div className={`toast${toast.kind === "error" ? " error" : ""}`}>{toast.kind === "error" ? <AlertCircle size={15} /> : <Check size={15} />}{toast.text}</div>}
       {!authReady && <div className="auth-gate"><div className="auth-card"><BrandMark /><LoaderCircle className="spin" size={22} /><h2>正在确认登录状态</h2><p>正在安全地读取你的论文空间…</p></div></div>}
-      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>开始使用文枢</h2><p>暂时不配置登录也没关系，可以先用游客身份继续阅读和测试。</p><button className="primary-button wide auth-guest" onClick={startGuestSession} disabled={guestSubmitting}>{guestSubmitting ? <><LoaderCircle className="spin" size={15} />正在创建游客空间</> : "游客试用"}</button><div className="auth-divider"><span>以后再登录</span></div><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a>{authMessage && <div className="auth-message">{authMessage}</div>}<small>游客数据只绑定当前浏览器；清除 Cookie 后无法恢复，也不能跨设备同步。</small></div></div>}
+      {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>开始使用文枢</h2><p>用邮箱接收验证码登录，论文、批注和对话会跨设备同步；也可以先用游客身份体验。</p>
+        {emailStage === "input" ? (
+          <div className="auth-email-form">
+            <label><Mail size={14} /><input type="email" value={emailAddress} onChange={(event) => setEmailAddress(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void sendEmailCode(); }} placeholder="输入邮箱，接收登录验证码" autoFocus /></label>
+            <button className="primary-button wide" onClick={() => void sendEmailCode()} disabled={emailSubmitting || !emailAddress.trim()}>{emailSubmitting ? <><LoaderCircle className="spin" size={15} />正在发送…</> : "发送验证码"}</button>
+          </div>
+        ) : (
+          <div className="auth-email-form auth-code-form">
+            <label><input inputMode="numeric" value={emailCode} onChange={(event) => setEmailCode(event.target.value.replace(/\D/g, "").slice(0, 8))} onKeyDown={(event) => { if (event.key === "Enter") void verifyEmailCode(); }} placeholder="邮件中的验证码（如有点链接可忽略）" autoFocus /></label>
+            <button className="primary-button wide" onClick={() => void verifyEmailCode()} disabled={emailSubmitting || emailCode.trim().length < 6}>{emailSubmitting ? <><LoaderCircle className="spin" size={15} />正在验证…</> : "验证并登录"}</button>
+            <button className="auth-back" onClick={() => { setEmailStage("input"); setEmailCode(""); setAuthMessage(""); }}>换个邮箱重新发送</button>
+          </div>
+        )}
+        <div className="auth-divider"><span>其他方式</span></div><a className="auth-google wide" href="/api/auth/google"><span>G</span>使用 Google 继续</a><button className="primary-button wide auth-guest" onClick={startGuestSession} disabled={guestSubmitting}>{guestSubmitting ? <><LoaderCircle className="spin" size={15} />正在创建游客空间</> : "游客试用"}</button>{authMessage && <div className="auth-message">{authMessage}</div>}<small>游客数据只绑定当前浏览器；清除 Cookie 后无法恢复，也不能跨设备同步。</small></div></div>}
     </main>
   );
 }

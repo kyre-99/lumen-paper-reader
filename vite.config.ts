@@ -43,6 +43,11 @@ export default defineConfig(async () => {
   // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
+  // vinext deploy 会在同一进程内先跑 build：部署构建不能再注入本地占位绑定，
+  // 否则 dist/server/wrangler.json 里的 site-creator 绑定会与根目录 wrangler.jsonc
+  // 的生产绑定重名（DB/FILES assigned to multiple bindings）导致部署失败
+  const isDeploy = process.argv.includes("deploy");
+
   return {
     // 端口在 package.json 的 dev/start 脚本里通过 -p 3939 固定（vinext CLI
     // 不读 vite 配置的 server.port）。这里只锁 strictPort：端口被占时直接
@@ -58,7 +63,9 @@ export default defineConfig(async () => {
       sites(),
       cloudflare({
         viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
-        config: localBindingConfig,
+        config: isDeploy
+          ? { main: localBindingConfig.main } // 绑定与 compatibility_flags 由根目录 wrangler.jsonc 提供，避免重复
+          : localBindingConfig,
       }),
     ],
   };

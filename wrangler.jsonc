@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lumen-paper-reader",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-07-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "dist/client",
+    "not_found_handling": "none",
+    "binding": "ASSETS"
+  },
+  "images": {
+    "binding": "IMAGES"
+  },
+  "vars": {
+    "LOCAL_ONLY": "false"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "lumen-paper-d1",
+      "database_id": "f90e0570-9998-4952-bf6b-fc17e163a095",
+      "migrations_dir": "drizzle"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "lumen-paper-r2"
+    }
+  ]
+}

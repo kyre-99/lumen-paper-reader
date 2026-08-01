@@ -12,6 +12,12 @@
   "images": {
     "binding": "IMAGES"
   },
+  "routes": [
+    {
+      "pattern": "wenshupaper.online",
+      "custom_domain": true
+    }
+  ],
   "d1_databases": [
     {
       "binding": "DB",

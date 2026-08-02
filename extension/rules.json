@@ -1,0 +1,22 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "redirect",
+      "redirect": {
+        "regexSubstitution": "https://wenshupaper.online/?url=\\1"
+      }
+    },
+    "condition": {
+      "regexFilter": "^(https?://.*)$",
+      "resourceTypes": ["main_frame"],
+      "responseHeaders": [
+        {
+          "header": "content-type",
+          "values": ["application/pdf*"]
+        }
+      ]
+    }
+  }
+]

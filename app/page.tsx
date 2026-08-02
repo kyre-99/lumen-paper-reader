@@ -1810,6 +1810,9 @@ export default function Home() {
   const [turnstileToken, setTurnstileToken] = useState("");
   const turnstileContainerRef = useRef<HTMLDivElement>(null);
   const turnstileWidgetRef = useRef<string | null>(null);
+  // 深链消费 effect 通过 ref 调用 openUrl（定义在组件后部），避免前向引用
+  const openUrlRef = useRef<(url: string) => void>(() => {});
+  const openLibraryPaperRef = useRef<(id: string) => Promise<void>>(async () => {});
   const [accountOpen, setAccountOpen] = useState(false);
   const [fontMenuOpen, setFontMenuOpen] = useState(false);
   const [saveStatus, setSaveStatus] = useState<"loading" | "saved" | "saving" | "error" | "dirty">("loading");
@@ -2396,6 +2399,41 @@ export default function Home() {
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
+
+  // 深链打开论文：?url=<pdf地址>（浏览器扩展/外部分享拉起）。先暂存到 sessionStorage
+  // 并清掉地址栏参数，待登录与水合完成后由下方 effect 消费；登录跳转 reload 后仍能续上
+  useEffect(() => {
+    const pending = new URLSearchParams(window.location.search).get("url");
+    if (!pending) return;
+    sessionStorage.setItem("pending-open-url", pending);
+    window.history.replaceState({}, "", window.location.pathname);
+  }, []);
+
+  useEffect(() => {
+    if (!authReady || !user || !hydrated) return;
+    const pending = sessionStorage.getItem("pending-open-url");
+    if (!pending) return;
+    sessionStorage.removeItem("pending-open-url");
+    // 深链进来时文库尚未加载，先拉一次文库做同源去重：已有记录直接打开，避免重复建档
+    void (async () => {
+      try {
+        const response = await fetch("/api/papers", { cache: "no-store" });
+        const payload = await response.json();
+        if (response.ok) {
+          const papers = Array.isArray(payload.papers) ? payload.papers : [];
+          setLibraryPapers(papers);
+          setLibraryFolders(Array.isArray(payload.folders) ? payload.folders : []);
+          const existing = papers.find((paper: LibraryPaper) => paper.sourceUrl === pending);
+          if (existing) {
+            setToast({ text: "这篇论文已在文库中，已为你打开原有记录" });
+            await openLibraryPaperRef.current(existing.id);
+            return;
+          }
+        }
+      } catch { /* 拉取失败时按新论文打开 */ }
+      openUrlRef.current(pending);
+    })();
+  }, [authReady, user, hydrated]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3734,6 +3772,8 @@ export default function Home() {
     } finally { setLibraryLoading(false); }
   }, [clearPaperAnnotations, paperId, performSave]);
 
+  useEffect(() => { openLibraryPaperRef.current = openLibraryPaper; });
+
   const openUrl = (raw: string) => {
     const normalized = normalizePaperUrl(raw);
     if (!/^https?:\/\//i.test(normalized)) { setToast({ text: "请输入有效的公开链接", kind: "error" }); return; }
@@ -3776,6 +3816,9 @@ export default function Home() {
     setOpenModal(false);
     setToast({ text: "论文已加入阅读区" });
   };
+
+  // 深链 effect 通过 ref 调用 openUrl：保持依赖稳定，不在每次渲染重建
+  useEffect(() => { openUrlRef.current = openUrl; });
 
   const openFile = async (file: File) => {
     if (!user) { setToast({ text: "请先登录再上传 PDF", kind: "error" }); return; }

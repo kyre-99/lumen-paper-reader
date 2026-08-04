@@ -76,6 +76,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .paper-identity p { margin: 3px 0 0; color: var(--muted); font-size: 11px; }
 .file-badge { width: 31px; height: 35px; display: grid; place-items: center; flex: 0 0 auto; color: var(--green); background: linear-gradient(160deg, #e4f2eb, #d2e8de); border: 1px solid #cfe3da; border-radius: 7px; box-shadow: 0 2px 6px rgba(47,108,91,.1); }
 .top-actions { gap: 7px; }
+/* 手机端顶栏的文库入口：宽屏隐藏（左栏已有），窄屏媒体查询里显示（需双类选择器压过 .icon-button 的 display） */
+.icon-button.mobile-library-button { display: none; }
 .sync-status { height: 32px; display: inline-flex; align-items: center; gap: 5px; padding: 0 10px; border: 0; border-radius: 9px; color: #668078; background: #edf4f1; font-size: 10px; white-space: nowrap; cursor: pointer; transition: background .16s var(--ease-out), box-shadow .18s var(--ease-out); }
 .sync-status:hover:not(:disabled) { background: #e2efe9; box-shadow: 0 2px 7px rgba(47,108,91,.1); }
 .sync-status:disabled { cursor: default; }
@@ -188,6 +190,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .reader-tip { animation: tip-in .32s var(--ease-spring) both; }
 
 .pdf-stack { display: flex; flex-direction: column; align-items: center; gap: 24px; width: fit-content; min-width: calc(100% + 480px); margin: 0 auto; }
+/* 演示论文的包装层：与 .pdf-stack 同款的居中 + 平移余量（原来是 page.tsx 内联样式，值为保持一致抽到这里，便于窄屏媒体查询覆盖） */
+.demo-paper-wrap { width: fit-content; min-width: calc(100% + 480px); margin: 0 auto; }
 .pdf-page { position: relative; flex: 0 0 auto; box-sizing: content-box; --user-unit: 1; --scale-round-x: 1px; --scale-round-y: 1px; background: white; border: 1px solid #e4e4df; box-shadow: 0 12px 36px rgba(35,48,42,.11), 0 2px 5px rgba(35,48,42,.05); transition: box-shadow .22s ease; }
 .pdf-page:hover { box-shadow: 0 18px 46px rgba(35,48,42,.15), 0 3px 7px rgba(35,48,42,.06); }
 .pdf-page canvas { display: block; }
@@ -1162,3 +1166,63 @@ html[data-theme="dark"] .auth-email-form input { color: var(--ink); }
 html[data-theme="dark"] .auth-back { color: var(--muted); }
 html[data-theme="dark"] .auth-message { background: var(--green-soft); color: #8fc3ac; }
 html[data-theme="dark"] .auth-card > small { color: var(--muted); }
+
+/* ===== 手机端（≤768px）适配：底部 AI 抽屉 / 近全屏弹层 / 底部弹出批注卡片 ===== */
+@media (max-width: 768px) {
+  /* 去掉桌面最小宽度约束，高度用 dvh 规避手机浏览器地址栏伸缩；隐藏左栏改单列，其文库入口挪到顶栏 */
+  .app-shell, .app-shell.right-closed { min-width: 0; height: 100dvh; grid-template-columns: minmax(0, 1fr); }
+  .app-rail { display: none; }
+  .icon-button.mobile-library-button { display: grid; }
+  .workspace { height: 100dvh; grid-template-rows: 46px 44px minmax(0, 1fr); }
+
+  /* 去掉桌面平移模式预留的 480px 额外宽度，否则窄屏下整叠页面被撑宽、居中后完全偏出可视区 */
+  .pdf-stack, .demo-paper-wrap { min-width: 100%; }
+  /* 演示稿在窄屏用 CSS zoom 缩放：Chrome 对 zoom 元素的 margin:auto 按未缩放宽度居中会把内容顶出左缘，改为左对齐 */
+  .demo-paper-wrap { margin: 0; }
+
+  /* 顶栏压缩：隐藏次要元素，阅读器工具条允许横向滚动 */
+  .topbar { gap: 8px; padding: 0 10px; }
+  .paper-identity .file-badge { display: none; }
+  .paper-identity h1 { max-width: 30vw; }
+  .sync-status { padding: 0 8px; }
+  .sync-status span { display: none; }
+  .top-actions .effort-control { display: none; }
+  .reader-toolbar { padding: 0 10px; overflow-x: auto; scrollbar-width: none; }
+  .reader-toolbar::-webkit-scrollbar { display: none; }
+  .reader-tip { left: 50%; }
+  /* 左栏已隐藏；演示稿保持 760px 设计宽度，由 JS 实测宽度后用 CSS zoom 整体缩放（820px 断点的 min() 宽度在窄屏会把桌面字号挤进窄栏，一行只剩几个字）。zoom 元素的 margin:auto 按未缩放尺寸居中会把内容顶出左缘，页与包装层都改为左对齐 */
+  .paper-page { width: 760px; margin: 0; }
+
+  /* 搜索条铺满宽度，避免小屏溢出 */
+  .search-bar { left: 10px; right: 10px; }
+  .search-bar input { flex: 1; width: auto; min-width: 0; }
+
+  /* AI 面板改为底部抽屉：展开时自底部滑入、关闭时滑出（覆盖 820px 断点的右侧固定面板） */
+  .ai-panel { top: auto; left: 0; right: 0; bottom: 0; width: auto; height: 75vh; height: 75dvh; border-left: 0; border-top: 1px solid var(--line); border-radius: 16px 16px 0 0; box-shadow: 0 -18px 50px rgba(27,38,33,.2); z-index: 60; }
+  .right-closed .ai-panel { transform: translateY(103%); }
+  /* 抽屉顶部的抓手条，提示可向下收起（头部本身有关闭按钮） */
+  .ai-header { position: relative; }
+  .ai-header::before { content: ""; position: absolute; top: 5px; left: 50%; width: 38px; height: 4px; border-radius: 2px; background: var(--line); transform: translateX(-50%); }
+  .panel-resize-handle { display: none; }
+
+  /* 划词工具条：钳制在屏内，按钮过多时允许横向滚动 */
+  .selection-menu { max-width: calc(100vw - 12px); overflow-x: auto; scrollbar-width: none; }
+  .selection-menu::-webkit-scrollbar { display: none; }
+
+  /* 批注卡片改为底部弹出卡片：固定底部近全屏宽、限高内部滚动，禁用拖拽/缩放手柄带来的出屏风险（行内定位样式需 !important 覆盖） */
+  .inline-card { position: fixed; left: 8px !important; right: 8px; top: auto !important; bottom: 10px; z-index: 66; width: auto !important; height: auto !important; max-width: none; max-height: 60vh !important; max-height: 60dvh !important; opacity: .98; }
+  .inline-card > header { cursor: default; }
+  .card-resize-handle { display: none; }
+
+  /* 弹层近全屏：小边距、最大高度 100dvh、圆角收紧 */
+  .modal-backdrop { padding: 10px; }
+  .modal-card { width: 100%; max-height: calc(100dvh - 20px); overflow-y: auto; padding: 24px 18px; border-radius: 16px; }
+  .settings-card { max-height: calc(100dvh - 20px); }
+  .library-card { width: 100%; }
+}
+
+/* 手机端深色模式补充：抽屉阴影与抓手条颜色 */
+@media (max-width: 768px) {
+  html[data-theme="dark"] .ai-panel { box-shadow: 0 -18px 50px rgba(0,0,0,.55); }
+  html[data-theme="dark"] .ai-header::before { background: #3a453f; }
+}

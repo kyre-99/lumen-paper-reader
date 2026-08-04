@@ -66,6 +66,7 @@ import {
 } from "lucide-react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { pdfWorkerSrcWithPolyfill } from "./pdf-uint8-polyfill";
 import { DEFAULT_PROMPTS, type PromptConfig } from "./chat-prompts";
 import { parseReferences, parseAuthorYearReferences, matchAuthorYearEntry, type AuthorYearCitation } from "./references";
 
@@ -892,7 +893,7 @@ async function capturePageRegion(pdf: PdfDocumentLike, pageNumber: number, regio
 
 // 页面虚拟化：IntersectionObserver 只挂载滚动容器可视区上下约 2 页的 canvas/TextLayer，
 // 视区外的页退化为带尺寸的占位 div；data-page-number 始终挂在根元素上，滚动定位/当前页检测不受影响
-const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, showFormula, onFormula, onTextLayerReady, onThumbnail, registerRef, registerThumbRequest }: { pdf: any; pageNumber: number; zoom: number; baseSize: { width: number; height: number }; showFormula: boolean; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void; registerRef?: (pageNumber: number, el: HTMLElement | null) => void; registerThumbRequest?: (pageNumber: number, listener: (() => void) | null) => void }) {
+const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, showFormula, onFormula, onTextLayerReady, onThumbnail, onRenderError, registerRef, registerThumbRequest }: { pdf: any; pageNumber: number; zoom: number; baseSize: { width: number; height: number }; showFormula: boolean; onFormula: (formula: FormulaAnchor) => void; onTextLayerReady: (pageNumber: number) => void; onThumbnail?: (pageNumber: number, dataUrl: string) => void; onRenderError?: (pageNumber: number, message: string) => void; registerRef?: (pageNumber: number, el: HTMLElement | null) => void; registerThumbRequest?: (pageNumber: number, listener: (() => void) | null) => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -1038,13 +1039,17 @@ const PdfPage = React.memo(function PdfPage({ pdf, pageNumber, zoom, baseSize, s
         };
       }).filter((item): item is NonNullable<typeof item> => Boolean(item));
       setFormulaAnchors(detected);
-    })().catch(() => undefined);
+    })().catch((error) => {
+      // 渲染取消（缩放/翻页重挂载）是正常流程；其余失败不能静默吞掉——否则白卡无内容且无任何线索
+      if (cancelled || error?.name === "RenderingCancelledException") return;
+      onRenderError?.(pageNumber, error?.message || String(error));
+    });
     return () => {
       cancelled = true;
       renderTask?.cancel?.();
       textLayer?.cancel?.();
     };
-  }, [nearViewport, onTextLayerReady, pdf, pageNumber, zoom]);
+  }, [nearViewport, onTextLayerReady, onRenderError, pdf, pageNumber, zoom]);
 
   // 缩略图独立生成（白底小图，避免透明）：每页每文档只生成一次，不随缩放重建，也不随虚拟化挂载状态变化；
   // 懒生成：只有对应 ThumbItem 进入过视口附近（thumbWanted）才渲染，未生成时缩略图位显示占位 spinner
@@ -1094,7 +1099,7 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
     let cancelled = false;
     (async () => {
       const pdfjs = await import("pdfjs-dist");
-      pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+      pdfjs.GlobalWorkerOptions.workerSrc = await pdfWorkerSrcWithPolyfill(pdfWorkerUrl);
       task = pdfjs.getDocument(typeof source === "string" ? { url: source } : { data: source });
       const loaded = await task.promise;
       if (!cancelled) {
@@ -1169,7 +1174,7 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
   if (!pdf) {
     return <div className="pdf-loading"><LoaderCircle className="spin" size={22} /><span>正在解析论文版面…</span></div>;
   }
-  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} baseSize={baseSize} showFormula={showFormula} onFormula={onFormula} onTextLayerReady={onTextLayerReady} onThumbnail={onThumbnail} registerRef={registerRef} registerThumbRequest={registerThumbRequest} />)}</div>;
+  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} baseSize={baseSize} showFormula={showFormula} onFormula={onFormula} onTextLayerReady={onTextLayerReady} onThumbnail={onThumbnail} onRenderError={(page, message) => onError?.(`第 ${page} 页渲染失败：${message}`)} registerRef={registerRef} registerThumbRequest={registerThumbRequest} />)}</div>;
 });
 
 // 缩略图窗口化：IntersectionObserver 只给可视区上下约 5 项挂载 <img>，其余保留同尺寸占位（aspect-ratio 固定，布局不抖动）
@@ -1866,6 +1871,17 @@ export default function Home() {
     thumbResizeRef.current = { startX: event.clientX, startWidth: thumbWidth };
     setThumbResizing(true);
   }, [thumbWidth]);
+  // 窄屏初始状态：挂载后检测一次，手机默认收起 AI 面板与缩略图栏；只设置一次，之后用户手动切换不再覆盖。
+  // 不能在 useState 初始化器里读 matchMedia（SSR 与水合 HTML 必须一致），effect 内同步 setState 又会触发
+  // 级联渲染告警，故推到宏任务里执行
+  useEffect(() => {
+    if (!window.matchMedia("(max-width: 768px)").matches) return;
+    const timer = window.setTimeout(() => {
+      setRightOpen(false);
+      setThumbsOpen("hide");
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [setThumbsOpen]);
   // 缩略图栏抓手拖动滚动；拖动超过阈值时抑制点击跳页
   const thumbRailRef = useRef<HTMLElement | null>(null);
   const thumbPanRef = useRef<{ startY: number; startScroll: number } | null>(null);
@@ -1996,6 +2012,17 @@ export default function Home() {
   const [draggingId, setDraggingId] = useState<number | null>(null);
   const [flashedFormulaIds, setFlashedFormulaIds] = useState<Set<number>>(() => new Set());
   const readerRef = useRef<HTMLDivElement>(null);
+  // 阅读区实测宽度：窄屏时用来把演示稿整体缩放到屏宽（transform 缩放不改变布局会留出横向空白，故用 CSS zoom）
+  // 初始值必须为 0：SSR 与客户端首次渲染保持一致（桌面分支），否则水合时残留的 transform 样式不会被清除
+  const [readerWidth, setReaderWidth] = useState(0);
+  useEffect(() => {
+    const reader = readerRef.current;
+    if (!reader) return;
+    setReaderWidth(reader.clientWidth);
+    const observer = new ResizeObserver(() => setReaderWidth(reader.clientWidth));
+    observer.observe(reader);
+    return () => observer.disconnect();
+  }, []);
   const selectionRangeRef = useRef<Range | null>(null);
   const annotationRangesRef = useRef(new Map<number, { range: Range; color: HighlightColor; persistent: boolean }>());
   const annotationAnchorsRef = useRef(new Map<number, { top: number; left: number }>());
@@ -2392,6 +2419,19 @@ export default function Home() {
     return () => window.clearTimeout(timer);
   }, [source, zoom]);
 
+  // 窄屏补充校正：PDF 页面异步渲染完成后版面才真正撑宽（上面的 60ms 校正跑在加载前，scrollWidth 还是估算值），
+  // 文本层每就绪一批就重新居中一次；宽屏仍只按上面的既有时机，桌面行为不变
+  useEffect(() => {
+    if (!textLayerVersion) return;
+    if (!window.matchMedia("(max-width: 768px)").matches) return;
+    const timer = window.setTimeout(() => {
+      const reader = readerRef.current;
+      if (!reader) return;
+      reader.scrollLeft = Math.max(0, (reader.scrollWidth - reader.clientWidth) / 2);
+    }, 60);
+    return () => window.clearTimeout(timer);
+  }, [textLayerVersion]);
+
   useEffect(() => {
     const error = new URLSearchParams(window.location.search).get("auth_error");
     if (error) {
@@ -2480,14 +2520,18 @@ export default function Home() {
           setPageCount(paper.pageCount || 1);
           setCurrentPage(workspace.currentPage || 1);
           pendingScrollPageRef.current = workspace.currentPage || 1;
-          setZoom(workspace.zoom || 0.88);
-          setRightOpen(workspace.rightOpen !== false);
+          // 窄屏（手机）：桌面保存的高缩放/面板展开状态不适用——缩放封顶 100%，AI 面板默认收起
+          const narrowScreen = window.matchMedia("(max-width: 768px)").matches;
+          const restoredZoom = narrowScreen ? Math.min(workspace.zoom || 0.88, 1) : workspace.zoom || 0.88;
+          const restoredRightOpen = narrowScreen ? false : workspace.rightOpen !== false;
+          setZoom(restoredZoom);
+          setRightOpen(restoredRightOpen);
           setMessages(restoredMessages);
           setAnnotations(restoredAnnotations);
           setConversations(restoredConversations);
           setHistoryOpen(false);
           // 记录恢复内容的快照，自动保存据此跳过未变更的"原样写回"
-          lastSavedSnapshotRef.current = workspaceSnapshot({ paperId: paper.id, title: paper.title, meta: paper.meta, sourceKind: paper.sourceKind, sourceUrl: paper.sourceUrl || null, paperText: "", pageCount: paper.pageCount || 1, currentPage: workspace.currentPage || 1, zoom: workspace.zoom || 0.88, rightOpen: workspace.rightOpen !== false, messages: restoredMessages, conversations: restoredConversations, annotationsJson: serializePersistentAnnotations(restoredAnnotations) });
+          lastSavedSnapshotRef.current = workspaceSnapshot({ paperId: paper.id, title: paper.title, meta: paper.meta, sourceKind: paper.sourceKind, sourceUrl: paper.sourceUrl || null, paperText: "", pageCount: paper.pageCount || 1, currentPage: workspace.currentPage || 1, zoom: restoredZoom, rightOpen: restoredRightOpen, messages: restoredMessages, conversations: restoredConversations, annotationsJson: serializePersistentAnnotations(restoredAnnotations) });
           lastSavedTextRef.current = paper.paperText || "";
           if (paper.sourceKind === "upload") {
             skipReadyToastRef.current = true;
@@ -2874,17 +2918,10 @@ export default function Home() {
     });
   }, []);
 
-  const handleSelection = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
-    window.cancelAnimationFrame(selectionFrameRef.current);
-    const pointerStart = selectionPointerRef.current;
-    selectionPointerRef.current = null;
+  // 拿到选区 range 之后的呈现逻辑（修剪/校验/高亮/弹出工具条）：鼠标拖拽与触屏原生选区共用，保证两端行为一致
+  const presentSelection = useCallback((rawRange: Range) => {
     const selection = window.getSelection();
-    const endRoot = (event.target as HTMLElement).closest(".textLayer, .demo-paper");
-    const pointerRange = pointerStart?.root.isConnected && endRoot === pointerStart.root
-      ? rangeFromPointerPoints(pointerStart.root, { x: pointerStart.x, y: pointerStart.y }, { x: event.clientX, y: event.clientY })
-      : null;
-    if ((!pointerRange || pointerRange.collapsed) && !selection?.rangeCount) { setSelectionRects([]); return; }
-    const range = trimRangeToText(pointerRange && !pointerRange.collapsed ? pointerRange : selection!.getRangeAt(0));
+    const range = trimRangeToText(rawRange);
     const text = range.toString().replace(/\s+/g, " ").trim();
     if (!text || text.length < 2) { setSelectionRects([]); return; }
     selection?.removeAllRanges();
@@ -2912,10 +2949,58 @@ export default function Home() {
     setSelectionContext(surrounding);
     selectionRangeRef.current = range.cloneRange();
     setSelectionAnchor({ top: anchorTop, left: anchorLeft, cardTop: anchorTop + 15, cardLeft: anchorLeft + 358 > visibleRight ? Math.max(readerRef.current.scrollLeft + 14, anchorLeft - 360) : anchorLeft + 15, pageNumber });
-    setSelectionPos({ x: Math.min(Math.max(rect.left + Math.min(rect.width / 2, 100), 190), window.innerWidth - 220), y: Math.max(rect.top - 58, 72) });
+    // 窄屏时工具条直接水平居中（配合 CSS max-width 钳在屏内）；桌面端钳制逻辑保持不变
+    const narrowScreen = window.innerWidth < 600;
+    setSelectionPos({ x: narrowScreen ? window.innerWidth / 2 : Math.min(Math.max(rect.left + Math.min(rect.width / 2, 100), 190), window.innerWidth - 220), y: Math.max(rect.top - 58, 72) });
     setShowColors(false);
     dismissReaderTip();
   }, [dismissReaderTip]);
+
+  const handleSelection = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    window.cancelAnimationFrame(selectionFrameRef.current);
+    const pointerStart = selectionPointerRef.current;
+    selectionPointerRef.current = null;
+    const selection = window.getSelection();
+    const endRoot = (event.target as HTMLElement).closest(".textLayer, .demo-paper");
+    const pointerRange = pointerStart?.root.isConnected && endRoot === pointerStart.root
+      ? rangeFromPointerPoints(pointerStart.root, { x: pointerStart.x, y: pointerStart.y }, { x: event.clientX, y: event.clientY })
+      : null;
+    if ((!pointerRange || pointerRange.collapsed) && !selection?.rangeCount) { setSelectionRects([]); return; }
+    presentSelection(pointerRange && !pointerRange.collapsed ? pointerRange : selection!.getRangeAt(0));
+  }, [presentSelection]);
+
+  // 触屏划词：手机端没有鼠标拖拽，长按由浏览器产生原生选区；松手（touchend）后取该选区复用同一套呈现逻辑。
+  // selectionchange 负责在原生选区被清空（点按空白处等）时同步收起工具条。
+  useEffect(() => {
+    if (!("ontouchstart" in window)) return;
+    const reader = readerRef.current;
+    if (!reader) return;
+    const presentNativeSelection = () => {
+      // 原生选区在 touchend 同一帧之后才稳定，延迟一拍再读取
+      window.setTimeout(() => {
+        const selection = window.getSelection();
+        if (!selection || selection.isCollapsed || !selection.rangeCount) return;
+        const range = selection.getRangeAt(0);
+        const node = range.commonAncestorContainer.nodeType === Node.TEXT_NODE ? range.commonAncestorContainer.parentElement : range.commonAncestorContainer as HTMLElement;
+        if (!node?.closest?.(".textLayer, .demo-paper")) return;
+        // 与鼠标路径一致：批注卡片/气泡等浮层内的选区不弹工具条
+        if (node.closest(".inline-card, .pdf-text-note, .citation-popover, .pdf-context-menu, .selection-menu, .figure-lasso-actions, .formula-assist")) return;
+        presentSelection(range);
+      }, 60);
+    };
+    const clearOnCollapse = () => {
+      const selection = window.getSelection();
+      if (selection && !selection.isCollapsed) return;
+      setSelectionRects([]);
+      setSelectionPos(null);
+    };
+    reader.addEventListener("touchend", presentNativeSelection, { passive: true });
+    document.addEventListener("selectionchange", clearOnCollapse);
+    return () => {
+      reader.removeEventListener("touchend", presentNativeSelection);
+      document.removeEventListener("selectionchange", clearOnCollapse);
+    };
+  }, [presentSelection]);
 
   // 引用点按：与划词共用手指流程——只有「位移 < 5px 且没有产生选区」的按下才算点击
   const handleCitationClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
@@ -3744,14 +3829,18 @@ export default function Home() {
       setPageCount(paper.pageCount || 1);
       setCurrentPage(workspace.currentPage || 1);
       pendingScrollPageRef.current = workspace.currentPage || 1;
-      setZoom(workspace.zoom || 0.88);
-      setRightOpen(workspace.rightOpen !== false);
+      // 窄屏（手机）：桌面保存的高缩放/面板展开状态不适用——缩放封顶 100%，AI 面板默认收起
+      const narrowScreen = window.matchMedia("(max-width: 768px)").matches;
+      const restoredZoom = narrowScreen ? Math.min(workspace.zoom || 0.88, 1) : workspace.zoom || 0.88;
+      const restoredRightOpen = narrowScreen ? false : workspace.rightOpen !== false;
+      setZoom(restoredZoom);
+      setRightOpen(restoredRightOpen);
       setMessages(restoredMessages);
       setAnnotations(restoredAnnotations);
       setConversations(restoredConversations);
       setHistoryOpen(false);
       // 记录恢复内容的快照，自动保存据此跳过未变更的"原样写回"
-      lastSavedSnapshotRef.current = workspaceSnapshot({ paperId: paper.id, title: paper.title, meta: paper.meta, sourceKind: paper.sourceKind, sourceUrl: paper.sourceUrl || null, paperText: "", pageCount: paper.pageCount || 1, currentPage: workspace.currentPage || 1, zoom: workspace.zoom || 0.88, rightOpen: workspace.rightOpen !== false, messages: restoredMessages, conversations: restoredConversations, annotationsJson: serializePersistentAnnotations(restoredAnnotations) });
+      lastSavedSnapshotRef.current = workspaceSnapshot({ paperId: paper.id, title: paper.title, meta: paper.meta, sourceKind: paper.sourceKind, sourceUrl: paper.sourceUrl || null, paperText: "", pageCount: paper.pageCount || 1, currentPage: workspace.currentPage || 1, zoom: restoredZoom, rightOpen: restoredRightOpen, messages: restoredMessages, conversations: restoredConversations, annotationsJson: serializePersistentAnnotations(restoredAnnotations) });
       lastSavedTextRef.current = paper.paperText || "";
       if (paper.sourceKind === "upload") {
         skipReadyToastRef.current = true;
@@ -4108,6 +4197,8 @@ export default function Home() {
             </button>
             <EffortControl effort={effort} onChange={setEffort} />
             <button className="secondary-button compact" onClick={() => setOpenModal(true)}><Plus size={16} />打开论文</button>
+            {/* 手机端隐藏左栏后，文库入口挪到顶栏（宽屏下由 CSS 隐藏，避免与左栏重复） */}
+            <button className="icon-button mobile-library-button" aria-label="我的文库" title="我的文库" onClick={showLibrary}><Library size={19} /></button>
             <button className="icon-button" aria-label={rightOpen ? "收起 AI" : "展开 AI"} title={rightOpen ? "收起 AI 面板" : "展开 AI 面板"} onClick={() => setRightOpen(!rightOpen)}>{rightOpen ? <PanelRightClose size={19} /> : <PanelRightOpen size={19} />}</button>
           </div>
         </header>
@@ -4156,7 +4247,10 @@ export default function Home() {
                 <button className="secondary-button" onClick={() => setLoadError(null)}>回到演示</button>
               </div>
             </div>
-          ) : <div style={{ transform: `scale(${zoom})`, transformOrigin: "top center", width: "fit-content", minWidth: "calc(100% + 480px)", margin: "0 auto" }}><DemoPaper /></div>}
+          ) : readerWidth > 0 && readerWidth <= 768 ? (
+            // 窄屏：演示稿保持 760px 设计宽度，用 CSS zoom 整体缩放到屏宽（zoom 会改变布局尺寸，不留横向滚动空白）
+            <div className="demo-paper-wrap" style={{ zoom: (readerWidth - 44) / 760 }}><DemoPaper /></div>
+          ) : <div className="demo-paper-wrap" style={{ transform: `scale(${zoom})`, transformOrigin: "top center" }}><DemoPaper /></div>}
           {selectionRects.map((rect, index) => <div key={`selection-${index}`} className="selection-overlay-rect" style={rect} aria-hidden="true" />)}
           {citationFlash.map((rect, index) => <div key={`citation-flash-${index}`} className="citation-flash-rect" style={rect} aria-hidden="true" />)}
           {annotations.filter((annotation) => (annotation.kind === "formula" || annotation.kind === "figure") && flashedFormulaIds.has(annotation.id) && annotation.formulaRegionLeft !== undefined && annotation.formulaRegionTop !== undefined && annotation.formulaRegionPixelWidth !== undefined && annotation.formulaRegionPixelHeight !== undefined).map((annotation) => (

@@ -43,3 +43,6 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# capacitor android 工程（可随时用 npx cap add android 重新生成）
+/android/

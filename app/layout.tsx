@@ -4,6 +4,8 @@ import "./globals.css";
 import { PwaRegister } from "./pwa-register";
 
 export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
   themeColor: "#2F6C5B",
 };
 

@@ -103,6 +103,15 @@ cd lumen-paper-reader
 
 > 注意：PWA 窗口只是应用的"外壳"，阅读器本体仍是本地服务——使用时需要先确保服务已启动。图标如需重新生成，运行 `npm run icons`。
 
+### 构建安卓 App（Capacitor，可选）
+
+仓库已集成 Capacitor，安卓 App 是线上站点的 WebView 外壳（加载 `capacitor.config.ts` 里的 `server.url`），网页端更新后 App 自动跟进，无需重新发版。
+
+1. 安装 JDK 17 与 Android SDK（或直接安装 Android Studio）
+2. 生成原生工程（已 gitignore，不随仓库分发）：`npx cap add android`
+3. 构建安装包：`cd android && ./gradlew assembleDebug`，产物在 `android/app/build/outputs/apk/debug/app-debug.apk`
+4. 修改 `capacitor.config.ts` 后执行 `npx cap sync android` 同步进原生工程
+
 ## 使用指南
 
 **1. 打开论文**

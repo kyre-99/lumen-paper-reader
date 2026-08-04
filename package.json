@@ -23,6 +23,8 @@
     "icons": "node scripts/generate-icons.mjs"
   },
   "dependencies": {
+    "@capacitor/android": "^8.5.0",
+    "@capacitor/core": "^8.5.0",
     "@supabase/ssr": "^0.12.3",
     "drizzle-orm": "0.45.2",
     "katex": "^0.18.1",
@@ -37,6 +39,7 @@
     "remark-math": "^6.0.0"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.5.0",
     "@cloudflare/vite-plugin": "1.37.1",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",

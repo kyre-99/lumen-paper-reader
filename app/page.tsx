@@ -23,6 +23,7 @@ import {
   Cloud,
   CloudOff,
   Copy,
+  Crop,
   Download,
   FileText,
   FolderOpen,
@@ -55,6 +56,7 @@ import {
   Sparkles,
   Square,
   SquarePen,
+  Star,
   Sun,
   Trash2,
   Type,
@@ -191,7 +193,7 @@ const PAPER_STATUS_OPTIONS: Array<{ value: PaperStatus; label: string }> = [
   { value: "reading", label: "阅读中" },
   { value: "done", label: "已阅读" },
 ];
-type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; sourceKind: PaperSourceKind; sourceUrl: string | null; pageCount: number; status: PaperStatus; createdAt: string; updatedAt: string };
+type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; sourceKind: PaperSourceKind; sourceUrl: string | null; pageCount: number; status: PaperStatus; rating: number; createdAt: string; updatedAt: string };
 type LibraryFolder = { id: string; name: string; createdAt?: string; updatedAt: string };
 type UsageStats = {
   totalCalls: number; promptTokens: number; completionTokens: number; totalTokens: number;
@@ -1236,22 +1238,29 @@ function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => voi
   );
 }
 
-function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpenPaper, onAddPaper, onCreateFolder, onMovePaper, onSetStatus, onDeletePaper, onRenamePaper, onRenameFolder, onDeleteFolder }: { onClose: () => void; papers: LibraryPaper[]; folders: LibraryFolder[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void; onCreateFolder: (name: string) => Promise<LibraryFolder | null>; onMovePaper: (paperId: string, folderId: string | null) => Promise<boolean>; onSetStatus: (paperId: string, status: PaperStatus) => Promise<boolean>; onDeletePaper: (id: string) => Promise<boolean>; onRenamePaper: (id: string, title: string) => Promise<boolean>; onRenameFolder: (id: string, name: string) => Promise<boolean>; onDeleteFolder: (id: string) => Promise<boolean> }) {
+function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpenPaper, onAddPaper, onCreateFolder, onMovePaper, onSetStatus, onRatePaper, onDeletePaper, onRenamePaper, onRenameFolder, onDeleteFolder }: { onClose: () => void; papers: LibraryPaper[]; folders: LibraryFolder[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void; onCreateFolder: (name: string) => Promise<LibraryFolder | null>; onMovePaper: (paperId: string, folderId: string | null) => Promise<boolean>; onSetStatus: (paperId: string, status: PaperStatus) => Promise<boolean>; onRatePaper: (paperId: string, rating: number) => Promise<boolean>; onDeletePaper: (id: string) => Promise<boolean>; onRenamePaper: (id: string, title: string) => Promise<boolean>; onRenameFolder: (id: string, name: string) => Promise<boolean>; onDeleteFolder: (id: string) => Promise<boolean> }) {
   const [activeFolder, setActiveFolder] = useState("all");
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [folderName, setFolderName] = useState("");
   const [folderSaving, setFolderSaving] = useState(false);
   const [search, setSearch] = useState("");
+  // 筛选栏：阅读状态分段 chip + 星级下拉，只在弹窗生命周期内保持，不持久化
+  const [statusFilter, setStatusFilter] = useState<"all" | PaperStatus>("all");
+  const [ratingFilter, setRatingFilter] = useState<"all" | number>("all");
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
+  // 文件夹、状态、星级、标题搜索四个条件叠加取交集
   const visiblePapers = useMemo(() => {
     const byFolder = activeFolder === "all" ? papers : activeFolder === "unfiled" ? papers.filter((paper) => !paper.folderId) : papers.filter((paper) => paper.folderId === activeFolder);
+    const byStatus = statusFilter === "all" ? byFolder : byFolder.filter((paper) => (paper.status || "unread") === statusFilter);
+    const byRating = ratingFilter === "all" ? byStatus : byStatus.filter((paper) => (paper.rating || 0) === ratingFilter);
     const keyword = search.trim().toLowerCase();
-    return keyword ? byFolder.filter((paper) => paper.title.toLowerCase().includes(keyword)) : byFolder;
-  }, [papers, activeFolder, search]);
+    return keyword ? byRating.filter((paper) => paper.title.toLowerCase().includes(keyword)) : byRating;
+  }, [papers, activeFolder, search, statusFilter, ratingFilter]);
+  const filtering = statusFilter !== "all" || ratingFilter !== "all";
   const activeFolderName = activeFolder === "all" ? "全部论文" : activeFolder === "unfiled" ? "未分类" : folders.find((folder) => folder.id === activeFolder)?.name || "文件夹";
   const createFolder = async () => {
     const name = folderName.trim();
@@ -1286,6 +1295,21 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
           </aside>
           <section className="library-content">
             <div className="library-content-title"><strong>{activeFolderName}</strong><span>{visiblePapers.length} 篇</span></div>
+            {/* 筛选栏：状态分段 chip + 星级下拉，与搜索框、左侧文件夹叠加生效 */}
+            <div className="library-filters">
+              <div className="library-filter-chips" role="group" aria-label="按阅读状态筛选">
+                <button className={statusFilter === "all" ? "active" : ""} onClick={() => setStatusFilter("all")}>全部</button>
+                {PAPER_STATUS_OPTIONS.map((option) => <button key={option.value} className={statusFilter === option.value ? "active" : ""} onClick={() => setStatusFilter(option.value)}>{option.label}</button>)}
+              </div>
+              <label className="library-folder-select library-rating-select" title="按星级筛选">
+                <Star size={12} />
+                <select aria-label="按星级筛选" value={ratingFilter === "all" ? "all" : String(ratingFilter)} onChange={(event) => setRatingFilter(event.target.value === "all" ? "all" : Number(event.target.value))}>
+                  <option value="all">全部星级</option>
+                  {[5, 4, 3, 2, 1].map((star) => <option key={star} value={star}>{star} 星</option>)}
+                  <option value="0">未评分</option>
+                </select>
+              </label>
+            </div>
             <input className="library-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索论文标题…" aria-label="搜索论文标题" />
             {loading ? <div className="library-loading"><LoaderCircle className="spin" size={18} />正在读取文库…</div> : visiblePapers.length ? (
               <div className="library-list">
@@ -1298,6 +1322,14 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
                     </button>
                     <button className="folder-action" aria-label={`重命名《${paper.title}》`} title="重命名论文（自动识别的标题有误时可以手动改）" onClick={() => { const title = window.prompt("论文标题", paper.title)?.trim(); if (title && title !== paper.title) void onRenamePaper(paper.id, title); }}><SquarePen size={14} /></button>
                     <button className="folder-action library-delete" aria-label={`删除《${paper.title}》`} title="删除论文（对话和批注一起删除）" onClick={() => { if (window.confirm(`确定删除《${paper.title}》吗？对话和批注会一起删除，无法恢复。`)) void onDeletePaper(paper.id); }}><Trash2 size={14} /></button>
+                    {/* 星级评分：点第 N 颗评 N 星，再点当前分值那颗清零；0 星时五颗全空心 */}
+                    <div className="library-rating" role="group" aria-label={`《${paper.title}》的评分`}>
+                      {[1, 2, 3, 4, 5].map((star) => (
+                        <button key={star} className={star <= paper.rating ? "filled" : ""} aria-label={star === paper.rating ? `清除《${paper.title}》的评分` : `给《${paper.title}》评 ${star} 星`} title={star === paper.rating ? "清除评分" : `评 ${star} 星`} onClick={() => void onRatePaper(paper.id, star === paper.rating ? 0 : star)}>
+                          <Star size={13} fill={star <= paper.rating ? "currentColor" : "none"} />
+                        </button>
+                      ))}
+                    </div>
                     <div className="library-meta-row">
                       <small>{paper.meta || `${paper.pageCount} 页`} · {new Date(paper.updatedAt).toLocaleDateString("zh-CN")}</small>
                       <label className={`library-status-select ${paper.status || "unread"}`} title="阅读状态">
@@ -1317,7 +1349,7 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
                   </div>
                 ))}
               </div>
-            ) : <div className="library-empty"><FolderOpen size={28} /><strong>{search.trim() ? "没有标题匹配的论文" : papers.length ? "这个文件夹还是空的" : "文库还是空的"}</strong><p>{search.trim() ? "换个关键词试试，或清空搜索。" : papers.length ? "可以从其他文件夹把论文移动到这里。" : "打开链接或上传 PDF 后会自动出现在这里。"}</p></div>}
+            ) : <div className="library-empty"><FolderOpen size={28} /><strong>{search.trim() ? "没有标题匹配的论文" : filtering ? "没有符合筛选的论文" : papers.length ? "这个文件夹还是空的" : "文库还是空的"}</strong><p>{search.trim() ? "换个关键词试试，或清空搜索。" : filtering ? "调整筛选条件试试。" : papers.length ? "可以从其他文件夹把论文移动到这里。" : "打开链接或上传 PDF 后会自动出现在这里。"}</p></div>}
           </section>
         </div>
         <button className="primary-button wide" onClick={onAddPaper}><Plus size={16} />添加论文</button>
@@ -2083,6 +2115,10 @@ export default function Home() {
   const [figureLasso, setFigureLasso] = useState(false);
   const [lassoRect, setLassoRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
   const [figureRegion, setFigureRegion] = useState<FigureRegionSelection | null>(null);
+  // 专注模式：隐藏所有栏位只留阅读区（瞬态，不持久化；ESC 或右下角浮动按钮退出）
+  const [focusMode, setFocusMode] = useState(false);
+  // 专注模式下的边缘唤出：鼠标贴近屏幕左/右缘临时滑出左栏/AI 面板（只在 focusMode 下生效）
+  const [focusPeek, setFocusPeek] = useState<"left" | "right" | null>(null);
   const lassoStartRef = useRef<{ x: number; y: number; page: HTMLElement } | null>(null);
   const lassoRectRef = useRef<{ left: number; top: number; width: number; height: number } | null>(null);
   // 已加载的 pdf.js 文档实例，供框选区域截图使用
@@ -2381,6 +2417,8 @@ export default function Home() {
         if (selectionPos) { setSelectionPos(null); setSelectionRects([]); window.getSelection()?.removeAllRanges(); return; }
         if (pdfContextMenu) { setPdfContextMenu(null); return; }
         if (shortcutsOpen) { setShortcutsOpen(false); return; }
+        // 专注模式最后退：框选激活时 Esc 先退内层的框选（见 figureLasso 专属的 Esc 处理），这里没有框选活动才退专注
+        if (focusMode && !figureLasso && !figureRegion) { setFocusPeek(null); setFocusMode(false); return; }
         return;
       }
       // 帮助浮层打开时，其余按键不穿透到阅读器
@@ -2393,7 +2431,27 @@ export default function Home() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [citationPopover, focusComposer, libraryOpen, openModal, openSearch, pdfContextMenu, searchOpen, selectionPos, settingsOpen, shortcutsOpen, source, statsOpen, usageOpen]);
+  }, [citationPopover, figureLasso, figureRegion, focusComposer, focusMode, libraryOpen, openModal, openSearch, pdfContextMenu, searchOpen, selectionPos, settingsOpen, shortcutsOpen, source, statsOpen, usageOpen]);
+
+  // 专注模式边缘唤出（peek）：鼠标贴近屏幕左/右缘（<20px）临时滑出左栏/AI 面板，移开越过栏宽+余量才收回
+  // （进出阈值不同，带迟滞防边缘抖动）。只在 focusMode 下挂载；手机端没有 mousemove，天然不触发。
+  // 退出专注模式的三个出口（工具条按钮/ESC/浮动按钮）各自负责把 focusPeek 归零
+  useEffect(() => {
+    if (!focusMode) return;
+    const onMouseMove = (event: MouseEvent) => {
+      const x = event.clientX;
+      const width = window.innerWidth;
+      setFocusPeek((current) => {
+        if (current === "left") return x > 116 ? null : current;
+        if (current === "right") return x < width - panelWidth - 40 ? null : current;
+        if (x < 20) return "left";
+        if (x > width - 20) return "right";
+        return current;
+      });
+    };
+    window.addEventListener("mousemove", onMouseMove);
+    return () => window.removeEventListener("mousemove", onMouseMove);
+  }, [focusMode, panelWidth]);
 
   // 打开/恢复论文后，等文本层渲染出来再滚动到上次阅读页
   useEffect(() => {
@@ -3722,6 +3780,21 @@ export default function Home() {
     }
   }, []);
 
+  // 星级评分：点第 N 颗评 N 星，再点当前分值那颗清零；沿用「先请求后更新、失败提示」的文库更新模式
+  const rateLibraryPaper = useCallback(async (id: string, rating: number) => {
+    try {
+      const response = await fetch(`/api/papers/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ rating }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "评分失败");
+      setLibraryPapers((papers) => papers.map((paper) => paper.id === id ? { ...paper, rating, updatedAt: payload.paper?.updatedAt || paper.updatedAt } : paper));
+      return true;
+    } catch (error: unknown) {
+      setLibraryPapers((papers) => [...papers]);
+      setToast({ text: errorMessage(error, "评分失败"), kind: "error" });
+      return false;
+    }
+  }, []);
+
   const renameLibraryPaper = useCallback(async (id: string, title: string) => {
     try {
       const response = await fetch(`/api/papers/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title }) });
@@ -4144,7 +4217,7 @@ export default function Home() {
   }
 
   return (
-    <main className={`app-shell font-${uiFontSize} ${rightOpen ? "right-open" : "right-closed"}${panelResizing ? " panel-resizing" : ""}`} style={{ "--panel-w": `${panelWidth}px` } as React.CSSProperties}>
+    <main className={`app-shell font-${uiFontSize} ${rightOpen ? "right-open" : "right-closed"}${panelResizing ? " panel-resizing" : ""}${focusMode ? " focus-mode" : ""}${focusMode && focusPeek ? ` focus-peek-${focusPeek}` : ""}`} style={{ "--panel-w": `${panelWidth}px` } as React.CSSProperties}>
       <aside className="app-rail">
         <BrandMark />
         <nav className="rail-nav">
@@ -4212,7 +4285,8 @@ export default function Home() {
           <div className="toolbar-spacer" />
           <button className={`icon-button small ${panMode ? "active" : ""}`} aria-label={panMode ? "切换到选择模式" : "切换到抓手平移模式"} title={panMode ? "选择模式：划词翻译/高亮" : "抓手模式：左键拖动平移页面"} onClick={() => { setPanMode(!panMode); setToast({ text: panMode ? "已切回选择模式，可以划词标注" : "抓手模式：按住左键拖动页面，中键也可随时拖动" }); }}><Hand size={17} /></button>
           {source && <button className={`icon-button small ${formulaAssist === "show" ? "active" : ""}`} aria-label={formulaAssist === "show" ? "隐藏公式按钮" : "显示公式按钮"} title={formulaAssist === "show" ? "隐藏页面上的「问公式」按钮" : "显示页面上的「问公式」按钮"} onClick={() => setFormulaAssist(formulaAssist === "show" ? "hide" : "show")}><Sparkles size={17} /></button>}
-          {source && <button className={`icon-button small ${figureLasso ? "active" : ""}`} aria-label={figureLasso ? "退出框选图表" : "框选图表"} title={figureLasso ? "退出框选模式（ESC 或再次点击）" : "框选图表：在页面上拖出矩形，向 AI 询问图表内容"} onClick={() => { setFigureLasso(!figureLasso); setFigureRegion(null); setLassoRect(null); lassoStartRef.current = null; lassoRectRef.current = null; }}><Scan size={17} /></button>}
+          {source && <button className={`icon-button small ${figureLasso ? "active" : ""}`} aria-label={figureLasso ? "退出框选图表" : "框选图表"} title={figureLasso ? "退出框选模式（ESC 或再次点击）" : "框选图表：在页面上拖出矩形，向 AI 询问图表内容"} onClick={() => { setFigureLasso(!figureLasso); setFigureRegion(null); setLassoRect(null); lassoStartRef.current = null; lassoRectRef.current = null; }}><Crop size={17} /></button>}
+          <button className={`icon-button small ${focusMode ? "active" : ""}`} aria-label="专注模式" title="专注模式：隐藏所有栏位，只留阅读区（ESC 退出）" onClick={() => { if (focusMode) setFocusPeek(null); setFocusMode(!focusMode); }}><Scan size={17} /></button>
           <button className="icon-button small" aria-label="全屏" title="切换全屏" onClick={toggleFullscreen}><Maximize2 size={17} /></button>
         </div>
 
@@ -4478,18 +4552,20 @@ export default function Home() {
               <li><span className="shortcut-keys"><kbd>/</kbd></span><em>聚焦提问输入框</em></li>
               <li><span className="shortcut-keys"><kbd>←</kbd> / <kbd>→</kbd></span><em>上一页 / 下一页</em></li>
               <li><span className="shortcut-keys"><kbd>Enter</kbd> / <kbd>Shift</kbd>+<kbd>Enter</kbd></span><em>搜索时：下一个 / 上一个匹配</em></li>
-              <li><span className="shortcut-keys"><kbd>Esc</kbd></span><em>关闭当前浮层</em></li>
+              <li><span className="shortcut-keys"><kbd>Esc</kbd></span><em>关闭当前浮层；专注模式下退出专注模式</em></li>
               <li><span className="shortcut-keys"><kbd>?</kbd></span><em>打开 / 关闭本帮助</em></li>
             </ul>
           </div>
         </div>
       )}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
-      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} onDeletePaper={deleteLibraryPaper} onRenamePaper={renameLibraryPaper} onRenameFolder={renameLibraryFolder} onDeleteFolder={deleteLibraryFolder} />}
+      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} onRatePaper={rateLibraryPaper} onDeletePaper={deleteLibraryPaper} onRenamePaper={renameLibraryPaper} onRenameFolder={renameLibraryFolder} onDeleteFolder={deleteLibraryFolder} />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} visionConfig={visionConfig} setVisionConfig={setVisionConfig} />}
       {usageOpen && <UsageModal onClose={() => setUsageOpen(false)} stats={usageStats} loading={usageLoading} />}
       {statsOpen && <StatsModal onClose={() => setStatsOpen(false)} stats={readingStats} loading={statsLoading} onOpenPaper={(id) => { setStatsOpen(false); void openLibraryPaper(id); }} />}
       {toast && <div className={`toast${toast.kind === "error" ? " error" : ""}`}>{toast.kind === "error" ? <AlertCircle size={15} /> : <Check size={15} />}{toast.text}</div>}
+      {/* 专注模式的浮动退出按钮：栏位全部隐藏后，这是除 ESC 外的唯一出口，必须渲染在被隐藏的栏之外 */}
+      {focusMode && <button className="focus-exit-button" aria-label="退出专注模式" title="退出专注模式（ESC）" onClick={() => { setFocusPeek(null); setFocusMode(false); }}><Scan size={19} /></button>}
       {!authReady && <div className="auth-gate"><div className="auth-card"><BrandMark /><LoaderCircle className="spin" size={22} /><h2>正在确认登录状态</h2><p>正在安全地读取你的论文空间…</p></div></div>}
       {authReady && !user && <div className="auth-gate"><div className="auth-card"><BrandMark /><h2>开始使用文枢</h2><p>{guestDisabled ? "用邮箱接收验证码登录，论文、批注和对话会跨设备同步。" : "用邮箱接收验证码登录，论文、批注和对话会跨设备同步；也可以先用游客身份体验。"}</p>
         {emailStage === "input" ? (

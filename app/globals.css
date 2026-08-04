@@ -627,7 +627,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .new-folder-row input:focus { border-color: #8fb5a6; box-shadow: 0 0 0 2px rgba(71,128,106,.07); }
 .new-folder-row button { display: grid; place-items: center; border: 0; border-radius: 7px; background: var(--green); color: white; cursor: pointer; }
 .new-folder-row button:disabled { opacity: .45; cursor: default; }
-.library-content { min-width: 0; min-height: 0; display: grid; grid-template-rows: 42px auto minmax(0, 1fr); padding: 0 11px 11px; }
+.library-content { min-width: 0; min-height: 0; display: grid; grid-template-rows: 42px auto auto minmax(0, 1fr); padding: 0 11px 11px; }
 .library-content-title { display: flex; align-items: center; justify-content: space-between; padding: 0 3px; border-bottom: 1px solid #edf0ee; }
 .library-content-title strong { color: #394740; font-size: 11px; }
 .library-content-title span { color: #8a948f; font-size: 9px; }
@@ -642,6 +642,20 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .library-open { color: var(--green); font-size: 9px; font-weight: 650; }
 /* 元信息行：来源/日期与状态、文件夹选择器同一行，紧凑小胶囊样式 */
 .library-meta-row { grid-column: 1 / -1; min-width: 0; display: flex; align-items: center; gap: 7px; padding-left: 45px; }
+/* 星级评分行：标题与 meta 行之间，与 meta 行左对齐；0 星时五颗全空心，低调不抢眼 */
+.library-rating { grid-column: 1 / -1; display: flex; align-items: center; gap: 1px; padding-left: 45px; }
+.library-rating button { display: grid; place-items: center; padding: 2px; border: 0; background: transparent; color: var(--muted); cursor: pointer; transition: color .16s var(--ease-out), transform .14s var(--ease-spring); }
+.library-rating button:hover { transform: scale(1.18); }
+.library-rating button.filled { color: var(--amber); }
+/* 筛选栏：状态分段 chip + 星级下拉，位于搜索框上方；星级下拉直接复用 .library-folder-select 的胶囊样式（暗色规则一并继承） */
+.library-filters { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; }
+.library-filter-chips { min-width: 0; display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; }
+.library-filter-chips::-webkit-scrollbar { display: none; }
+.library-filter-chips button { flex: 0 0 auto; height: 26px; padding: 0 10px; border: 1px solid var(--line); border-radius: 13px; background: transparent; color: var(--muted); font-size: 10px; cursor: pointer; transition: color .16s var(--ease-out), border-color .16s var(--ease-out), background .16s var(--ease-out), transform .14s var(--ease-spring); }
+.library-filter-chips button:hover { border-color: #c7dcd3; color: var(--green); }
+.library-filter-chips button:active { transform: scale(.95); }
+.library-filter-chips button.active { border-color: #9bc0b1; background: var(--green-soft); color: var(--green); font-weight: 650; }
+.library-rating-select { flex: 0 0 auto; margin-left: auto; height: 26px; color: var(--amber); }
 .library-meta-row > small { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #818b86; font-size: 9px; }
 .library-folder-select { height: 24px; flex: 0 0 auto; display: flex; align-items: center; gap: 4px; padding: 0 5px; border: 1px solid #e0e5e2; border-radius: 7px; background: rgba(255,255,255,.84); color: #738078; }
 .library-folder-select select { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #66736c; font-size: 9px; cursor: pointer; }
@@ -665,6 +679,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
   .library-browser { grid-template-columns: 132px minmax(0,1fr); }
   .library-meta-row { flex-wrap: wrap; padding-left: 0; }
   .library-meta-row > small { flex: 1 0 100%; }
+  .library-rating { padding-left: 0; }
+  /* 窄屏筛选栏允许换行，星级下拉不再右挤 */
+  .library-filters { flex-wrap: wrap; }
+  .library-rating-select { margin-left: 0; }
 }
 .toast { position: fixed; z-index: 120; left: 50%; bottom: 27px; transform: translateX(-50%); display: flex; align-items: center; gap: 7px; padding: 9px 13px; border: 1px solid #dce4e0; border-radius: 9px; background: #fff; box-shadow: 0 10px 30px rgba(24,39,31,.16); color: #49554f; font-size: 11px; animation: toast-in .34s var(--ease-spring) both; }
 .toast svg { color: var(--green); }
@@ -1226,3 +1244,32 @@ html[data-theme="dark"] .auth-card > small { color: var(--muted); }
   html[data-theme="dark"] .ai-panel { box-shadow: 0 -18px 50px rgba(0,0,0,.55); }
   html[data-theme="dark"] .ai-header::before { background: #3a453f; }
 }
+
+/* ===== 专注模式：隐藏所有栏位，只留阅读区（工具条 Scan 按钮开关，ESC 或右下角浮动按钮退出） ===== */
+/* 栅格列收拢到 0，配合 .app-shell 自身的 grid-template-columns 过渡做出平滑动画；
+   栏位靠「列宽收 0 + overflow 裁切」隐藏，不做 visibility/opacity 开关——后者在隐藏→显示往返时可能拿不到重绘（peek 唤出时栏位内容不渲染） */
+.app-shell.focus-mode, .app-shell.focus-mode.right-closed { grid-template-columns: 0 minmax(0, 1fr) 0; }
+.app-shell.focus-mode .app-rail, .app-shell.focus-mode .ai-panel { overflow: hidden; pointer-events: none; }
+/* right-closed 给 ai-panel 的位移/透明在专注模式下压掉，统一交给列裁切（peek 唤出时只需改列宽） */
+.app-shell.focus-mode .ai-panel { transform: none; opacity: 1; visibility: visible; }
+.app-shell.focus-mode .topbar, .app-shell.focus-mode .reader-toolbar, .app-shell.focus-mode .thumb-rail, .app-shell.focus-mode .thumb-resize-handle, .app-shell.focus-mode .panel-resize-handle { display: none; }
+.app-shell.focus-mode .workspace { height: 100vh; height: 100dvh; grid-template-rows: minmax(0, 1fr); }
+/* 专注模式去掉阅读区顶部留白（非专注模式保持 36px 不动） */
+.app-shell.focus-mode .reader-viewport { padding-top: 14px; }
+/* 手机端：左栏是 display:none 不参与网格摆放，workspace 需显式横跨整行，否则会被摆进 0 宽的第 1 列；
+   ai-panel 是 fixed 底部抽屉，列裁切管不到它，仍用透明度隐藏（无 mousemove，peek 不会触发，无重绘问题） */
+@media (max-width: 768px) {
+  .app-shell.focus-mode .workspace { grid-column: 1 / -1; }
+  .app-shell.focus-mode .ai-panel { opacity: 0; visibility: hidden; transform: translateY(103%); }
+}
+
+/* 专注模式边缘唤出（peek）：鼠标贴近屏幕边缘时对应栅格列展开；栏位全程可见、只靠列宽裁切，列宽变化免费得到 app-shell 的 .34s 列过渡 */
+.app-shell.focus-mode.focus-peek-left { grid-template-columns: 66px minmax(0, 1fr) 0; }
+.app-shell.focus-mode.focus-peek-right, .app-shell.focus-mode.focus-peek-right.right-closed { grid-template-columns: 0 minmax(0, 1fr) var(--panel-w, 394px); }
+/* peek 时恢复栏位交互（peek-right 与 rightOpen 解耦：内容始终挂载，上面的规则已保证其不被位移/隐藏） */
+.app-shell.focus-mode.focus-peek-left .app-rail, .app-shell.focus-mode.focus-peek-right .ai-panel { pointer-events: auto; }
+
+/* 专注模式浮动退出按钮：深色渐变圆钮，风格对齐划词工具条（本身即深色，暗色主题下无需额外覆盖） */
+.focus-exit-button { position: fixed; z-index: 80; right: 18px; bottom: 18px; width: 44px; height: 44px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,.09); border-radius: 50%; background: linear-gradient(165deg, #2c4038, #1e2a25 75%); color: white; cursor: pointer; box-shadow: 0 14px 34px rgba(20,31,26,.36), 0 0 0 4px rgba(38,51,46,.08); transition: transform .16s var(--ease-spring), box-shadow .18s var(--ease-out); animation: pop-in .26s var(--ease-spring) both; }
+.focus-exit-button:hover { transform: scale(1.06); }
+.focus-exit-button:active { transform: scale(.92); }

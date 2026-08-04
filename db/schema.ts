@@ -30,6 +30,8 @@ export const papers = sqliteTable("papers", {
   paperText: text("paper_text").notNull().default(""),
   pageCount: integer("page_count").notNull().default(1),
   status: text("status", { enum: ["unread", "reading", "done"] }).notNull().default("unread"),
+  // 星级评分 0-5，0 表示未评分
+  rating: integer("rating").notNull().default(0),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [index("papers_user_id_idx").on(table.userId)]);

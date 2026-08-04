@@ -17,6 +17,7 @@ export async function GET() {
       sourceUrl: papers.sourceUrl,
       pageCount: papers.pageCount,
       status: papers.status,
+      rating: papers.rating,
       createdAt: papers.createdAt,
       updatedAt: papers.updatedAt,
     }).from(papers).where(eq(papers.userId, user.id)).orderBy(desc(papers.updatedAt)).limit(500),

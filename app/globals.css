@@ -248,8 +248,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 /* 搜索命中高亮：琥珀色系（--amber），当前匹配加深并描边 */
 .textLayer span.search-hit { background: rgba(214,157,82,.34); border-radius: 2px; }
 .textLayer span.search-hit-active { background: rgba(214,157,82,.62); outline: 1.5px solid rgba(154,90,22,.8); border-radius: 2px; }
-/* 快捷键帮助浮层（? 开关） */
-.shortcuts-card { width: min(430px, calc(100vw - 40px)); }
+/* 快捷键速查列表：并入新手导览的最后一步展示（导览样式见文件末尾） */
 .shortcut-list { list-style: none; margin: 0; padding: 0; }
 .shortcut-list li { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 8px 0; border-bottom: 1px solid var(--soft-line); font-size: 12px; }
 .shortcut-list li:last-child { border-bottom: 0; }
@@ -1275,3 +1274,34 @@ html[data-theme="dark"] .auth-card > small { color: var(--muted); }
 .focus-exit-button { position: fixed; z-index: 80; right: 18px; bottom: 18px; width: 44px; height: 44px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,.09); border-radius: 50%; background: linear-gradient(165deg, #2c4038, #1e2a25 75%); color: white; cursor: pointer; box-shadow: 0 14px 34px rgba(20,31,26,.36), 0 0 0 4px rgba(38,51,46,.08); transition: transform .16s var(--ease-spring), box-shadow .18s var(--ease-out); animation: pop-in .26s var(--ease-spring) both; }
 .focus-exit-button:hover { transform: scale(1.06); }
 .focus-exit-button:active { transform: scale(.92); }
+
+/* ===== 分步引导导览（帮助 ? 按钮 / ? 键开启，快捷键速查为最后一步） ===== */
+.tour-overlay { position: fixed; z-index: 110; inset: 0; }
+/* 无锚点步骤的全屏半透明遮罩；有锚点步骤由聚光灯的 9999px 外阴影充当遮罩（点遮罩不关闭，防误触跳过内容） */
+.tour-veil { position: absolute; inset: 0; background: rgba(20,30,26,.45); }
+/* 聚光灯高亮框：圆角绿描边 + 巨大外阴影挖出亮区，切步时位置/尺寸平滑过渡 */
+.tour-spot { position: absolute; box-sizing: border-box; border: 2px solid #58b18c; border-radius: 10px; box-shadow: 0 0 0 9999px rgba(20,30,26,.45), 0 0 18px rgba(88,176,134,.45); pointer-events: none; transition: left .32s var(--ease-out), top .32s var(--ease-out), width .32s var(--ease-out), height .32s var(--ease-out); animation: fade-in .3s var(--ease-out) both; }
+/* 示意卡：白卡绿点缀，带指向锚点的小三角（方向由 JS 按卡片在锚点上方/下方决定） */
+.tour-card { position: absolute; width: min(320px, calc(100vw - 24px)); padding: 15px 16px 12px; border: 1px solid rgba(219,226,222,.9); border-radius: 14px; background: rgba(255,255,255,.97); box-shadow: 0 18px 48px rgba(20,31,26,.22), 0 3px 10px rgba(20,31,26,.06); color: #35403b; backdrop-filter: blur(14px); animation: pop-in .26s var(--ease-spring) both; }
+.tour-arrow { position: absolute; width: 12px; height: 12px; transform: rotate(45deg); background: inherit; border: inherit; }
+.tour-arrow.up { top: -7px; border-right: 0; border-bottom: 0; }
+.tour-arrow.down { bottom: -7px; border-left: 0; border-top: 0; }
+.tour-step-count { color: var(--green); font-size: 10px; font-weight: 700; letter-spacing: .05em; }
+.tour-card h3 { margin: 4px 0 6px; font-size: 14px; }
+.tour-card > p { margin: 0 0 10px; color: #66736c; font-size: 11px; line-height: 1.65; }
+.tour-card .shortcut-list { margin-bottom: 10px; }
+.tour-card .shortcut-list li { padding: 5px 0; font-size: 11px; }
+.tour-foot { display: flex; align-items: center; gap: 7px; }
+.tour-dots { display: flex; gap: 4px; margin-right: auto; }
+.tour-dots i { width: 5px; height: 5px; border-radius: 50%; background: #cfd8d3; transition: background .2s var(--ease-out), transform .2s var(--ease-spring); }
+.tour-dots i.active { background: var(--green); transform: scale(1.35); }
+.tour-skip { border: 0; background: transparent; color: #8a948f; font-size: 10px; cursor: pointer; }
+.tour-skip:hover { color: var(--ink); }
+.tour-foot .secondary-button, .tour-foot .primary-button { height: 30px; padding: 0 12px; font-size: 11px; }
+
+/* 导览暗色主题（聚光灯/遮罩本身是深色，无需覆盖） */
+html[data-theme="dark"] .tour-card { border-color: rgba(60,72,66,.9); background: rgba(27,33,30,.97); color: #d7e0da; box-shadow: 0 18px 48px rgba(0,0,0,.5), 0 3px 10px rgba(0,0,0,.3); }
+html[data-theme="dark"] .tour-card > p { color: var(--d-text-2); }
+html[data-theme="dark"] .tour-skip { color: var(--muted); }
+html[data-theme="dark"] .tour-dots i { background: #3a453f; }
+html[data-theme="dark"] .tour-dots i.active { background: var(--green); }

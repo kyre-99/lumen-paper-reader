@@ -31,7 +31,6 @@ import {
   Highlighter,
   Hand,
   History,
-  Keyboard,
   Languages,
   Library,
   Link2,
@@ -1238,6 +1237,100 @@ function OpenPaperModal({ onClose, onOpenUrl, onOpenFile }: { onClose: () => voi
   );
 }
 
+// ===== 分步引导导览（帮助 ? 按钮 / ? 键开启） =====
+// anchor 为锚点键名；锚点元素不存在或不可见（未打开论文时部分工具条按钮不渲染、手机端左栏/「打开论文」按钮隐藏）时，该步降级为无锚点居中卡片
+const TOUR_STEPS: Array<{ title: string; body: string; anchor?: "open" | "reader" | "lasso" | "ai" | "focus" | "library" }> = [
+  { title: "欢迎来到文枢", body: "把论文放进来，剩下的交给它：划词即译、追问全文、图表解读，批注自动保存。花 30 秒带你逛一遍。" },
+  { title: "打开论文", body: "两种入口随你选：粘贴 arXiv 链接直接在线读，或上传本地 PDF。打开后阅读进度、对话和批注都会被记住。", anchor: "open" },
+  { title: "划词即译", body: "选中论文里的任何句子，立刻翻译、解释或高亮。批注钉在原文旁边，还能针对这一段继续追问。", anchor: "reader" },
+  { title: "框选图表", body: "点这个按钮进入框选模式，在页面上拖出一个矩形框住图表或公式，AI 会看着图为你解读。", anchor: "lasso" },
+  { title: "全文 AI 对话", body: "右侧 AI 面板已经读入全文，随时提问。三档思考力度：越深入越慢，但回答越可靠。", anchor: "ai" },
+  { title: "专注模式", body: "一键收起所有栏位，只留论文。鼠标贴近屏幕左右边缘可以临时唤出侧栏，ESC 退出。", anchor: "focus" },
+  { title: "我的文库", body: "读过的论文都收在这里：文件夹归类、星级评分、按状态和星级筛选，跨设备同步。", anchor: "library" },
+  { title: "键盘党福利", body: "双手不离开键盘，也能读完一篇论文。" },
+];
+const TOUR_ANCHORS: Record<string, string> = {
+  open: 'button[aria-label="打开论文"]',
+  lasso: 'button[aria-label="框选图表"], button[aria-label="退出框选图表"]',
+  ai: 'button[aria-label="展开 AI"], button[aria-label="收起 AI"], button[aria-label="展开 AI 面板"], button[aria-label="收起 AI 面板"]',
+  focus: 'button[aria-label="专注模式"]',
+  library: 'button[aria-label="我的文库"]',
+};
+function resolveTourAnchor(anchor?: string): { left: number; top: number; width: number; height: number } | null {
+  if (!anchor) return null;
+  if (anchor === "reader") {
+    const rect = document.querySelector(".reader-viewport")?.getBoundingClientRect();
+    if (!rect || !rect.width || !rect.height) return null;
+    // 取阅读区中心一块示意，而不是框住整个阅读区
+    const width = Math.min(rect.width * .5, 420);
+    const height = Math.min(rect.height * .4, 240);
+    return { left: rect.left + (rect.width - width) / 2, top: rect.top + (rect.height - height) / 2, width, height };
+  }
+  const rect = document.querySelector(TOUR_ANCHORS[anchor])?.getBoundingClientRect();
+  if (!rect || !rect.width || !rect.height) return null;
+  return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+}
+
+function TourOverlay({ step, onStep, onClose }: { step: number; onStep: (step: number) => void; onClose: () => void }) {
+  const [anchorRect, setAnchorRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const current = TOUR_STEPS[step];
+  const last = step === TOUR_STEPS.length - 1;
+  // 切步与窗口 resize 时重算锚点位置（延迟一拍等布局稳定）
+  useEffect(() => {
+    const update = () => setAnchorRect(resolveTourAnchor(current.anchor));
+    const timer = window.setTimeout(update, 40);
+    window.addEventListener("resize", update);
+    return () => { window.clearTimeout(timer); window.removeEventListener("resize", update); };
+  }, [current.anchor]);
+  const PAD = 6; // 高亮框四角外扩
+  const GAP = 14; // 高亮框与卡片的间距
+  // 卡片优先放锚点下方，放不下换上方；水平钳制在视口内留 12px 边距，小三角始终对准锚点中心
+  let cardStyle: React.CSSProperties = { left: "50%", top: "50%", transform: "translate(-50%, -50%)" };
+  let arrow: "up" | "down" | null = null;
+  let arrowLeft = 0;
+  if (anchorRect) {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const width = Math.min(320, vw - 24);
+    const cardH = last ? 340 : 200; // 仅用于上下翻转判断的估算高度（快捷键步内容更长）
+    const left = Math.min(Math.max(anchorRect.left + anchorRect.width / 2 - width / 2, 12), vw - width - 12);
+    let top = anchorRect.top + anchorRect.height + PAD + GAP;
+    arrow = "up";
+    if (top + cardH > vh - 12) { top = anchorRect.top - cardH - GAP - PAD; arrow = "down"; }
+    if (top < 12) top = 12;
+    arrowLeft = Math.min(Math.max(anchorRect.left + anchorRect.width / 2 - left, 24), width - 24);
+    cardStyle = { left, top, width };
+  }
+  return (
+    <div className="tour-overlay" role="dialog" aria-modal="true" aria-label="新手导览">
+      {!anchorRect && <div className="tour-veil" />}
+      {anchorRect && <div className="tour-spot" style={{ left: anchorRect.left - PAD, top: anchorRect.top - PAD, width: anchorRect.width + PAD * 2, height: anchorRect.height + PAD * 2 }} />}
+      <div className="tour-card" style={cardStyle} key={step}>
+        {arrow && <div className={`tour-arrow ${arrow}`} style={{ left: arrowLeft }} />}
+        <span className="tour-step-count">{step + 1} / {TOUR_STEPS.length}</span>
+        <h3>{current.title}</h3>
+        <p>{current.body}</p>
+        {last && (
+          <ul className="shortcut-list">
+            <li><span className="shortcut-keys"><kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>⌘</kbd>+<kbd>F</kbd></span><em>在论文中搜索</em></li>
+            <li><span className="shortcut-keys"><kbd>/</kbd></span><em>聚焦提问输入框</em></li>
+            <li><span className="shortcut-keys"><kbd>←</kbd> / <kbd>→</kbd></span><em>上一页 / 下一页</em></li>
+            <li><span className="shortcut-keys"><kbd>Enter</kbd> / <kbd>Shift</kbd>+<kbd>Enter</kbd></span><em>搜索时：下一个 / 上一个匹配</em></li>
+            <li><span className="shortcut-keys"><kbd>Esc</kbd></span><em>关闭当前浮层；专注模式下退出专注模式</em></li>
+            <li><span className="shortcut-keys"><kbd>?</kbd></span><em>打开 / 关闭本导览</em></li>
+          </ul>
+        )}
+        <div className="tour-foot">
+          <div className="tour-dots">{TOUR_STEPS.map((_, index) => <i key={index} className={index === step ? "active" : ""} />)}</div>
+          {!last && <button className="tour-skip" onClick={onClose}>跳过</button>}
+          {step > 0 && <button className="secondary-button" onClick={() => onStep(step - 1)}>上一步</button>}
+          <button className="primary-button" onClick={() => (last ? onClose() : onStep(step + 1))}>{last ? "完成" : "下一步"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpenPaper, onAddPaper, onCreateFolder, onMovePaper, onSetStatus, onRatePaper, onDeletePaper, onRenamePaper, onRenameFolder, onDeleteFolder }: { onClose: () => void; papers: LibraryPaper[]; folders: LibraryFolder[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void; onCreateFolder: (name: string) => Promise<LibraryFolder | null>; onMovePaper: (paperId: string, folderId: string | null) => Promise<boolean>; onSetStatus: (paperId: string, status: PaperStatus) => Promise<boolean>; onRatePaper: (paperId: string, rating: number) => Promise<boolean>; onDeletePaper: (id: string) => Promise<boolean>; onRenamePaper: (id: string, title: string) => Promise<boolean>; onRenameFolder: (id: string, name: string) => Promise<boolean>; onDeleteFolder: (id: string) => Promise<boolean> }) {
   const [activeFolder, setActiveFolder] = useState("all");
   const [creatingFolder, setCreatingFolder] = useState(false);
@@ -2156,7 +2249,9 @@ export default function Home() {
   const [searchMatches, setSearchMatches] = useState<Array<{ page: number; ordinal: number }>>([]);
   const [searchActive, setSearchActive] = useState(0);
   // 快捷键帮助浮层（? 开关）
-  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  // 分步引导导览：帮助 ? 按钮 / ? 键开启；快捷键速查并入最后一步
+  const [tourOpen, setTourOpen] = useState(false);
+  const [tourStep, setTourStep] = useState(0);
 
   // 文本层就绪批量上报：约 200ms 合并成一次 textLayerVersion 递增，避免每页一次整树渲染
   const handleTextLayerReady = useCallback(() => {
@@ -2398,8 +2493,8 @@ export default function Home() {
     window.setTimeout(() => composerRef.current?.focus(), rightOpen ? 30 : 380);
   }, [rightOpen, historyOpen]);
 
-  // 全局快捷键：Ctrl/Cmd+F 搜索、/ 聚焦提问、? 快捷键帮助、Esc 按层级关闭最上层浮层
-  // （搜索框 → 引用气泡 → 划词工具条/右键菜单 → 帮助浮层）；
+  // 全局快捷键：Ctrl/Cmd+F 搜索、/ 聚焦提问、? 新手导览、Esc 按层级关闭最上层浮层
+  // （搜索框 → 引用气泡 → 划词工具条/右键菜单 → 导览）；
   // 焦点在输入控件内时除 Esc 与 Ctrl/Cmd+F 外都不触发；模态框打开时让模态自己的 Esc 处理接管
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -2407,7 +2502,7 @@ export default function Home() {
       if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "f") {
         if (!source) return; // 演示页没有可检索的 PDF，把浏览器自带查找留给用户
         event.preventDefault();
-        setShortcutsOpen(false);
+        setTourOpen(false);
         openSearch();
         return;
       }
@@ -2416,22 +2511,22 @@ export default function Home() {
         if (citationPopover) { setCitationPopover(null); return; }
         if (selectionPos) { setSelectionPos(null); setSelectionRects([]); window.getSelection()?.removeAllRanges(); return; }
         if (pdfContextMenu) { setPdfContextMenu(null); return; }
-        if (shortcutsOpen) { setShortcutsOpen(false); return; }
+        if (tourOpen) { setTourOpen(false); return; }
         // 专注模式最后退：框选激活时 Esc 先退内层的框选（见 figureLasso 专属的 Esc 处理），这里没有框选活动才退专注
         if (focusMode && !figureLasso && !figureRegion) { setFocusPeek(null); setFocusMode(false); return; }
         return;
       }
-      // 帮助浮层打开时，其余按键不穿透到阅读器
-      if (shortcutsOpen) { if (event.key === "?") setShortcutsOpen(false); return; }
+      // 导览打开时，其余按键不穿透到阅读器
+      if (tourOpen) { if (event.key === "?") setTourOpen(false); return; }
       const target = event.target as HTMLElement | null;
       if (target && (target.closest("input, textarea, select") || target.isContentEditable)) return;
       if (event.ctrlKey || event.metaKey || event.altKey) return;
       if (event.key === "/") { event.preventDefault(); focusComposer(); }
-      else if (event.key === "?") { event.preventDefault(); setShortcutsOpen((open) => !open); }
+      else if (event.key === "?") { event.preventDefault(); setTourStep(0); setTourOpen(true); }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [citationPopover, figureLasso, figureRegion, focusComposer, focusMode, libraryOpen, openModal, openSearch, pdfContextMenu, searchOpen, selectionPos, settingsOpen, shortcutsOpen, source, statsOpen, usageOpen]);
+  }, [citationPopover, figureLasso, figureRegion, focusComposer, focusMode, libraryOpen, openModal, openSearch, pdfContextMenu, searchOpen, selectionPos, settingsOpen, source, statsOpen, tourOpen, usageOpen]);
 
   // 专注模式边缘唤出（peek）：鼠标贴近屏幕左/右缘（<20px）临时滑出左栏/AI 面板，移开越过栏宽+余量才收回
   // （进出阈值不同，带迟滞防边缘抖动）。只在 focusMode 下挂载；手机端没有 mousemove，天然不触发。
@@ -4227,7 +4322,7 @@ export default function Home() {
           <RailButton icon={<Receipt size={20} />} label="用量账单" onClick={showUsage} />
         </nav>
         <div className="rail-bottom">
-          <RailButton icon={<CircleHelp size={20} />} label="使用帮助" onClick={() => setToast({ text: "提示：先选中文字，再选择翻译或解释" })} />
+          <RailButton icon={<CircleHelp size={20} />} label="使用帮助" onClick={() => { setTourStep(0); setTourOpen(true); }} />
           <RailButton icon={theme === "dark" ? <Sun size={20} /> : <Moon size={20} />} label={theme === "dark" ? "切换浅色模式" : "切换深色模式"} onClick={toggleTheme} />
           <div className="font-menu">
             <RailButton icon={<Type size={20} />} label="界面字号" active={fontMenuOpen} onClick={() => setFontMenuOpen(!fontMenuOpen)} />
@@ -4269,7 +4364,7 @@ export default function Home() {
               <ChevronDown size={15} />
             </button>
             <EffortControl effort={effort} onChange={setEffort} />
-            <button className="secondary-button compact" onClick={() => setOpenModal(true)}><Plus size={16} />打开论文</button>
+            <button className="secondary-button compact" aria-label="打开论文" onClick={() => setOpenModal(true)}><Plus size={16} />打开论文</button>
             {/* 手机端隐藏左栏后，文库入口挪到顶栏（宽屏下由 CSS 隐藏，避免与左栏重复） */}
             <button className="icon-button mobile-library-button" aria-label="我的文库" title="我的文库" onClick={showLibrary}><Library size={19} /></button>
             <button className="icon-button" aria-label={rightOpen ? "收起 AI" : "展开 AI"} title={rightOpen ? "收起 AI 面板" : "展开 AI 面板"} onClick={() => setRightOpen(!rightOpen)}>{rightOpen ? <PanelRightClose size={19} /> : <PanelRightOpen size={19} />}</button>
@@ -4540,24 +4635,7 @@ export default function Home() {
       {pdfContextMenu && <div className="pdf-context-menu" style={{ left: pdfContextMenu.x, top: pdfContextMenu.y }} onMouseDown={(event) => event.stopPropagation()}>
         <button onClick={createPdfTextNote}><MessageSquareText size={15} /><span><strong>添加文字批注</strong><small>写在当前 PDF 位置</small></span></button>
       </div>}
-      {shortcutsOpen && (
-        <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShortcutsOpen(false); }}>
-          <div className="modal-card shortcuts-card" role="dialog" aria-modal="true" aria-label="键盘快捷键">
-            <button className="icon-button modal-close" onClick={() => setShortcutsOpen(false)} aria-label="关闭" title="关闭（Esc）"><X size={16} /></button>
-            <div className="modal-icon"><Keyboard size={20} /></div>
-            <h2>键盘快捷键</h2>
-            <p>双手不离开键盘，也能读完一篇论文。</p>
-            <ul className="shortcut-list">
-              <li><span className="shortcut-keys"><kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>⌘</kbd>+<kbd>F</kbd></span><em>在论文中搜索</em></li>
-              <li><span className="shortcut-keys"><kbd>/</kbd></span><em>聚焦提问输入框</em></li>
-              <li><span className="shortcut-keys"><kbd>←</kbd> / <kbd>→</kbd></span><em>上一页 / 下一页</em></li>
-              <li><span className="shortcut-keys"><kbd>Enter</kbd> / <kbd>Shift</kbd>+<kbd>Enter</kbd></span><em>搜索时：下一个 / 上一个匹配</em></li>
-              <li><span className="shortcut-keys"><kbd>Esc</kbd></span><em>关闭当前浮层；专注模式下退出专注模式</em></li>
-              <li><span className="shortcut-keys"><kbd>?</kbd></span><em>打开 / 关闭本帮助</em></li>
-            </ul>
-          </div>
-        </div>
-      )}
+      {tourOpen && <TourOverlay step={tourStep} onStep={setTourStep} onClose={() => setTourOpen(false)} />}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
       {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} onRatePaper={rateLibraryPaper} onDeletePaper={deleteLibraryPaper} onRenamePaper={renameLibraryPaper} onRenameFolder={renameLibraryFolder} onDeleteFolder={deleteLibraryFolder} />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} visionConfig={visionConfig} setVisionConfig={setVisionConfig} />}

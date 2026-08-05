@@ -4,6 +4,13 @@
 
 ![文枢 Wenshu 界面](public/og.png)
 
+## 下载客户端
+
+阅读器本体是 Web 应用（线上版：<https://wenshupaper.online>），另有两种便捷入口，见 [GitHub Releases](https://github.com/kyre-99/lumen-paper-reader/releases)：
+
+- **安卓 App**（`wenshu-android-*.apk`）：WebView 壳加载线上站点，网页端更新自动跟进，Android 7.0+ 侧载安装
+- **Chrome 扩展**（`wenshu-chrome-extension-*.zip`）：网页中打开 PDF 时自动跳转到文枢阅读器
+
 ## 功能
 
 - 打开 arXiv PDF 链接或上传本地 PDF

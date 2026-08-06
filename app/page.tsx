@@ -48,6 +48,7 @@ import {
   PanelRightOpen,
   Plus,
   Receipt,
+  RotateCcw,
   Scan,
   Search,
   Send,
@@ -71,7 +72,7 @@ import { pdfWorkerSrcWithPolyfill } from "./pdf-uint8-polyfill";
 import { DEFAULT_PROMPTS, type PromptConfig } from "./chat-prompts";
 import { parseReferences, parseAuthorYearReferences, matchAuthorYearEntry, type AuthorYearCitation } from "./references";
 
-type ChatMessage = { id: number; role: "user" | "assistant"; content: string; steps?: string[]; plain?: boolean };
+type ChatMessage = { id: number; role: "user" | "assistant"; content: string; steps?: string[]; plain?: boolean; failed?: boolean };
 type ToastMessage = { text: string; kind?: "success" | "error" };
 type SavedConversation = { id: number; title: string; createdAt: number; messages: ChatMessage[] };
 type ChatEffort = "medium" | "high" | "max";
@@ -1315,6 +1316,11 @@ function TourOverlay({ step, onStep, onClose }: { step: number; onStep: (step: n
             <li><span className="shortcut-keys"><kbd>Ctrl</kbd>+<kbd>F</kbd> / <kbd>⌘</kbd>+<kbd>F</kbd></span><em>在论文中搜索</em></li>
             <li><span className="shortcut-keys"><kbd>/</kbd></span><em>聚焦提问输入框</em></li>
             <li><span className="shortcut-keys"><kbd>←</kbd> / <kbd>→</kbd></span><em>上一页 / 下一页</em></li>
+            <li><span className="shortcut-keys"><kbd>H</kbd></span><em>抓手平移 / 选择模式切换</em></li>
+            <li><span className="shortcut-keys"><kbd>M</kbd></span><em>显示 / 隐藏「问公式」按钮</em></li>
+            <li><span className="shortcut-keys"><kbd>C</kbd></span><em>进入 / 退出框选图表</em></li>
+            <li><span className="shortcut-keys"><kbd>Z</kbd></span><em>进入 / 退出专注模式</em></li>
+            <li><span className="shortcut-keys"><kbd>F</kbd></span><em>切换全屏</em></li>
             <li><span className="shortcut-keys"><kbd>Enter</kbd> / <kbd>Shift</kbd>+<kbd>Enter</kbd></span><em>搜索时：下一个 / 上一个匹配</em></li>
             <li><span className="shortcut-keys"><kbd>Esc</kbd></span><em>关闭当前浮层；专注模式下退出专注模式</em></li>
             <li><span className="shortcut-keys"><kbd>?</kbd></span><em>打开 / 关闭本导览</em></li>
@@ -2118,6 +2124,8 @@ export default function Home() {
   const [paperText, setPaperText] = useState(demoParagraphs.map((item) => `${item.heading || ""}\n${item.body}`).join("\n\n"));
   const [extractingText, setExtractingText] = useState(false);
   const [question, setQuestion] = useState("");
+  // 编辑重发：正在编辑的用户消息 id；进入编辑态只回填输入框，真正发送时才截断该消息及之后内容，Esc 或清空可放弃
+  const [editingMessageId, setEditingMessageId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [statusText, setStatusText] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -2493,8 +2501,13 @@ export default function Home() {
     window.setTimeout(() => composerRef.current?.focus(), rightOpen ? 30 : 380);
   }, [rightOpen, historyOpen]);
 
+  const toggleFullscreen = useCallback(() => {
+    if (document.fullscreenElement) void document.exitFullscreen();
+    else if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => undefined);
+  }, []);
+
   // 全局快捷键：Ctrl/Cmd+F 搜索、/ 聚焦提问、? 新手导览、Esc 按层级关闭最上层浮层
-  // （搜索框 → 引用气泡 → 划词工具条/右键菜单 → 导览）；
+  // （搜索框 → 引用气泡 → 划词工具条/右键菜单 → 导览）；H 抓手模式、M 公式按钮、C 框选图表、Z 专注模式、F 全屏；
   // 焦点在输入控件内时除 Esc 与 Ctrl/Cmd+F 外都不触发；模态框打开时让模态自己的 Esc 处理接管
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -2521,12 +2534,18 @@ export default function Home() {
       const target = event.target as HTMLElement | null;
       if (target && (target.closest("input, textarea, select") || target.isContentEditable)) return;
       if (event.ctrlKey || event.metaKey || event.altKey) return;
+      const key = event.key.toLowerCase();
       if (event.key === "/") { event.preventDefault(); focusComposer(); }
       else if (event.key === "?") { event.preventDefault(); setTourStep(0); setTourOpen(true); }
+      else if (key === "h") { setPanMode(!panMode); setToast({ text: panMode ? "已切回选择模式，可以划词标注" : "抓手模式：按住左键拖动页面，中键也可随时拖动" }); }
+      else if (key === "m" && source) setFormulaAssist(formulaAssist === "show" ? "hide" : "show");
+      else if (key === "c" && source) { setFigureLasso(!figureLasso); setFigureRegion(null); setLassoRect(null); lassoStartRef.current = null; lassoRectRef.current = null; }
+      else if (key === "z") { if (focusMode) setFocusPeek(null); setFocusMode(!focusMode); }
+      else if (key === "f") toggleFullscreen();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [citationPopover, figureLasso, figureRegion, focusComposer, focusMode, libraryOpen, openModal, openSearch, pdfContextMenu, searchOpen, selectionPos, settingsOpen, source, statsOpen, tourOpen, usageOpen]);
+  }, [citationPopover, figureLasso, figureRegion, focusComposer, focusMode, formulaAssist, libraryOpen, openModal, openSearch, panMode, pdfContextMenu, searchOpen, selectionPos, setFormulaAssist, settingsOpen, source, statsOpen, toggleFullscreen, tourOpen, usageOpen]);
 
   // 专注模式边缘唤出（peek）：鼠标贴近屏幕左/右缘（<20px）临时滑出左栏/AI 面板，移开越过栏宽+余量才收回
   // （进出阈值不同，带迟滞防边缘抖动）。只在 focusMode 下挂载；手机端没有 mousemove，天然不触发。
@@ -2556,11 +2575,6 @@ export default function Home() {
     const timer = window.setTimeout(() => scrollToPage(page, "auto"), 60);
     return () => window.clearTimeout(timer);
   }, [scrollToPage, textLayerVersion]);
-
-  const toggleFullscreen = useCallback(() => {
-    if (document.fullscreenElement) void document.exitFullscreen();
-    else if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => undefined);
-  }, []);
 
   // 阅读区两侧留有可拖动余量，换论文/缩放后把水平滚动位置校正回居中
   useEffect(() => {
@@ -2717,20 +2731,13 @@ export default function Home() {
     return () => window.clearTimeout(timer);
   }, [dismissReaderTip]);
 
-  const sendQuestion = useCallback(async (raw: string) => {
-    const text = raw.trim();
-    if (!text || loading) return;
+  // 流式请求主体：sendQuestion（新提问）与 retryChat（失败重试）共用；history 为不含当前问题的上下文
+  const startChatStream = useCallback(async (text: string, history: ChatMessage[]) => {
     // 发送前中断上一个未完成的全局流（loading 守卫下正常不会触发，防御用）
     chatControllerRef.current?.abort();
     const controller = new AbortController();
     chatControllerRef.current = controller;
-    const userMessage: ChatMessage = { id: Date.now(), role: "user", content: text };
-    chatStickRef.current = true; // 自己发问时强制回到底部跟随新回复
-    setMessages((old) => [...old, userMessage]);
-    setQuestion("");
     setLoading(true);
-    setRightOpen(true);
-    setSelectionPos(null);
     const assistantId = Date.now() + 1;
     const steps: string[] = [];
     let created = false;
@@ -2764,7 +2771,7 @@ export default function Home() {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: text, mode: "global", history: messages.slice(-10), systemPrompts: promptConfig, effort, ...(paperId ? { paperId } : {}), ...(paperId && paperText === lastSavedTextRef.current ? {} : { paperContext: paperText }) }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: text, mode: "global", history, systemPrompts: promptConfig, effort, ...(paperId ? { paperId } : {}), ...(paperId && paperText === lastSavedTextRef.current ? {} : { paperContext: paperText }) }),
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -2814,15 +2821,64 @@ export default function Home() {
       }
       flushNow(); // 已收到的内容先写进 state，避免丢字
       const errorText = `连接模型时遇到问题：${error instanceof Error && error.message ? error.message : "请检查 API 设置"}\n\n你可以在右上角的模型设置中检查接口地址与密钥。`;
-      if (created) setMessages((old) => old.map((message) => message.id === assistantId ? { ...message, content: `${message.content}\n\n> ${errorText}` } : message));
-      else setMessages((old) => [...old, { id: assistantId, role: "assistant", content: errorText }]);
+      // failed 标记供渲染层显示「重试」按钮，发送历史时也会过滤掉
+      if (created) setMessages((old) => old.map((message) => message.id === assistantId ? { ...message, content: `${message.content}\n\n> ${errorText}`, failed: true } : message));
+      else setMessages((old) => [...old, { id: assistantId, role: "assistant", content: errorText, failed: true }]);
       setLoading(false);
       setStreaming(false);
       setStatusText("");
     } finally {
       if (chatControllerRef.current === controller) chatControllerRef.current = null;
     }
-  }, [config, effort, loading, messages, paperId, paperText, paperTitle, promptConfig]);
+  }, [config, effort, paperId, paperText, paperTitle, promptConfig]);
+
+  const sendQuestion = useCallback((raw: string) => {
+    const text = raw.trim();
+    if (!text || loading) return;
+    // 编辑重发：发送时才把被编辑的消息及之后内容截掉，基于截断后的列表续写
+    const editIndex = editingMessageId !== null ? messages.findIndex((message) => message.id === editingMessageId) : -1;
+    const base = editIndex >= 0 ? messages.slice(0, editIndex) : messages;
+    const userMessage: ChatMessage = { id: Date.now(), role: "user", content: text };
+    chatStickRef.current = true; // 自己发问时强制回到底部跟随新回复
+    setMessages([...base, userMessage]);
+    setQuestion("");
+    setEditingMessageId(null);
+    setRightOpen(true);
+    setSelectionPos(null);
+    // 失败消息不进上下文；当前问题走 question 字段，不含在 history 里
+    void startChatStream(text, base.filter((message) => !message.failed).slice(-10));
+  }, [editingMessageId, loading, messages, startChatStream]);
+
+  // 失败重试：丢弃失败的回复，用同一问题重新请求
+  const retryChat = useCallback((failedId: number) => {
+    if (loading) return;
+    const index = messages.findIndex((message) => message.id === failedId && message.failed);
+    if (index < 1 || messages[index - 1].role !== "user") return;
+    const kept = messages.slice(0, index); // 保留问题，丢弃失败回复
+    setMessages(kept);
+    chatStickRef.current = true;
+    void startChatStream(kept[index - 1].content, kept.slice(0, -1).filter((message) => !message.failed).slice(-10));
+  }, [loading, messages, startChatStream]);
+
+  // 编辑重发：只允许编辑最后一条用户消息。点铅笔只回填输入框并标记编辑态，消息列表不动；
+  // 真正发送时才截断（见 sendQuestion），Esc 或清空输入可放弃，避免误删对话
+  const editUserMessage = useCallback((id: number) => {
+    if (loading) return;
+    const lastUser = [...messages].reverse().find((message) => message.role === "user");
+    if (!lastUser || lastUser.id !== id) return;
+    setQuestion(lastUser.content);
+    setEditingMessageId(id);
+    composerRef.current?.focus();
+  }, [loading, messages]);
+
+  // 放弃编辑：清掉输入框里的回填内容和编辑标记，消息列表保持原样
+  const cancelEditMessage = useCallback(() => {
+    setEditingMessageId(null);
+    setQuestion("");
+  }, []);
+
+  // 只有最后一条用户消息可编辑（编辑重发会截断后续对话，放开中间消息容易把对话搞乱）
+  const lastUserMessageId = useMemo(() => [...messages].reverse().find((message) => message.role === "user")?.id ?? null, [messages]);
 
   // 停止按钮：中断进行中的全局流，已收到的部分内容保留
   const stopChatStream = useCallback(() => {
@@ -2981,7 +3037,7 @@ export default function Home() {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline", history: history.slice(-10), systemPrompts: promptConfig, effort: inlineEffort, ...(paperId ? { paperId } : {}), ...(paperId && paperText === lastSavedTextRef.current ? {} : { paperContext: paperText }), ...(imageDataUrl ? { imageDataUrl } : {}) }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline", history: history.filter((message) => !message.failed).slice(-10), systemPrompts: promptConfig, effort: inlineEffort, ...(paperId ? { paperId } : {}), ...(paperId && paperText === lastSavedTextRef.current ? {} : { paperContext: paperText }), ...(imageDataUrl ? { imageDataUrl } : {}) }),
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -3021,12 +3077,24 @@ export default function Home() {
     } catch (error: any) {
       if (controller.signal.aborted) return; // 批注已删除或论文已切换，静默退出
       const errorText = `连接模型时遇到问题：${error?.message || "请检查 API 设置"}`;
-      updateAnnotation(id, { loading: false, result: errorText, thread: [...nextThread, { id: Date.now() + 1, role: "assistant", content: errorText }] });
+      updateAnnotation(id, { loading: false, result: errorText, thread: [...nextThread, { id: Date.now() + 1, role: "assistant", content: errorText, failed: true }] });
       scrollInlineCardToBottom(id);
     } finally {
       if (inlineControllersRef.current.get(id) === controller) inlineControllersRef.current.delete(id);
     }
   }, [config, inlineEffort, paperId, paperText, paperTitle, promptConfig, updateAnnotation, scrollInlineCardToBottom]);
+
+  // 批注失败重试：丢弃失败回复，首轮自动调用（翻译/解释/公式/图表）用同样动作重建提示词，追问则沿用原问题
+  const retryInlineAnswer = useCallback((annotation: Annotation) => {
+    if (annotation.loading) return;
+    const thread = annotation.thread;
+    const last = thread[thread.length - 1];
+    const userMessage = thread[thread.length - 2];
+    if (!last?.failed || last.role !== "assistant" || !userMessage || userMessage.role !== "user") return;
+    const history = thread.slice(0, -2).filter((message) => !message.failed);
+    const isAutoFirst = thread.length === 2 && annotation.kind !== "ask";
+    void requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, isAutoFirst ? undefined : userMessage.content, history, annotation.kind === "figure" ? annotation.figureImage || undefined : undefined);
+  }, [requestInlineAnswer]);
 
   const handleSelectionStart = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
     citationDownRef.current = null;
@@ -4378,11 +4446,11 @@ export default function Home() {
           {source && <><div className="toolbar-divider" /><div className="toolbar-group"><button className={`icon-button small ${thumbsOpen === "show" ? "active" : ""}`} aria-label={thumbsOpen === "show" ? "隐藏缩略图" : "显示缩略图"} title={thumbsOpen === "show" ? "隐藏缩略图栏" : "显示缩略图栏"} onClick={() => setThumbsOpen(thumbsOpen === "show" ? "hide" : "show")}><PanelLeft size={17} /></button></div></>}
           {source && <><div className="toolbar-divider" /><div className="toolbar-group"><button className={`icon-button small ${searchOpen ? "active" : ""}`} aria-label="在论文中搜索" title="在论文中搜索（Ctrl/⌘+F）" onClick={() => (searchOpen ? setSearchOpen(false) : openSearch())}><Search size={17} /></button></div></>}
           <div className="toolbar-spacer" />
-          <button className={`icon-button small ${panMode ? "active" : ""}`} aria-label={panMode ? "切换到选择模式" : "切换到抓手平移模式"} title={panMode ? "选择模式：划词翻译/高亮" : "抓手模式：左键拖动平移页面"} onClick={() => { setPanMode(!panMode); setToast({ text: panMode ? "已切回选择模式，可以划词标注" : "抓手模式：按住左键拖动页面，中键也可随时拖动" }); }}><Hand size={17} /></button>
-          {source && <button className={`icon-button small ${formulaAssist === "show" ? "active" : ""}`} aria-label={formulaAssist === "show" ? "隐藏公式按钮" : "显示公式按钮"} title={formulaAssist === "show" ? "隐藏页面上的「问公式」按钮" : "显示页面上的「问公式」按钮"} onClick={() => setFormulaAssist(formulaAssist === "show" ? "hide" : "show")}><Sparkles size={17} /></button>}
-          {source && <button className={`icon-button small ${figureLasso ? "active" : ""}`} aria-label={figureLasso ? "退出框选图表" : "框选图表"} title={figureLasso ? "退出框选模式（ESC 或再次点击）" : "框选图表：在页面上拖出矩形，向 AI 询问图表内容"} onClick={() => { setFigureLasso(!figureLasso); setFigureRegion(null); setLassoRect(null); lassoStartRef.current = null; lassoRectRef.current = null; }}><Crop size={17} /></button>}
-          <button className={`icon-button small ${focusMode ? "active" : ""}`} aria-label="专注模式" title="专注模式：隐藏所有栏位，只留阅读区（ESC 退出）" onClick={() => { if (focusMode) setFocusPeek(null); setFocusMode(!focusMode); }}><Scan size={17} /></button>
-          <button className="icon-button small" aria-label="全屏" title="切换全屏" onClick={toggleFullscreen}><Maximize2 size={17} /></button>
+          <button className={`icon-button small ${panMode ? "active" : ""}`} aria-label={panMode ? "切换到选择模式" : "切换到抓手平移模式"} title={panMode ? "选择模式：划词翻译/高亮（按 H 切回抓手）" : "抓手模式：左键拖动平移页面，中键也可随时拖动（按 H 切换）"} onClick={() => { setPanMode(!panMode); setToast({ text: panMode ? "已切回选择模式，可以划词标注" : "抓手模式：按住左键拖动页面，中键也可随时拖动" }); }}><Hand size={17} /></button>
+          {source && <button className={`icon-button small ${formulaAssist === "show" ? "active" : ""}`} aria-label={formulaAssist === "show" ? "隐藏公式按钮" : "显示公式按钮"} title={formulaAssist === "show" ? "隐藏页面上的「问公式」按钮（按 M 切换）" : "显示页面上的「问公式」按钮（按 M 切换）"} onClick={() => setFormulaAssist(formulaAssist === "show" ? "hide" : "show")}><Sparkles size={17} /></button>}
+          {source && <button className={`icon-button small ${figureLasso ? "active" : ""}`} aria-label={figureLasso ? "退出框选图表" : "框选图表"} title={figureLasso ? "退出框选模式（ESC 或按 C）" : "框选图表：在页面上拖出矩形，向 AI 询问图表内容（按 C 进入）"} onClick={() => { setFigureLasso(!figureLasso); setFigureRegion(null); setLassoRect(null); lassoStartRef.current = null; lassoRectRef.current = null; }}><Crop size={17} /></button>}
+          <button className={`icon-button small ${focusMode ? "active" : ""}`} aria-label="专注模式" title="专注模式：隐藏所有栏位，只留阅读区（按 Z 切换，ESC 退出）" onClick={() => { if (focusMode) setFocusPeek(null); setFocusMode(!focusMode); }}><Scan size={17} /></button>
+          <button className="icon-button small" aria-label="全屏" title="切换全屏（按 F）" onClick={toggleFullscreen}><Maximize2 size={17} /></button>
         </div>
 
         {searchOpen && (
@@ -4475,7 +4543,7 @@ export default function Home() {
                     </div>
                   )}
                   {annotation.kind === "highlight" && <><p className="highlight-saved"><Check size={14} />已保存为{annotation.color === "yellow" ? "黄色" : annotation.color === "green" ? "绿色" : annotation.color === "blue" ? "蓝色" : "玫红色"}高亮</p><label className="highlight-note"><span>个人批注</span><textarea value={annotation.note || ""} onChange={(event) => updateAnnotation(annotation.id, { note: event.target.value })} placeholder="记录你对这段内容的想法…" rows={3} /></label></>}
-                  {annotation.thread.length > 0 && <div className="inline-thread">{annotation.thread.map((message) => <div key={message.id} className={`inline-message ${message.role}`}>{message.role === "assistant" ? <MarkdownContent content={message.content} compact maxPage={pageCount} onPageJump={handlePageJump} /> : <p>{message.content}</p>}</div>)}</div>}
+                  {annotation.thread.length > 0 && <div className="inline-thread">{annotation.thread.map((message) => <div key={message.id} className={`inline-message ${message.role}`}>{message.role === "assistant" ? <MarkdownContent content={message.content} compact maxPage={pageCount} onPageJump={handlePageJump} /> : <p>{message.content}</p>}{message.failed && !annotation.loading && <button className="inline-retry" onClick={() => retryInlineAnswer(annotation)}><RotateCcw size={11} />重试</button>}</div>)}</div>}
                   {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />{annotation.loadingLabel || "正在结合相邻段落分析…"}</div>}
                   {annotation.kind !== "highlight" && !annotation.loading && (
                     <div className="inline-ask follow-up">
@@ -4560,7 +4628,8 @@ export default function Home() {
               <div className="message-body">
                 {message.role === "assistant" && message.steps && message.steps.length > 0 && <div className="message-steps"><Zap size={11} /><span>{message.steps.join(" → ")}</span></div>}
                 {message.role === "assistant" ? (message.plain ? <p>{message.content}</p> : <MarkdownContent content={message.content} maxPage={pageCount} onPageJump={handlePageJump} />) : <p>{message.content}</p>}
-                {message.role === "assistant" && <div className="message-tools"><button aria-label="复制回答" onClick={async () => { await navigator.clipboard.writeText(message.content); setCopiedMessageId(message.id); window.setTimeout(() => setCopiedMessageId(null), 1500); }}>{copiedMessageId === message.id ? <Check size={13} /> : <Copy size={13} />}</button></div>}
+                {message.role === "assistant" && <div className="message-tools"><button aria-label="复制回答" onClick={async () => { await navigator.clipboard.writeText(message.content); setCopiedMessageId(message.id); window.setTimeout(() => setCopiedMessageId(null), 1500); }}>{copiedMessageId === message.id ? <Check size={13} /> : <Copy size={13} />}</button>{message.failed && !loading && <button aria-label="重试" title="重试" onClick={() => retryChat(message.id)}><RotateCcw size={13} /></button>}</div>}
+                {message.role === "user" && !loading && message.id === lastUserMessageId && <div className="message-tools"><button aria-label="编辑并重发" title="编辑这条问题并重新发送" onClick={() => editUserMessage(message.id)}><SquarePen size={13} /></button></div>}
               </div>
             </div>
           ))}
@@ -4572,8 +4641,8 @@ export default function Home() {
             <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? (extractProgress ? `已解析 ${extractProgress.done}/${extractProgress.total} 页` : "解析中") : paperText ? "上下文已就绪" : "等待文字"}</small></div>
           </div>
           <div className="composer">
-            <textarea ref={composerRef} value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question); } }} placeholder="询问整篇论文…" rows={2} />
-            <div className="composer-bottom"><span>Enter 发送 · Shift+Enter 换行</span>{loading
+            <textarea ref={composerRef} value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question); } else if (e.key === "Escape" && editingMessageId !== null) cancelEditMessage(); }} placeholder="询问整篇论文…" rows={2} />
+            <div className="composer-bottom"><span>{editingMessageId !== null ? "编辑中：Enter 重发 · Esc 放弃" : "Enter 发送 · Shift+Enter 换行"}</span>{loading
               ? <button onClick={stopChatStream} aria-label="停止生成" title="停止生成"><Square size={14} /></button>
               : <button onClick={() => sendQuestion(question)} disabled={!question.trim() || extractingText} aria-label="发送"><Send size={16} /></button>}
             </div>

@@ -92,6 +92,13 @@
       "when": 1785852722593,
       "tag": "0012_fair_mephistopheles",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1786020152663,
+      "tag": "0013_faithful_spectrum",
+      "breakpoints": true
     }
   ]
 }

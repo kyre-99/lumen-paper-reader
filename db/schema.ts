@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { index, integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
@@ -72,6 +72,25 @@ export const readingSessions = sqliteTable("reading_sessions", {
   endPage: integer("end_page"),
 }, (table) => [index("reading_sessions_user_paper_day_idx").on(table.userId, table.paperId, table.day)]);
 
+// 语义索引：每篇论文一行。embeddingModel 或 textStamp（建索引时的 papers.updatedAt）不匹配即失效重建
+export const paperIndexes = sqliteTable("paper_indexes", {
+  paperId: text("paper_id").primaryKey().references(() => papers.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  embeddingModel: text("embedding_model").notNull().default(""),
+  textStamp: text("text_stamp").notNull().default(""),
+  chunkCount: integer("chunk_count").notNull().default(0),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [index("paper_indexes_user_id_idx").on(table.userId)]);
+
+// 语义索引的分块向量：chunkId 与 chunkPaper 的确定性分块结果一一对应，向量存 base64 编码的 Float32
+export const paperChunks = sqliteTable("paper_chunks", {
+  paperId: text("paper_id").notNull().references(() => papers.id, { onDelete: "cascade" }),
+  chunkId: integer("chunk_id").notNull(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  page: integer("page").notNull().default(1),
+  vector: text("vector").notNull().default(""),
+}, (table) => [primaryKey({ columns: [table.paperId, table.chunkId] }), index("paper_chunks_user_id_idx").on(table.userId)]);
+
 export const llmUsage = sqliteTable("llm_usage", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
@@ -95,6 +114,10 @@ export const userSettings = sqliteTable("user_settings", {
   visionModelEndpoint: text("vision_model_endpoint").notNull().default(""),
   visionModelName: text("vision_model_name").notNull().default(""),
   visionApiKeyEncrypted: text("vision_api_key_encrypted").notNull().default(""),
+  // 语义检索模型（Embedding）：模型名留空表示关闭语义检索；endpoint/key 留空回退主模型配置
+  embeddingModelEndpoint: text("embedding_model_endpoint").notNull().default(""),
+  embeddingModelName: text("embedding_model_name").notNull().default(""),
+  embeddingApiKeyEncrypted: text("embedding_api_key_encrypted").notNull().default(""),
   syncEndpoint: text("sync_endpoint").notNull().default(""),
   syncUsername: text("sync_username").notNull().default(""),
   syncPasswordEncrypted: text("sync_password_encrypted").notNull().default(""),

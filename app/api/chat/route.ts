@@ -4,6 +4,7 @@ import { getDb } from "../../../db";
 import { llmUsage, papers, userSettings } from "../../../db/schema";
 import { DEFAULT_PROMPTS, renderSystemPrompt } from "../../chat-prompts";
 import { chatCompletionsUrl, resolveModelConfig } from "../../model-config";
+import { embedTexts, ensurePaperIndex, mergeHits, vectorRetrieve } from "./embeddings";
 import { requireAppUser } from "../../server-user";
 
 const MAX_REFERENCE_CHARS = 26000;
@@ -372,11 +373,30 @@ export async function POST(request: NextRequest) {
     const historyChars = historyMessages.reduce((sum, item) => sum + item.content.length, 0);
     const referenceBudget = Math.max(8000, MAX_REFERENCE_CHARS - Math.min(historyChars, 10000));
     const meter: TokenMeter = { prompt: 0, completion: 0 };
+    // 语义检索（Embedding）：模型名留空即未启用；仅论文已入库且文本来自库中（与索引内容一致）时可用；快速档永不触发
+    const embeddingConfig = await resolveModelConfig(savedSettings, {}, { embedding: true });
+    const embeddingReady = !fromClient && Boolean(paperIdText) && level !== "medium" && Boolean(embeddingConfig.model && embeddingConfig.endpoint && embeddingConfig.apiKey);
 
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       async start(controller) {
         const send = (payload: Record<string, unknown>) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+        let indexed = false;
+        // 懒建语义索引并返回向量召回函数；embedding 不可用时降级为 null，走纯关键词检索
+        const setupVectorSearch = async (chunks: Chunk[]) => {
+          if (!embeddingReady || !chunks.length) return null;
+          try {
+            await ensurePaperIndex(db, user.id, paperIdText, chunks, paperUpdatedAt, embeddingConfig, (label) => send({ type: "step", label }), meter);
+            indexed = true;
+            return async (queries: string[], k: number, exclude?: Map<number, Chunk>) => {
+              const queryVectors = await embedTexts(embeddingConfig.endpoint, embeddingConfig.apiKey, embeddingConfig.model, queries, meter);
+              return vectorRetrieve(db, user.id, paperIdText, chunks, queryVectors, k, exclude);
+            };
+          } catch {
+            send({ type: "step", label: "语义索引不可用，本次使用关键词检索" });
+            return null;
+          }
+        };
         try {
           if (isInline && imageDataUrl) {
             // 框选图表问答：单次直接流式调用，跳过检索规划与 Agent
@@ -397,6 +417,7 @@ export async function POST(request: NextRequest) {
             // 划词问答：medium 只用选区和相邻原文（零额外调用）；high/max 会从全论文检索补充上下文
             const questionText = String(question);
             const chunks = cachedChunkPaper(chunkKey, resolvedPaperContext);
+            const vectorSearch = await setupVectorSearch(chunks);
             const gathered = new Map<number, Chunk>();
             if (chunks.length && level !== "medium") {
               let queries = [questionText, String(selectedText).slice(0, 120)];
@@ -405,7 +426,12 @@ export async function POST(request: NextRequest) {
                 if (plan.queries.length) queries = plan.queries;
               } catch { /* 检索规划失败时退回原问题 */ }
               send({ type: "step", label: `在全文中检索：${queries.slice(0, 2).join(" / ")}` });
-              const first = retrieveChunks(chunks, queries, false, 6);
+              let first = retrieveChunks(chunks, queries, false, 6);
+              if (vectorSearch) {
+                try {
+                  first = mergeHits(first, await vectorSearch(queries, 5), 10);
+                } catch { /* 向量召回失败保持关键词结果 */ }
+              }
               first.forEach((chunk) => gathered.set(chunk.id, chunk));
               if (first.length) send({ type: "step", label: `找到 ${first.length} 个相关片段（${pagesLabel(first)}）` });
               if (level === "max") {
@@ -426,6 +452,7 @@ export async function POST(request: NextRequest) {
           } else {
             const questionText = String(question);
             const chunks = cachedChunkPaper(chunkKey, resolvedPaperContext);
+            const vectorSearch = await setupVectorSearch(chunks);
             const gathered = new Map<number, Chunk>();
 
             let queries = [questionText];
@@ -445,6 +472,14 @@ export async function POST(request: NextRequest) {
               if (!first.length && !broad) {
                 first = retrieveChunks(chunks, queries, true, 6);
                 if (first.length) send({ type: "step", label: `关键词未命中，按章节取样 ${first.length} 个片段（${pagesLabel(first)}）` });
+              }
+              // 语义召回与关键词结果合并（关键词优先，向量补满）；broad 全文型问题保持均匀取样
+              if (vectorSearch && !broad) {
+                try {
+                  const keywordCount = first.length;
+                  first = mergeHits(first, await vectorSearch(queries, 6), 12);
+                  if (first.length > keywordCount) send({ type: "step", label: `语义召回补充 ${first.length - keywordCount} 个片段` });
+                } catch { /* 向量召回失败保持关键词结果 */ }
               }
               first.forEach((chunk) => gathered.set(chunk.id, chunk));
               if (first.length) send({ type: "step", label: `找到 ${first.length} 个相关片段（${pagesLabel(first)}）` });
@@ -482,7 +517,7 @@ export async function POST(request: NextRequest) {
               await db.insert(llmUsage).values({ id: crypto.randomUUID(), userId: user.id, model: resolvedModel, mode: isInline ? "inline" : "global", effort: level, promptTokens: meter.prompt, completionTokens: meter.completion, createdAt: new Date().toISOString() });
             } catch { /* 用量写入失败不影响回答 */ }
           }
-          send({ type: "done", usage: { promptTokens: meter.prompt, completionTokens: meter.completion } });
+          send({ type: "done", usage: { promptTokens: meter.prompt, completionTokens: meter.completion }, indexed });
         } catch (error: unknown) {
           send({ type: "error", message: error instanceof Error ? error.message : "请求失败" });
         }

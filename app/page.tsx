@@ -107,7 +107,7 @@ const CHAT_EFFORT_LEVELS: Array<{ value: ChatEffort; label: string; desc: string
 ];
 
 // 解析 /api/chat 的 SSE 流：step 为检索进度，delta 为回答增量；signal 中断时静默退出
-async function consumeChatStream(response: Response, handlers: { onStep?: (label: string) => void; onDelta?: (text: string) => void; signal?: AbortSignal }) {
+async function consumeChatStream(response: Response, handlers: { onStep?: (label: string) => void; onDelta?: (text: string) => void; onDone?: (payload: { indexed?: boolean }) => void; signal?: AbortSignal }) {
   if (!response.body) throw new Error("连接中断");
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -130,6 +130,7 @@ async function consumeChatStream(response: Response, handlers: { onStep?: (label
         const payload = JSON.parse(line.slice(5).trim());
         if (payload.type === "step" && payload.label) handlers.onStep?.(String(payload.label));
         if (payload.type === "delta" && payload.text) handlers.onDelta?.(String(payload.text));
+        if (payload.type === "done") handlers.onDone?.({ indexed: Boolean(payload.indexed) });
         if (payload.type === "error") failed = String(payload.message || "模型请求失败");
       } catch { /* 忽略不完整分片 */ }
     }
@@ -1595,7 +1596,7 @@ const UI_FONT_OPTIONS: Array<{ value: UiFontSize; label: string; desc: string; s
   { value: "xlarge", label: "特大", desc: "最大化可读性", sample: 23 },
 ];
 
-function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, visionConfig, setVisionConfig }: { onClose: () => void; config: ApiConfig; setConfig: (v: ApiConfig) => void; prompts: PromptConfig; setPrompts: (v: PromptConfig) => void; visionConfig: VisionConfig; setVisionConfig: (v: VisionConfig) => void }) {
+function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, visionConfig, setVisionConfig, embeddingConfig, setEmbeddingConfig }: { onClose: () => void; config: ApiConfig; setConfig: (v: ApiConfig) => void; prompts: PromptConfig; setPrompts: (v: PromptConfig) => void; visionConfig: VisionConfig; setVisionConfig: (v: VisionConfig) => void; embeddingConfig: EmbeddingConfig; setEmbeddingConfig: (v: EmbeddingConfig) => void }) {
   const [tab, setTab] = useState<"model" | "prompts" | "sync">("model");
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveError, setSaveError] = useState("");
@@ -1603,9 +1604,14 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
   const [testMessage, setTestMessage] = useState("");
   const [visionTestState, setVisionTestState] = useState<"idle" | "testing" | "ok" | "fail">("idle");
   const [visionTestMessage, setVisionTestMessage] = useState("");
+  const [embeddingTestState, setEmbeddingTestState] = useState<"idle" | "testing" | "ok" | "fail">("idle");
+  const [embeddingTestMessage, setEmbeddingTestMessage] = useState("");
   // 已保存的 key 在输入框里以掩码实体显示；聚焦进入编辑态时清空，避免掩码被当成新 key 提交
   const [mainKeyEditing, setMainKeyEditing] = useState(false);
   const [visionKeyEditing, setVisionKeyEditing] = useState(false);
+  const [embeddingKeyEditing, setEmbeddingKeyEditing] = useState(false);
+  // 打开弹窗时已保存的 embedding 模型名：换模型会使既有向量索引失配（下次提问逐篇自动重建），据此显示提醒
+  const [savedEmbeddingModel] = useState(embeddingConfig.model);
   const syncLoadedRef = useRef(false);
   const [syncConfig, setSyncConfig] = useState({ endpoint: "", username: "", password: "", remotePath: "lumen-backup", hasPassword: false, configured: false, lastBackupAt: null as string | null });
   const [syncTestState, setSyncTestState] = useState<"idle" | "testing" | "ok" | "fail">("idle");
@@ -1679,16 +1685,41 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
       setVisionTestMessage("网络错误，无法完成测试");
     }
   };
+  const testEmbeddingConnection = async () => {
+    if (embeddingTestState === "testing") return;
+    setEmbeddingTestState("testing");
+    setEmbeddingTestMessage("");
+    try {
+      const response = await fetch("/api/models/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // endpoint/key 留空即测主模型配置；模型名必须显式给出（embedding 不回退聊天模型）
+        body: JSON.stringify({ embedding: true, endpoint: embeddingConfig.endpoint || undefined, apiKey: embeddingConfig.apiKey || undefined, model: embeddingConfig.model || undefined }),
+      });
+      const payload = await response.json();
+      if (payload.ok) {
+        setEmbeddingTestState("ok");
+        setEmbeddingTestMessage(`连接成功，向量维度 ${payload.dimensions}（${payload.latencyMs} ms）`);
+      } else {
+        setEmbeddingTestState("fail");
+        setEmbeddingTestMessage(payload.error || "连接失败，请检查配置");
+      }
+    } catch {
+      setEmbeddingTestState("fail");
+      setEmbeddingTestMessage("网络错误，无法完成测试");
+    }
+  };
   const saveSettings = async () => {
     setSaveState("saving");
     setSaveError("");
     try {
-      const response = await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompts, modelConfig: config, visionConfig: { endpoint: visionConfig.endpoint, model: visionConfig.model, apiKey: visionConfig.apiKey || undefined } }) });
+      const response = await fetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompts, modelConfig: config, visionConfig: { endpoint: visionConfig.endpoint, model: visionConfig.model, apiKey: visionConfig.apiKey || undefined }, embeddingConfig: { endpoint: embeddingConfig.endpoint, model: embeddingConfig.model, apiKey: embeddingConfig.apiKey || undefined } }) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "设置保存失败");
       setPrompts(payload.prompts);
       setConfig({ ...payload.modelConfig, apiKey: "" });
       if (payload.visionConfig) setVisionConfig({ ...payload.visionConfig, apiKey: "" });
+      if (payload.embeddingConfig) setEmbeddingConfig({ ...payload.embeddingConfig, apiKey: "" });
       sessionStorage.removeItem("lumen-api-key");
       localStorage.removeItem("lumen-api-config");
       setSaveState("saved");
@@ -1862,6 +1893,26 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
             {visionTestState === "ok" && <span className="test-result ok"><span className="test-dot" />{visionTestMessage}</span>}
             {visionTestState === "fail" && <span className="test-result fail"><span className="test-dot" />{visionTestMessage}</span>}
           </div>
+          <div className="sync-section-title">语义检索模型（Embedding）</div>
+          <p className="vision-section-hint">用于「深入 / 研究」档的语义检索：首次提问时为本篇论文建立向量索引（只建一次，长期有效），之后召回更准确。填写模型名即启用（默认 text-embedding-3-small 即可），留空则关闭；模型选定后不建议更换——更换会使已建索引失效并逐篇重建。</p>
+          <label className="field-label">API Base URL<input value={embeddingConfig.endpoint} onChange={(e) => { setEmbeddingTestState("idle"); setEmbeddingTestMessage(""); setEmbeddingConfig({ ...embeddingConfig, endpoint: e.target.value }); }} placeholder="留空则使用主模型配置" /></label>
+          <label className="field-label">API Key<input type="password" value={embeddingConfig.apiKey || (embeddingConfig.hasApiKey && !embeddingKeyEditing ? "••••••••••••" : "")} onFocus={() => setEmbeddingKeyEditing(true)} onBlur={() => setEmbeddingKeyEditing(false)} onChange={(e) => { setEmbeddingTestState("idle"); setEmbeddingTestMessage(""); setEmbeddingConfig({ ...embeddingConfig, apiKey: e.target.value }); }} placeholder={embeddingConfig.hasApiKey ? "已保存，输入新密钥可更换" : "留空则使用主模型配置"} /></label>
+          {embeddingConfig.hasApiKey && !embeddingConfig.apiKey && <div className="settings-note"><Check size={14} />已保存语义检索模型的密钥。</div>}
+          <label className="field-label">模型名<input list="embedding-model-options" value={embeddingConfig.model} onChange={(e) => { setEmbeddingTestState("idle"); setEmbeddingTestMessage(""); setEmbeddingConfig({ ...embeddingConfig, model: e.target.value }); }} placeholder="默认 text-embedding-3-small，留空关闭语义检索" /></label>
+          <datalist id="embedding-model-options">
+            <option value="text-embedding-3-small">默认，便宜够用</option>
+            <option value="text-embedding-3-large">更准，价格更高</option>
+          </datalist>
+          {savedEmbeddingModel && embeddingConfig.model && embeddingConfig.model !== savedEmbeddingModel && (
+            <div className="settings-note key-status warn"><AlertCircle size={14} />更换模型后，已建立的语义索引会因向量对不上而失效，保存后将在下次提问时逐篇自动重建（产生少量 embedding 费用）。</div>
+          )}
+          <div className="test-row">
+            <button type="button" className="test-button" onClick={testEmbeddingConnection} disabled={embeddingTestState === "testing" || !embeddingConfig.model.trim()}>
+              {embeddingTestState === "testing" ? <><LoaderCircle className="spin" size={14} />正在测试连接…</> : <><Zap size={14} />测试 Embedding 连接</>}
+            </button>
+            {embeddingTestState === "ok" && <span className="test-result ok"><span className="test-dot" />{embeddingTestMessage}</span>}
+            {embeddingTestState === "fail" && <span className="test-result fail"><span className="test-dot" />{embeddingTestMessage}</span>}
+          </div>
         </div> : tab === "sync" ? <div className="settings-pane">
           <div className="sync-section-title">云同步</div>
           <label className="field-label">WebDAV 地址<input value={syncConfig.endpoint} onChange={(event) => updateSync({ ...syncConfig, endpoint: event.target.value })} placeholder="https://dav.jianguoyun.com/dav/" /></label>
@@ -1931,6 +1982,7 @@ function SettingsModal({ onClose, config, setConfig, prompts, setPrompts, vision
 
 type ApiConfig = { provider: string; endpoint: string; model: string; apiKey: string; hasApiKey: boolean };
 type VisionConfig = { endpoint: string; model: string; apiKey: string; hasApiKey: boolean };
+type EmbeddingConfig = { endpoint: string; model: string; apiKey: string; hasApiKey: boolean };
 
 export default function Home() {
   const [user, setUser] = useState<SessionUser | null>(null);
@@ -2211,6 +2263,9 @@ export default function Home() {
   const saveStatusRef = useRef(saveStatus);
   const [config, setConfig] = useState<ApiConfig>({ provider: "OpenAI", endpoint: "https://api.openai.com/v1", model: "gpt-4.1-mini", apiKey: "", hasApiKey: false });
   const [visionConfig, setVisionConfig] = useState<VisionConfig>({ endpoint: "", model: "", apiKey: "", hasApiKey: false });
+  const [embeddingConfig, setEmbeddingConfig] = useState<EmbeddingConfig>({ endpoint: "", model: "", apiKey: "", hasApiKey: false });
+  // 当前论文是否已建立语义索引（workspace 加载时取服务端值，提问建成后置 true）
+  const [embeddingIndexed, setEmbeddingIndexed] = useState(false);
   const [promptConfig, setPromptConfig] = useState<PromptConfig>(DEFAULT_PROMPTS);
   // 框选图表模式：lassoRect 为拖动中的屏幕矩形，figureRegion 为松手后确认的选区
   const [figureLasso, setFigureLasso] = useState(false);
@@ -2667,9 +2722,11 @@ export default function Home() {
           if (settingsPayload?.prompts?.global && settingsPayload?.prompts?.inline) setPromptConfig(settingsPayload.prompts);
           if (settingsPayload?.modelConfig) setConfig({ ...settingsPayload.modelConfig, apiKey: "" });
           if (settingsPayload?.visionConfig) setVisionConfig({ ...settingsPayload.visionConfig, apiKey: "" });
+          if (settingsPayload?.embeddingConfig) setEmbeddingConfig({ ...settingsPayload.embeddingConfig, apiKey: "" });
         }
         const workspace = workspacePayload.workspace;
         if (workspace?.paper) {
+          setEmbeddingIndexed(Boolean(workspace.embeddingIndexed));
           restoringWorkspaceRef.current = true;
           suppressDirtyRef.current = true;
           clearPaperAnnotations();
@@ -2786,6 +2843,8 @@ export default function Home() {
             if (created) setMessages((old) => old.map((message) => message.id === assistantId ? { ...message, steps: [...steps] } : message));
           },
           onDelta: pushDelta,
+          // 服务端完成语义索引后点亮上下文 chip 的「语义索引」标记
+          onDone: (payload) => { if (payload.indexed) setEmbeddingIndexed(true); },
         });
         // 中断时（停止按钮或切换论文）也按 flushDelta 逻辑落地已收到内容；切换论文时控制器已被置空，旧内容不写进新论文的消息列表
         if (!controller.signal.aborted || chatControllerRef.current === controller) flushNow();
@@ -3986,6 +4045,7 @@ export default function Home() {
         restoringWorkspaceRef.current = false;
         setSource(null);
         setPaperId(null);
+        setEmbeddingIndexed(false);
         setPaperStatus(null);
         setPaperSourceKind(null);
         setPaperSourceUrl(null);
@@ -4049,6 +4109,7 @@ export default function Home() {
       if (!response.ok || !payload.workspace?.paper) throw new Error(payload.error || "论文记录不存在");
       const workspace = payload.workspace;
       const paper = workspace.paper;
+      setEmbeddingIndexed(Boolean(workspace.embeddingIndexed));
       restoringWorkspaceRef.current = true;
       suppressDirtyRef.current = true;
       clearPaperAnnotations();
@@ -4121,6 +4182,7 @@ export default function Home() {
     restoringWorkspaceRef.current = false;
     clearPaperAnnotations();
     setPaperId(crypto.randomUUID());
+    setEmbeddingIndexed(false);
     setPaperStatus("unread");
     setPaperSourceKind("remote");
     setPaperSourceUrl(normalized);
@@ -4171,6 +4233,7 @@ export default function Home() {
       if (!response.ok) throw new Error(payload.error || "上传失败");
       clearPaperAnnotations();
       setPaperId(payload.paper.id);
+      setEmbeddingIndexed(false);
       setPaperStatus("unread");
       setPaperSourceKind("upload");
       setPaperSourceUrl(null);
@@ -4638,7 +4701,7 @@ export default function Home() {
         )}
         {panelTab === "chat" && !historyOpen && <div className="composer-wrap">
           <div className="composer-top-row">
-            <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? (extractProgress ? `已解析 ${extractProgress.done}/${extractProgress.total} 页` : "解析中") : paperText ? "上下文已就绪" : "等待文字"}</small></div>
+            <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? (extractProgress ? `已解析 ${extractProgress.done}/${extractProgress.total} 页` : "解析中") : paperText ? "上下文已就绪" : "等待文字"}</small>{embeddingIndexed && <small className="semantic-index-badge">语义索引</small>}</div>
           </div>
           <div className="composer">
             <textarea ref={composerRef} value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question); } else if (e.key === "Escape" && editingMessageId !== null) cancelEditMessage(); }} placeholder="询问整篇论文…" rows={2} />
@@ -4707,7 +4770,7 @@ export default function Home() {
       {tourOpen && <TourOverlay step={tourStep} onStep={setTourStep} onClose={() => setTourOpen(false)} />}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
       {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} onRatePaper={rateLibraryPaper} onDeletePaper={deleteLibraryPaper} onRenamePaper={renameLibraryPaper} onRenameFolder={renameLibraryFolder} onDeleteFolder={deleteLibraryFolder} />}
-      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} visionConfig={visionConfig} setVisionConfig={setVisionConfig} />}
+      {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} visionConfig={visionConfig} setVisionConfig={setVisionConfig} embeddingConfig={embeddingConfig} setEmbeddingConfig={setEmbeddingConfig} />}
       {usageOpen && <UsageModal onClose={() => setUsageOpen(false)} stats={usageStats} loading={usageLoading} />}
       {statsOpen && <StatsModal onClose={() => setStatsOpen(false)} stats={readingStats} loading={statsLoading} onOpenPaper={(id) => { setStatsOpen(false); void openLibraryPaper(id); }} />}
       {toast && <div className={`toast${toast.kind === "error" ? " error" : ""}`}>{toast.kind === "error" ? <AlertCircle size={15} /> : <Check size={15} />}{toast.text}</div>}

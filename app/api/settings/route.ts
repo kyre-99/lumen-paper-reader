@@ -59,6 +59,12 @@ export async function GET() {
       model: settings?.visionModelName || "",
       hasApiKey: Boolean(settings?.visionApiKeyEncrypted),
     },
+    // 语义检索模型（Embedding）：模型名留空即关闭；密钥同样只回 hasApiKey
+    embeddingConfig: {
+      endpoint: settings?.embeddingModelEndpoint || "",
+      model: settings?.embeddingModelName || "",
+      hasApiKey: Boolean(settings?.embeddingApiKeyEncrypted),
+    },
   });
 }
 
@@ -90,12 +96,24 @@ export async function PUT(request: Request) {
       if (visionUrl.protocol !== "https:") throw new Error();
     } catch { return Response.json({ error: "图表理解模型的 API 地址必须是有效的 HTTPS 地址" }, { status: 400 }); }
   }
+  // 语义检索模型（Embedding）：全部留空表示关闭；请求未携带 embeddingConfig 时保留已有配置
+  const hasEmbeddingPayload = payload?.embeddingConfig !== undefined;
+  const embeddingModelEndpoint = hasEmbeddingPayload ? String(payload?.embeddingConfig?.endpoint || "").trim().replace(/\/+$/, "").slice(0, 2000) : "";
+  const embeddingModelName = hasEmbeddingPayload ? String(payload?.embeddingConfig?.model || "").trim().slice(0, 200) : "";
+  const embeddingApiKey = hasEmbeddingPayload ? String(payload?.embeddingConfig?.apiKey || "").trim().slice(0, 1000) : "";
+  if (embeddingModelEndpoint) {
+    try {
+      const embeddingUrl = new URL(embeddingModelEndpoint);
+      if (embeddingUrl.protocol !== "https:") throw new Error();
+    } catch { return Response.json({ error: "语义检索模型的 API 地址必须是有效的 HTTPS 地址" }, { status: 400 }); }
+  }
   const db = getDb();
   const [existing] = await db.select().from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
   const apiKeyEncrypted = apiKey ? await encryptApiKey(apiKey) : existing?.apiKeyEncrypted || "";
   // 密钥处理与主模型一致：只在新提供时重新加密；endpoint 与模型名都清空时视为取消配置，一并清掉密钥
   const visionApiKeyEncrypted = !hasVisionPayload ? existing?.visionApiKeyEncrypted || "" : visionApiKey ? await encryptApiKey(visionApiKey) : (visionModelEndpoint || visionModelName) ? existing?.visionApiKeyEncrypted || "" : "";
-  const values = { userId: user.id, globalSystemPrompt, inlineSystemPrompt, modelProvider, modelEndpoint, modelName, apiKeyEncrypted, visionModelEndpoint: hasVisionPayload ? visionModelEndpoint : existing?.visionModelEndpoint || "", visionModelName: hasVisionPayload ? visionModelName : existing?.visionModelName || "", visionApiKeyEncrypted, updatedAt: new Date().toISOString() };
+  const embeddingApiKeyEncrypted = !hasEmbeddingPayload ? existing?.embeddingApiKeyEncrypted || "" : embeddingApiKey ? await encryptApiKey(embeddingApiKey) : (embeddingModelEndpoint || embeddingModelName) ? existing?.embeddingApiKeyEncrypted || "" : "";
+  const values = { userId: user.id, globalSystemPrompt, inlineSystemPrompt, modelProvider, modelEndpoint, modelName, apiKeyEncrypted, visionModelEndpoint: hasVisionPayload ? visionModelEndpoint : existing?.visionModelEndpoint || "", visionModelName: hasVisionPayload ? visionModelName : existing?.visionModelName || "", visionApiKeyEncrypted, embeddingModelEndpoint: hasEmbeddingPayload ? embeddingModelEndpoint : existing?.embeddingModelEndpoint || "", embeddingModelName: hasEmbeddingPayload ? embeddingModelName : existing?.embeddingModelName || "", embeddingApiKeyEncrypted, updatedAt: new Date().toISOString() };
   await db.insert(userSettings).values(values).onConflictDoUpdate({ target: userSettings.userId, set: values });
-  return Response.json({ saved: true, prompts: { global: globalSystemPrompt, inline: inlineSystemPrompt }, modelConfig: { provider: modelProvider, endpoint: modelEndpoint, model: modelName, hasApiKey: Boolean(apiKeyEncrypted) || environmentModelConfig().hasApiKey }, visionConfig: { endpoint: values.visionModelEndpoint, model: values.visionModelName, hasApiKey: Boolean(visionApiKeyEncrypted) } });
+  return Response.json({ saved: true, prompts: { global: globalSystemPrompt, inline: inlineSystemPrompt }, modelConfig: { provider: modelProvider, endpoint: modelEndpoint, model: modelName, hasApiKey: Boolean(apiKeyEncrypted) || environmentModelConfig().hasApiKey }, visionConfig: { endpoint: values.visionModelEndpoint, model: values.visionModelName, hasApiKey: Boolean(visionApiKeyEncrypted) }, embeddingConfig: { endpoint: values.embeddingModelEndpoint, model: values.embeddingModelName, hasApiKey: Boolean(embeddingApiKeyEncrypted) } });
 }

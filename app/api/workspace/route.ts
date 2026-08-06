@@ -1,8 +1,8 @@
 import { and, eq } from "drizzle-orm";
 import { requireAppUser } from "../../server-user";
 import { getDb } from "../../../db";
-import { papers, paperStates, readerStates } from "../../../db/schema";
-import { hasPaperIndex } from "../chat/embeddings";
+import { papers, paperStates, readerStates, userSettings } from "../../../db/schema";
+import { getIndexState } from "../chat/embeddings";
 
 function parseArray(value: string) {
   try {
@@ -38,6 +38,9 @@ export async function GET(request: Request) {
   if (!paper) return Response.json({ workspace: null });
   const [paperState] = await db.select().from(paperStates).where(and(eq(paperStates.paperId, paper.id), eq(paperStates.userId, user.id))).limit(1);
   const restoredState = paperState || (state?.activePaperId === paper.id ? state : null);
+  // 语义索引状态（ready/building/missing）：供阅读器上下文 chip 展示与轮询
+  const [settings] = await db.select({ embeddingModelName: userSettings.embeddingModelName }).from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
+  const embeddingIndex = await getIndexState(db, user.id, paper.id, paper.updatedAt, String(settings?.embeddingModelName || "").trim());
 
   return Response.json({
     workspace: {
@@ -59,8 +62,7 @@ export async function GET(request: Request) {
       // 历史对话只存 paperStates；回退到 readerStates 行时没有该列，按空数组处理
       conversations: parseArray((restoredState && "conversationsJson" in restoredState ? restoredState.conversationsJson : "[]") || "[]"),
       updatedAt: restoredState?.updatedAt || paper.updatedAt,
-      // 语义索引状态：供阅读器上下文 chip 展示「语义索引」标记
-      embeddingIndexed: await hasPaperIndex(db, user.id, paper.id),
+      embeddingIndex,
     },
   });
 }

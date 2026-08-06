@@ -107,7 +107,7 @@ const CHAT_EFFORT_LEVELS: Array<{ value: ChatEffort; label: string; desc: string
 ];
 
 // 解析 /api/chat 的 SSE 流：step 为检索进度，delta 为回答增量；signal 中断时静默退出
-async function consumeChatStream(response: Response, handlers: { onStep?: (label: string) => void; onDelta?: (text: string) => void; onDone?: (payload: { indexed?: boolean }) => void; signal?: AbortSignal }) {
+async function consumeChatStream(response: Response, handlers: { onStep?: (label: string) => void; onDelta?: (text: string) => void; onDone?: (payload: { indexState?: "ready" | "building" | "missing" }) => void; signal?: AbortSignal }) {
   if (!response.body) throw new Error("连接中断");
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -130,7 +130,7 @@ async function consumeChatStream(response: Response, handlers: { onStep?: (label
         const payload = JSON.parse(line.slice(5).trim());
         if (payload.type === "step" && payload.label) handlers.onStep?.(String(payload.label));
         if (payload.type === "delta" && payload.text) handlers.onDelta?.(String(payload.text));
-        if (payload.type === "done") handlers.onDone?.({ indexed: Boolean(payload.indexed) });
+        if (payload.type === "done") handlers.onDone?.({ indexState: payload.indexState === "ready" || payload.indexState === "building" ? payload.indexState : "missing" });
         if (payload.type === "error") failed = String(payload.message || "模型请求失败");
       } catch { /* 忽略不完整分片 */ }
     }
@@ -2264,8 +2264,8 @@ export default function Home() {
   const [config, setConfig] = useState<ApiConfig>({ provider: "OpenAI", endpoint: "https://api.openai.com/v1", model: "gpt-4.1-mini", apiKey: "", hasApiKey: false });
   const [visionConfig, setVisionConfig] = useState<VisionConfig>({ endpoint: "", model: "", apiKey: "", hasApiKey: false });
   const [embeddingConfig, setEmbeddingConfig] = useState<EmbeddingConfig>({ endpoint: "", model: "", apiKey: "", hasApiKey: false });
-  // 当前论文是否已建立语义索引（workspace 加载时取服务端值，提问建成后置 true）
-  const [embeddingIndexed, setEmbeddingIndexed] = useState(false);
+  // 当前论文的语义索引状态：missing 未建立（可点击手动建立）、building 后台建立中、ready 已就绪
+  const [embeddingIndex, setEmbeddingIndex] = useState<"ready" | "building" | "missing">("missing");
   const [promptConfig, setPromptConfig] = useState<PromptConfig>(DEFAULT_PROMPTS);
   // 框选图表模式：lassoRect 为拖动中的屏幕矩形，figureRegion 为松手后确认的选区
   const [figureLasso, setFigureLasso] = useState(false);
@@ -2726,7 +2726,7 @@ export default function Home() {
         }
         const workspace = workspacePayload.workspace;
         if (workspace?.paper) {
-          setEmbeddingIndexed(Boolean(workspace.embeddingIndexed));
+          setEmbeddingIndex(workspace.embeddingIndex === "ready" || workspace.embeddingIndex === "building" ? workspace.embeddingIndex : "missing");
           restoringWorkspaceRef.current = true;
           suppressDirtyRef.current = true;
           clearPaperAnnotations();
@@ -2788,6 +2788,29 @@ export default function Home() {
     return () => window.clearTimeout(timer);
   }, [dismissReaderTip]);
 
+  // 后台建立/续建语义索引：不阻塞提问；服务端每次调用在时间预算内尽量多建并落库进度，
+  // 返回 building 就稍等再调（断点续建），ready 即点亮 chip。失败静默回退，用户可点 chip 重试
+  const buildIndexForRef = useRef<string | null>(null);
+  const triggerIndexBuild = useCallback(async (id: string) => {
+    if (!id || buildIndexForRef.current === id) return;
+    buildIndexForRef.current = id;
+    setEmbeddingIndex("building");
+    try {
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const response = await fetch(`/api/papers/${id}/index`, { method: "POST", keepalive: true });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) { setEmbeddingIndex("missing"); return; }
+        if (payload.status === "ready") { setEmbeddingIndex("ready"); return; }
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+      setEmbeddingIndex("missing"); // 连续续建仍未完成：回到未建立态，允许手动重试
+    } catch {
+      setEmbeddingIndex("missing");
+    } finally {
+      if (buildIndexForRef.current === id) buildIndexForRef.current = null;
+    }
+  }, []);
+
   // 流式请求主体：sendQuestion（新提问）与 retryChat（失败重试）共用；history 为不含当前问题的上下文
   const startChatStream = useCallback(async (text: string, history: ChatMessage[]) => {
     // 发送前中断上一个未完成的全局流（loading 守卫下正常不会触发，防御用）
@@ -2843,8 +2866,11 @@ export default function Home() {
             if (created) setMessages((old) => old.map((message) => message.id === assistantId ? { ...message, steps: [...steps] } : message));
           },
           onDelta: pushDelta,
-          // 服务端完成语义索引后点亮上下文 chip 的「语义索引」标记
-          onDone: (payload) => { if (payload.indexed) setEmbeddingIndexed(true); },
+          // 索引就绪点亮 chip；未建立时后台自动建索引（不阻塞本次回答），建好后下次提问起用语义检索
+          onDone: (payload) => {
+            if (payload.indexState === "ready") setEmbeddingIndex("ready");
+            else if (payload.indexState === "missing" && embeddingConfig.model && paperId) void triggerIndexBuild(paperId);
+          },
         });
         // 中断时（停止按钮或切换论文）也按 flushDelta 逻辑落地已收到内容；切换论文时控制器已被置空，旧内容不写进新论文的消息列表
         if (!controller.signal.aborted || chatControllerRef.current === controller) flushNow();
@@ -2889,7 +2915,7 @@ export default function Home() {
     } finally {
       if (chatControllerRef.current === controller) chatControllerRef.current = null;
     }
-  }, [config, effort, paperId, paperText, paperTitle, promptConfig]);
+  }, [config, effort, embeddingConfig, paperId, paperText, paperTitle, promptConfig, triggerIndexBuild]);
 
   const sendQuestion = useCallback((raw: string) => {
     const text = raw.trim();
@@ -4045,7 +4071,7 @@ export default function Home() {
         restoringWorkspaceRef.current = false;
         setSource(null);
         setPaperId(null);
-        setEmbeddingIndexed(false);
+        setEmbeddingIndex("missing");
         setPaperStatus(null);
         setPaperSourceKind(null);
         setPaperSourceUrl(null);
@@ -4109,7 +4135,7 @@ export default function Home() {
       if (!response.ok || !payload.workspace?.paper) throw new Error(payload.error || "论文记录不存在");
       const workspace = payload.workspace;
       const paper = workspace.paper;
-      setEmbeddingIndexed(Boolean(workspace.embeddingIndexed));
+      setEmbeddingIndex(workspace.embeddingIndex === "ready" || workspace.embeddingIndex === "building" ? workspace.embeddingIndex : "missing");
       restoringWorkspaceRef.current = true;
       suppressDirtyRef.current = true;
       clearPaperAnnotations();
@@ -4182,7 +4208,7 @@ export default function Home() {
     restoringWorkspaceRef.current = false;
     clearPaperAnnotations();
     setPaperId(crypto.randomUUID());
-    setEmbeddingIndexed(false);
+    setEmbeddingIndex("missing");
     setPaperStatus("unread");
     setPaperSourceKind("remote");
     setPaperSourceUrl(normalized);
@@ -4233,7 +4259,7 @@ export default function Home() {
       if (!response.ok) throw new Error(payload.error || "上传失败");
       clearPaperAnnotations();
       setPaperId(payload.paper.id);
-      setEmbeddingIndexed(false);
+      setEmbeddingIndex("missing");
       setPaperStatus("unread");
       setPaperSourceKind("upload");
       setPaperSourceUrl(null);
@@ -4701,7 +4727,7 @@ export default function Home() {
         )}
         {panelTab === "chat" && !historyOpen && <div className="composer-wrap">
           <div className="composer-top-row">
-            <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? (extractProgress ? `已解析 ${extractProgress.done}/${extractProgress.total} 页` : "解析中") : paperText ? "上下文已就绪" : "等待文字"}</small>{embeddingIndexed && <small className="semantic-index-badge">语义索引</small>}</div>
+            <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? (extractProgress ? `已解析 ${extractProgress.done}/${extractProgress.total} 页` : "解析中") : paperText ? "上下文已就绪" : "等待文字"}</small>{embeddingIndex === "ready" && <small className="semantic-index-badge">语义索引</small>}{embeddingIndex === "building" && <small className="semantic-index-badge building"><LoaderCircle className="spin" size={9} />索引建立中</small>}{embeddingIndex === "missing" && embeddingConfig.model && paperId && Boolean(paperText) && <button type="button" className="semantic-index-trigger" title="为本文建立语义索引（后台进行，期间不影响提问），建立后深入/研究档召回更准" onClick={() => void triggerIndexBuild(paperId)}>建立语义索引</button>}</div>
           </div>
           <div className="composer">
             <textarea ref={composerRef} value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question); } else if (e.key === "Escape" && editingMessageId !== null) cancelEditMessage(); }} placeholder="询问整篇论文…" rows={2} />

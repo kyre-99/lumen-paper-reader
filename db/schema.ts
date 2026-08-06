@@ -72,13 +72,16 @@ export const readingSessions = sqliteTable("reading_sessions", {
   endPage: integer("end_page"),
 }, (table) => [index("reading_sessions_user_paper_day_idx").on(table.userId, table.paperId, table.day)]);
 
-// 语义索引：每篇论文一行。embeddingModel 或 textStamp（建索引时的 papers.updatedAt）不匹配即失效重建
+// 语义索引：每篇论文一行。embeddingModel 或 textStamp（建索引时的 papers.updatedAt）不匹配即失效重建；
+// status 标记 building/ready，doneCount 记录已写入的块数——中断后从断点续建，不整批重来
 export const paperIndexes = sqliteTable("paper_indexes", {
   paperId: text("paper_id").primaryKey().references(() => papers.id, { onDelete: "cascade" }),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   embeddingModel: text("embedding_model").notNull().default(""),
   textStamp: text("text_stamp").notNull().default(""),
   chunkCount: integer("chunk_count").notNull().default(0),
+  status: text("status", { enum: ["building", "ready"] }).notNull().default("ready"),
+  doneCount: integer("done_count").notNull().default(0),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [index("paper_indexes_user_id_idx").on(table.userId)]);
 

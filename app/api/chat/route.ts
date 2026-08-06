@@ -4,15 +4,14 @@ import { getDb } from "../../../db";
 import { llmUsage, papers, userSettings } from "../../../db/schema";
 import { DEFAULT_PROMPTS, renderSystemPrompt } from "../../chat-prompts";
 import { chatCompletionsUrl, resolveModelConfig } from "../../model-config";
-import { embedTexts, ensurePaperIndex, mergeHits, vectorRetrieve } from "./embeddings";
+import { cachedChunkPaper, chunkCacheKey, type Chunk } from "./chunks";
+import { embedTexts, getIndexState, mergeHits, vectorRetrieve } from "./embeddings";
 import { requireAppUser } from "../../server-user";
 
 const MAX_REFERENCE_CHARS = 26000;
-const CHUNK_TARGET = 1100;
 const AGENT_MAX_ROUNDS = 3;
 
 type Effort = "medium" | "high" | "max";
-type Chunk = { id: number; page: number; heading: string; text: string };
 // 单次 /api/chat 请求内多次模型调用的 token 累计器
 type TokenMeter = { prompt: number; completion: number };
 
@@ -48,64 +47,6 @@ const AGENT_SYSTEM = `你是论文研究 Agent，可以使用工具在论文中�
 - 阅读指定页的完整片段：{"action":"read","pages":[3,7]}（pages 最多 6 页）
 - 资料足够，开始作答：{"action":"answer"}
 策略：先 search 找到大致位置，再 read 关键页确认细节，确认足够后 answer。论文页码以 P数字 标注。`;
-
-function chunkPaper(fullText: string): Chunk[] {
-  const pages = String(fullText || "").split(/(?=--- PAGE \d+ ---)/).filter((page) => page.trim());
-  const chunks: Chunk[] = [];
-  let id = 0;
-  for (const pageBlock of pages) {
-    const match = pageBlock.match(/^--- PAGE (\d+) ---/);
-    const page = match ? Number(match[1]) : 1;
-    const body = pageBlock.replace(/^--- PAGE \d+ ---\s*\n?/, "");
-    const lines = body.split("\n").map((line) => line.trim()).filter(Boolean);
-    let buffer: string[] = [];
-    let heading = "";
-    // 相邻分块回叠约 160 字符：关键句被切在两个分块边界时，两半至少有一块能完整检出
-    let overlap = "";
-    const flush = () => {
-      const bodyText = buffer.join(" ").replace(/\s+/g, " ").trim();
-      buffer = [];
-      const text = (overlap + bodyText).trim();
-      if (text.length > 40) chunks.push({ id: id++, page, heading, text });
-      overlap = bodyText ? `${bodyText.slice(-160)} ` : "";
-    };
-    for (const line of lines) {
-      const looksHeading = line.length <= 80 && !/[.。;；,，:：]$/.test(line) && /[A-Za-z\u4e00-\u9fff]/.test(line);
-      if (looksHeading && buffer.join(" ").length > 300) flush();
-      if (looksHeading) heading = line;
-      buffer.push(line);
-      if (buffer.join(" ").length >= CHUNK_TARGET) flush();
-    }
-    flush();
-  }
-  return chunks;
-}
-
-// 分块结果的模块级缓存：同一篇论文的重复提问不再每次重新切分全文。
-// key 为 `paperId:updatedAt`（服务端从库读取时）或文本长度+首尾采样哈希（客户端直传时）。
-const CHUNK_CACHE_LIMIT = 20;
-const chunkCache = new Map<string, Chunk[]>();
-
-function chunkCacheKey(paperId: string, updatedAt: string, text: string) {
-  if (paperId) return `${paperId}:${updatedAt}`;
-  const sample = `${text.slice(0, 64)}${text.length}${text.slice(-64)}`;
-  let hash = 0;
-  for (let index = 0; index < sample.length; index++) hash = (hash * 31 + sample.charCodeAt(index)) | 0;
-  return `text:${text.length}:${hash}`;
-}
-
-function cachedChunkPaper(cacheKey: string, text: string): Chunk[] {
-  const cached = chunkCache.get(cacheKey);
-  if (cached) return cached;
-  const chunks = chunkPaper(text);
-  if (chunkCache.size >= CHUNK_CACHE_LIMIT) {
-    // Map 按插入序迭代，满了就清掉最旧的一条
-    const oldest = chunkCache.keys().next().value;
-    if (oldest !== undefined) chunkCache.delete(oldest);
-  }
-  chunkCache.set(cacheKey, chunks);
-  return chunks;
-}
 
 function extractTerms(text: string): string[] {
   const latin = text.toLowerCase().match(/[a-z0-9][a-z0-9-]{1,}/g) || [];
@@ -381,21 +322,17 @@ export async function POST(request: NextRequest) {
     const stream = new ReadableStream({
       async start(controller) {
         const send = (payload: Record<string, unknown>) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
-        let indexed = false;
-        // 懒建语义索引并返回向量召回函数；embedding 不可用时降级为 null，走纯关键词检索
+        // 语义索引状态：ready 时启用向量召回；missing/building 时不阻塞回答、走纯关键词检索，
+        // 由 done 里的 indexState 通知前端在后台触发/续建索引（见 /api/papers/[id]/index）
+        let indexState: "ready" | "building" | "missing" = "missing";
         const setupVectorSearch = async (chunks: Chunk[]) => {
           if (!embeddingReady || !chunks.length) return null;
-          try {
-            await ensurePaperIndex(db, user.id, paperIdText, chunks, paperUpdatedAt, embeddingConfig, (label) => send({ type: "step", label }), meter);
-            indexed = true;
-            return async (queries: string[], k: number, exclude?: Map<number, Chunk>) => {
-              const queryVectors = await embedTexts(embeddingConfig.endpoint, embeddingConfig.apiKey, embeddingConfig.model, queries, meter);
-              return vectorRetrieve(db, user.id, paperIdText, chunks, queryVectors, k, exclude);
-            };
-          } catch {
-            send({ type: "step", label: "语义索引不可用，本次使用关键词检索" });
-            return null;
-          }
+          indexState = await getIndexState(db, user.id, paperIdText, paperUpdatedAt, embeddingConfig.model, chunks.length);
+          if (indexState !== "ready") return null;
+          return async (queries: string[], k: number, exclude?: Map<number, Chunk>) => {
+            const queryVectors = await embedTexts(embeddingConfig.endpoint, embeddingConfig.apiKey, embeddingConfig.model, queries, meter);
+            return vectorRetrieve(db, user.id, paperIdText, chunks, queryVectors, k, exclude);
+          };
         };
         try {
           if (isInline && imageDataUrl) {
@@ -517,7 +454,7 @@ export async function POST(request: NextRequest) {
               await db.insert(llmUsage).values({ id: crypto.randomUUID(), userId: user.id, model: resolvedModel, mode: isInline ? "inline" : "global", effort: level, promptTokens: meter.prompt, completionTokens: meter.completion, createdAt: new Date().toISOString() });
             } catch { /* 用量写入失败不影响回答 */ }
           }
-          send({ type: "done", usage: { promptTokens: meter.prompt, completionTokens: meter.completion }, indexed });
+          send({ type: "done", usage: { promptTokens: meter.prompt, completionTokens: meter.completion }, indexState });
         } catch (error: unknown) {
           send({ type: "error", message: error instanceof Error ? error.message : "请求失败" });
         }

@@ -409,6 +409,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .global-context-chip span { font-weight: 700; }
 .global-context-chip small { color: #7d8983; font-size: 8px; }
 .global-context-chip .semantic-index-badge { color: var(--green); font-weight: 700; border-left: 1px solid #dbe5e0; padding-left: 5px; }
+.global-context-chip .semantic-index-badge.building { display: inline-flex; align-items: center; gap: 3px; color: #7d8983; font-weight: 400; }
+.global-context-chip .semantic-index-trigger { border: 0; background: transparent; color: #7d8983; font-size: 8px; cursor: pointer; border-left: 1px solid #dbe5e0; padding: 0 0 0 5px; text-decoration: underline; text-underline-offset: 2px; }
+.global-context-chip .semantic-index-trigger:hover { color: var(--green); }
 .composer-context { position: relative; margin-bottom: -5px; padding: 8px 34px 11px 10px; border: 1px solid #dfe5e2; border-bottom: 0; border-radius: 10px 10px 0 0; background: #f1f6f3; color: #6b7771; }
 .composer-context span { color: var(--green); font-size: 9px; font-weight: 700; }
 .composer-context p { margin: 2px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
@@ -1035,6 +1038,9 @@ html[data-theme="dark"] .message-steps { border-color: #2f3a34; background: #222
 html[data-theme="dark"] .global-context-chip { border-color: #35544a; background: var(--green-soft); }
 html[data-theme="dark"] .global-context-chip small { color: var(--muted); }
 html[data-theme="dark"] .global-context-chip .semantic-index-badge { color: var(--green); border-left-color: #35544a; }
+html[data-theme="dark"] .global-context-chip .semantic-index-badge.building { color: var(--muted); }
+html[data-theme="dark"] .global-context-chip .semantic-index-trigger { color: var(--muted); border-left-color: #35544a; }
+html[data-theme="dark"] .global-context-chip .semantic-index-trigger:hover { color: var(--green); }
 html[data-theme="dark"] .composer-context { border-color: #3a453f; background: #222b26; color: #9aa69f; }
 html[data-theme="dark"] .composer { border-color: #3a453f; background: var(--d-card-2); box-shadow: 0 8px 30px rgba(0,0,0,.3); }
 html[data-theme="dark"] .composer textarea { color: var(--ink); }

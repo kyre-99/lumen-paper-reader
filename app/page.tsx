@@ -2266,6 +2266,8 @@ export default function Home() {
   const [embeddingConfig, setEmbeddingConfig] = useState<EmbeddingConfig>({ endpoint: "", model: "", apiKey: "", hasApiKey: false });
   // 当前论文的语义索引状态：missing 未建立（可点击手动建立）、building 后台建立中、ready 已就绪
   const [embeddingIndex, setEmbeddingIndex] = useState<"ready" | "building" | "missing">("missing");
+  // 建立进度（done/total），在 chip 上展示
+  const [indexProgress, setIndexProgress] = useState<{ done: number; total: number } | null>(null);
   const [promptConfig, setPromptConfig] = useState<PromptConfig>(DEFAULT_PROMPTS);
   // 框选图表模式：lassoRect 为拖动中的屏幕矩形，figureRegion 为松手后确认的选区
   const [figureLasso, setFigureLasso] = useState(false);
@@ -2789,23 +2791,52 @@ export default function Home() {
   }, [dismissReaderTip]);
 
   // 后台建立/续建语义索引：不阻塞提问；服务端每次调用在时间预算内尽量多建并落库进度，
-  // 返回 building 就稍等再调（断点续建），ready 即点亮 chip。失败静默回退，用户可点 chip 重试
+  // 返回 building 就稍等再调（断点续建），ready 即点亮 chip。5xx/网络错误自动重试（连续 3 次放弃），
+  // 放弃后本会话不再自动触发（避免提供商故障时空转），点 chip 可手动重试。
+  // 切换论文后循环继续把旧论文建完，但 chip 只跟随当前论文（paperIdRef 守卫）
   const buildIndexForRef = useRef<string | null>(null);
-  const triggerIndexBuild = useCallback(async (id: string) => {
+  const paperIdRef = useRef<string | null>(null);
+  const indexGaveUpRef = useRef<string | null>(null);
+  useEffect(() => { paperIdRef.current = paperId; }, [paperId]);
+  const triggerIndexBuild = useCallback(async (id: string, manual = false) => {
     if (!id || buildIndexForRef.current === id) return;
+    if (!manual && indexGaveUpRef.current === id) return;
+    if (manual) indexGaveUpRef.current = null;
     buildIndexForRef.current = id;
-    setEmbeddingIndex("building");
+    // 只有仍是当前论文时才更新界面；切走后循环照旧把旧论文建完
+    const sync = (state: "ready" | "building" | "missing", progress?: { done: number; total: number } | null) => {
+      if (paperIdRef.current !== id) return;
+      setEmbeddingIndex(state);
+      if (progress !== undefined) setIndexProgress(progress);
+    };
+    sync("building", null);
+    let failures = 0;
     try {
       for (let attempt = 0; attempt < 12; attempt++) {
-        const response = await fetch(`/api/papers/${id}/index`, { method: "POST", keepalive: true });
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok) { setEmbeddingIndex("missing"); return; }
-        if (payload.status === "ready") { setEmbeddingIndex("ready"); return; }
-        await new Promise((resolve) => setTimeout(resolve, 1500));
+        try {
+          const response = await fetch(`/api/papers/${id}/index`, { method: "POST", keepalive: true });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            if (response.status < 500) { sync("missing"); return; } // 配置缺失等 4xx 不重试
+            throw new Error(String(payload.error || "索引建立失败"));
+          }
+          failures = 0;
+          if (payload.status === "ready") { sync("ready", null); return; }
+          sync("building", { done: Number(payload.doneCount) || 0, total: Number(payload.chunkCount) || 0 });
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        } catch {
+          failures += 1;
+          if (failures >= 3) {
+            indexGaveUpRef.current = id;
+            sync("missing");
+            if (paperIdRef.current === id) setToast({ text: "语义索引建立中断（网络问题），已保留进度，点「建立语义索引」可继续", kind: "error" });
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+        }
       }
-      setEmbeddingIndex("missing"); // 连续续建仍未完成：回到未建立态，允许手动重试
-    } catch {
-      setEmbeddingIndex("missing");
+      indexGaveUpRef.current = id;
+      sync("missing");
     } finally {
       if (buildIndexForRef.current === id) buildIndexForRef.current = null;
     }
@@ -4727,7 +4758,7 @@ export default function Home() {
         )}
         {panelTab === "chat" && !historyOpen && <div className="composer-wrap">
           <div className="composer-top-row">
-            <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? (extractProgress ? `已解析 ${extractProgress.done}/${extractProgress.total} 页` : "解析中") : paperText ? "上下文已就绪" : "等待文字"}</small>{embeddingIndex === "ready" && <small className="semantic-index-badge">语义索引</small>}{embeddingIndex === "building" && <small className="semantic-index-badge building"><LoaderCircle className="spin" size={9} />索引建立中</small>}{embeddingIndex === "missing" && embeddingConfig.model && paperId && Boolean(paperText) && <button type="button" className="semantic-index-trigger" title="为本文建立语义索引（后台进行，期间不影响提问），建立后深入/研究档召回更准" onClick={() => void triggerIndexBuild(paperId)}>建立语义索引</button>}</div>
+            <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? (extractProgress ? `已解析 ${extractProgress.done}/${extractProgress.total} 页` : "解析中") : paperText ? "上下文已就绪" : "等待文字"}</small>{embeddingIndex === "ready" && <small className="semantic-index-badge">语义索引</small>}{embeddingIndex === "building" && <small className="semantic-index-badge building"><LoaderCircle className="spin" size={9} />索引建立中{indexProgress?.total ? ` ${indexProgress.done}/${indexProgress.total}` : ""}</small>}{embeddingIndex === "missing" && embeddingConfig.model && paperId && Boolean(paperText) && <button type="button" className="semantic-index-trigger" title="为本文建立语义索引（后台进行，期间不影响提问），建立后深入/研究档召回更准" onClick={() => void triggerIndexBuild(paperId, true)}>建立语义索引</button>}</div>
           </div>
           <div className="composer">
             <textarea ref={composerRef} value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question); } else if (e.key === "Escape" && editingMessageId !== null) cancelEditMessage(); }} placeholder="询问整篇论文…" rows={2} />

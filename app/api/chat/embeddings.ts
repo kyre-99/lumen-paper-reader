@@ -12,7 +12,8 @@ type Chunk = { id: number; page: number; heading: string; text: string };
 type TokenMeter = { prompt: number; completion: number };
 export type IndexState = "ready" | "building" | "missing";
 
-const EMBED_BATCH = 64;
+// 单批 16 块：中转/代理接口常限制单批条数或响应较慢，小批次更不容易超时，进度粒度也更细
+const EMBED_BATCH = 16;
 // D1 单条语句的绑定参数与体积有限，分块写入每批 40 行（每行向量约 8KB）
 const WRITE_BATCH = 40;
 
@@ -44,22 +45,42 @@ export function cosine(a: Float32Array, b: Float32Array): number {
   return normA && normB ? dot / (Math.sqrt(normA) * Math.sqrt(normB)) : 0;
 }
 
-// 批量调用 /embeddings；usage 计入 token 表（embedding 费用纳入用量统计）
+// 批量调用 /embeddings；usage 计入 token 表（embedding 费用纳入用量统计）。
+// 每批 45 秒超时、失败最多重试 2 次（指数退避）：中转接口偶发慢响应/断连时建索引不会整批报废
+async function embedBatch(target: URL, apiKey: string, model: string, batch: string[]): Promise<{ items: Array<{ embedding?: number[] }>; promptTokens: number }> {
+  let lastError: Error = new Error("Embedding 请求失败");
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await new Promise((resolve) => setTimeout(resolve, attempt * 2500));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 45000);
+    try {
+      const response = await fetch(target.toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, input: batch }),
+        signal: controller.signal,
+      });
+      const data = await response.json().catch(() => ({})) as { error?: { message?: string }; data?: Array<{ embedding?: number[] }>; usage?: { prompt_tokens?: number } };
+      if (!response.ok) throw new Error(data?.error?.message || `Embedding 接口返回 ${response.status}`);
+      if (!Array.isArray(data.data) || data.data.length !== batch.length) throw new Error("Embedding 接口返回的数据不完整");
+      return { items: data.data, promptTokens: Number(data.usage?.prompt_tokens) || 0 };
+    } catch (error: unknown) {
+      lastError = error instanceof Error && error.name === "AbortError" ? new Error("Embedding 接口响应超时（45 秒）") : error instanceof Error ? error : new Error("Embedding 请求失败");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastError;
+}
+
 export async function embedTexts(endpoint: string, apiKey: string, model: string, texts: string[], meter?: TokenMeter): Promise<Float32Array[]> {
   const target = embeddingsUrl(endpoint);
   const vectors: Float32Array[] = [];
   for (let start = 0; start < texts.length; start += EMBED_BATCH) {
     const batch = texts.slice(start, start + EMBED_BATCH);
-    const response = await fetch(target.toString(), {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, input: batch }),
-    });
-    const data = await response.json().catch(() => ({})) as { error?: { message?: string }; data?: Array<{ embedding?: number[] }>; usage?: { prompt_tokens?: number } };
-    if (!response.ok) throw new Error(data?.error?.message || `Embedding 接口返回 ${response.status}`);
-    if (!Array.isArray(data.data) || data.data.length !== batch.length) throw new Error("Embedding 接口返回的数据不完整");
-    if (meter && data.usage?.prompt_tokens) meter.prompt += Number(data.usage.prompt_tokens) || 0;
-    for (const item of data.data) {
+    const { items, promptTokens } = await embedBatch(target, apiKey, model, batch);
+    if (meter && promptTokens) meter.prompt += promptTokens;
+    for (const item of items) {
       if (!Array.isArray(item.embedding) || !item.embedding.length) throw new Error("Embedding 接口返回了空向量");
       vectors.push(new Float32Array(item.embedding));
     }

@@ -32,6 +32,14 @@ export function fromBase64(payload: string): Float32Array {
   return new Float32Array(bytes.buffer);
 }
 
+// 文本版本指纹：内容不变指纹不变。不能用 papers.updatedAt——任何保存（翻页/发消息）都会刷新它，
+// 会导致索引被误判失效而整篇重建
+export function textStampOf(text: string): string {
+  let hash = 0;
+  for (let index = 0; index < text.length; index++) hash = (hash * 31 + text.charCodeAt(index)) | 0;
+  return `${text.length}:${hash}`;
+}
+
 export function cosine(a: Float32Array, b: Float32Array): number {
   let dot = 0;
   let normA = 0;

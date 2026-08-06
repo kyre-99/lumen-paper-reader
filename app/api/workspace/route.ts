@@ -2,7 +2,7 @@ import { and, eq } from "drizzle-orm";
 import { requireAppUser } from "../../server-user";
 import { getDb } from "../../../db";
 import { papers, paperStates, readerStates, userSettings } from "../../../db/schema";
-import { getIndexState } from "../chat/embeddings";
+import { getIndexState, textStampOf } from "../chat/embeddings";
 
 function parseArray(value: string) {
   try {
@@ -40,7 +40,7 @@ export async function GET(request: Request) {
   const restoredState = paperState || (state?.activePaperId === paper.id ? state : null);
   // 语义索引状态（ready/building/missing）：供阅读器上下文 chip 展示与轮询
   const [settings] = await db.select({ embeddingModelName: userSettings.embeddingModelName }).from(userSettings).where(eq(userSettings.userId, user.id)).limit(1);
-  const embeddingIndex = await getIndexState(db, user.id, paper.id, paper.updatedAt, String(settings?.embeddingModelName || "").trim());
+  const embeddingIndex = await getIndexState(db, user.id, paper.id, textStampOf(paper.paperText), String(settings?.embeddingModelName || "").trim());
 
   return Response.json({
     workspace: {

@@ -5,7 +5,7 @@ import { llmUsage, papers, userSettings } from "../../../db/schema";
 import { DEFAULT_PROMPTS, renderSystemPrompt } from "../../chat-prompts";
 import { chatCompletionsUrl, resolveModelConfig } from "../../model-config";
 import { cachedChunkPaper, chunkCacheKey, type Chunk } from "./chunks";
-import { embedTexts, getIndexState, mergeHits, vectorRetrieve } from "./embeddings";
+import { embedTexts, getIndexState, mergeHits, textStampOf, vectorRetrieve } from "./embeddings";
 import { requireAppUser } from "../../server-user";
 
 const MAX_REFERENCE_CHARS = 26000;
@@ -327,7 +327,7 @@ export async function POST(request: NextRequest) {
         let indexState: "ready" | "building" | "missing" = "missing";
         const setupVectorSearch = async (chunks: Chunk[]) => {
           if (!embeddingReady || !chunks.length) return null;
-          indexState = await getIndexState(db, user.id, paperIdText, paperUpdatedAt, embeddingConfig.model, chunks.length);
+          indexState = await getIndexState(db, user.id, paperIdText, textStampOf(resolvedPaperContext), embeddingConfig.model, chunks.length);
           if (indexState !== "ready") return null;
           return async (queries: string[], k: number, exclude?: Map<number, Chunk>) => {
             const queryVectors = await embedTexts(embeddingConfig.endpoint, embeddingConfig.apiKey, embeddingConfig.model, queries, meter);

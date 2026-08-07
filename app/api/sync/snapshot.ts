@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import { getDb } from "../../../db";
-import { paperFolders, papers, paperStates, readerStates, readingSessions } from "../../../db/schema";
+import { diaryEntries, paperFolders, papers, paperStates, readerStates, readingSessions } from "../../../db/schema";
 import { sanitizeObjectKey } from "../../object-key";
 
 // 全量备份快照（version 1），WebDAV 与本地导出共用
@@ -13,24 +13,27 @@ export type SyncSnapshot = {
   paperStates: Array<typeof paperStates.$inferSelect>;
   // 旧快照没有该字段，恢复时按空数组处理
   readingSessions?: Array<typeof readingSessions.$inferSelect>;
+  // 旧快照没有该字段，恢复时按空数组处理
+  diaryEntries?: Array<typeof diaryEntries.$inferSelect>;
 };
 
 // 校验远端/文件里的快照结构
 export function isSyncSnapshot(value: unknown): value is SyncSnapshot {
   const snapshot = value as SyncSnapshot | null;
-  return Boolean(snapshot && snapshot.version === 1 && Array.isArray(snapshot.papers) && Array.isArray(snapshot.folders) && Array.isArray(snapshot.paperStates) && (snapshot.readingSessions === undefined || Array.isArray(snapshot.readingSessions)));
+  return Boolean(snapshot && snapshot.version === 1 && Array.isArray(snapshot.papers) && Array.isArray(snapshot.folders) && Array.isArray(snapshot.paperStates) && (snapshot.readingSessions === undefined || Array.isArray(snapshot.readingSessions)) && (snapshot.diaryEntries === undefined || Array.isArray(snapshot.diaryEntries)));
 }
 
 // 组装该用户的全量快照
 export async function buildSnapshot(userId: string): Promise<SyncSnapshot> {
   const db = getDb();
-  const [folders, allPapers, allStates, allSessions] = await Promise.all([
+  const [folders, allPapers, allStates, allSessions, allDiaryEntries] = await Promise.all([
     db.select().from(paperFolders).where(eq(paperFolders.userId, userId)),
     db.select().from(papers).where(eq(papers.userId, userId)),
     db.select().from(paperStates).where(eq(paperStates.userId, userId)),
     db.select().from(readingSessions).where(eq(readingSessions.userId, userId)),
+    db.select().from(diaryEntries).where(eq(diaryEntries.userId, userId)),
   ]);
-  return { version: 1, exportedAt: new Date().toISOString(), folders, papers: allPapers, paperStates: allStates, readingSessions: allSessions };
+  return { version: 1, exportedAt: new Date().toISOString(), folders, papers: allPapers, paperStates: allStates, readingSessions: allSessions, diaryEntries: allDiaryEntries };
 }
 
 // 覆盖式恢复：先删本用户现有数据，再插入快照行（userId 一律换成本用户）
@@ -40,6 +43,7 @@ export async function restoreSnapshot(userId: string, snapshot: SyncSnapshot) {
   const statements: BatchItem<"sqlite">[] = [
     db.delete(paperStates).where(eq(paperStates.userId, userId)),
     db.delete(readingSessions).where(eq(readingSessions.userId, userId)),
+    db.delete(diaryEntries).where(eq(diaryEntries.userId, userId)),
     db.delete(papers).where(eq(papers.userId, userId)),
     db.delete(paperFolders).where(eq(paperFolders.userId, userId)),
     db.update(readerStates).set({ activePaperId: null, updatedAt: now }).where(eq(readerStates.userId, userId)),
@@ -58,6 +62,10 @@ export async function restoreSnapshot(userId: string, snapshot: SyncSnapshot) {
   // 论文按原 id 重新插入，readingSessions 的 paperId 与 paperStates 一样直接沿用
   for (const session of snapshot.readingSessions || []) {
     statements.push(db.insert(readingSessions).values({ ...session, id: String(session.id).slice(0, 64), paperId: String(session.paperId).slice(0, 64), userId }));
+  }
+  // 日记按原 id 重新插入，userId 换成本用户
+  for (const entry of snapshot.diaryEntries || []) {
+    statements.push(db.insert(diaryEntries).values({ ...entry, id: String(entry.id).slice(0, 64), userId, day: String(entry.day || "").slice(0, 10), title: String(entry.title || "").slice(0, 120), content: String(entry.content || "").slice(0, 100000) }));
   }
   await db.batch(statements as [BatchItem<"sqlite">, ...BatchItem<"sqlite">[]]);
 }
@@ -82,11 +90,12 @@ export async function mergeSnapshot(userId: string, snapshot: SyncSnapshot): Pro
     const parsed = Date.parse(String(value || ""));
     return Number.isFinite(parsed) ? parsed : 0;
   };
-  const [localFolders, localPapers, localStates, localSessions] = await Promise.all([
+  const [localFolders, localPapers, localStates, localSessions, localDiaryEntries] = await Promise.all([
     db.select().from(paperFolders).where(eq(paperFolders.userId, userId)),
     db.select().from(papers).where(eq(papers.userId, userId)),
     db.select().from(paperStates).where(eq(paperStates.userId, userId)),
     db.select().from(readingSessions).where(eq(readingSessions.userId, userId)),
+    db.select().from(diaryEntries).where(eq(diaryEntries.userId, userId)),
   ]);
   const statements: BatchItem<"sqlite">[] = [];
   const summary: MergeSummary = { foldersAdded: 0, papersAdded: 0, papersUpdated: 0, statesUpdated: 0, sessionsAdded: 0, restoredPaperIds: [] };
@@ -169,6 +178,32 @@ export async function mergeSnapshot(userId: string, snapshot: SyncSnapshot): Pro
     }
     if (ts(session.lastPingAt) > ts(local.lastPingAt)) {
       statements.push(db.update(readingSessions).set(values).where(and(eq(readingSessions.id, id), eq(readingSessions.userId, userId))));
+    }
+  }
+
+  // 日记按 (id) 合并，同 id 取 updatedAt 较新者；不同 id 但同一天的以 updatedAt 较新者为准，避免唯一索引冲突
+  const localDiaryById = new Map(localDiaryEntries.map((entry) => [entry.id, entry]));
+  const localDiaryDayTaken = new Map(localDiaryEntries.map((entry) => [entry.day, entry]));
+  for (const entry of snapshot.diaryEntries || []) {
+    const id = String(entry.id).slice(0, 64);
+    const day = String(entry.day || "").slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
+    const values = { ...entry, id, userId, day, title: String(entry.title || "").slice(0, 120), content: String(entry.content || "").slice(0, 100000) };
+    const local = localDiaryById.get(id);
+    if (!local) {
+      const sameDay = localDiaryDayTaken.get(day);
+      if (sameDay) {
+        if (ts(entry.updatedAt) > ts(sameDay.updatedAt)) {
+          statements.push(db.update(diaryEntries).set({ title: values.title, content: values.content, updatedAt: String(entry.updatedAt || now) }).where(and(eq(diaryEntries.id, sameDay.id), eq(diaryEntries.userId, userId))));
+        }
+        continue;
+      }
+      statements.push(db.insert(diaryEntries).values(values));
+      localDiaryDayTaken.set(day, values as typeof localDiaryEntries[number]);
+      continue;
+    }
+    if (ts(entry.updatedAt) > ts(local.updatedAt)) {
+      statements.push(db.update(diaryEntries).set(values).where(and(eq(diaryEntries.id, id), eq(diaryEntries.userId, userId))));
     }
   }
 

@@ -42,6 +42,7 @@ import {
   Minus,
   Moon,
   MoreHorizontal,
+  NotebookPen,
   PanelLeft,
   Palette,
   PanelRightClose,
@@ -196,6 +197,7 @@ const PAPER_STATUS_OPTIONS: Array<{ value: PaperStatus; label: string }> = [
 ];
 type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; sourceKind: PaperSourceKind; sourceUrl: string | null; pageCount: number; status: PaperStatus; rating: number; createdAt: string; updatedAt: string };
 type LibraryFolder = { id: string; name: string; createdAt?: string; updatedAt: string };
+type DiaryEntry = { id: string; day: string; title: string; content: string; updatedAt: string };
 type UsageStats = {
   totalCalls: number; promptTokens: number; completionTokens: number; totalTokens: number;
   estimatedCost: number | null; currency: string;
@@ -211,6 +213,12 @@ type ReadingStats = {
 // 客户端本地日期 YYYY-MM-DD，心跳与统计都按本地自然日聚合
 function localDayString(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+// 日记列表摘要：剥掉 Markdown 记号、压缩空白后取前 40 字
+function diaryExcerpt(content: string) {
+  const plain = content.replace(/[#>*_`~!\[\]()-]/g, "").replace(/\s+/g, " ").trim();
+  return plain.length > 40 ? `${plain.slice(0, 40)}…` : plain;
 }
 
 // 本周一（本地时区）的日期字符串，作为统计接口的 from 参数
@@ -1458,6 +1466,146 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
   );
 }
 
+function DiaryView({ onBack, leaveRef, entries, loading, onSaveEntry, onDeleteEntry }: { onBack: () => void; leaveRef: { current: () => boolean }; entries: DiaryEntry[]; loading: boolean; onSaveEntry: (day: string, title: string, content: string) => Promise<DiaryEntry | null>; onDeleteEntry: (day: string) => Promise<boolean> }) {
+  const today = localDayString();
+  const [selectedDay, setSelectedDay] = useState(today);
+  const [title, setTitle] = useState("");
+  const [content, setContent] = useState("");
+  const [mode, setMode] = useState<"edit" | "preview">("edit");
+  // saveState 兼作 dirty 标记："dirty" 即"saved"/"saving" 即无未保存修改
+  const [saveState, setSaveState] = useState<"saved" | "saving" | "dirty">("saved");
+  const [generating, setGenerating] = useState(false);
+  const [notice, setNotice] = useState("");
+  const dirty = saveState === "dirty";
+  // 列表加载完成或切换日期时把该天内容灌进编辑区；之后 entries 变化（保存/删除）不回灌，避免覆盖正在输入的内容
+  // 渲染期同步写法（与页码输入框同款），避免 effect 里同步 setState 触发级联渲染
+  const [loadedDay, setLoadedDay] = useState("");
+  if (!loading && loadedDay !== selectedDay) {
+    setLoadedDay(selectedDay);
+    const entry = entries.find((item) => item.day === selectedDay);
+    setTitle(entry?.title || "");
+    setContent(entry?.content || "");
+    setMode(entry?.content ? "preview" : "edit");
+    setSaveState("saved");
+    setNotice("");
+  }
+
+  const discardConfirm = () => !dirty || window.confirm("有未保存的修改，确定不保存吗？");
+  const requestBack = () => { if (discardConfirm()) onBack(); };
+  const selectDay = (day: string) => {
+    if (day === selectedDay || generating) return;
+    if (!discardConfirm()) return;
+    setSelectedDay(day);
+  };
+
+  const save = useCallback(async () => {
+    if (saveState === "saving" || generating) return;
+    setSaveState("saving");
+    const entry = await onSaveEntry(selectedDay, title.trim(), content);
+    setSaveState(entry ? "saved" : "dirty");
+  }, [saveState, generating, onSaveEntry, selectedDay, title, content]);
+
+  // Ctrl/Cmd+S 保存、Esc 返回阅读器；用 ref 取最新闭包，监听器只挂载一次
+  // leaveRef 暴露给父组件：点侧栏"阅读器"切回时也要过未保存确认
+  const saveRef = useRef(save);
+  const backRef = useRef(requestBack);
+  useEffect(() => { saveRef.current = save; backRef.current = requestBack; leaveRef.current = discardConfirm; });
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); void saveRef.current(); return; }
+      if (event.key === "Escape") backRef.current();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  const removeEntry = async (day: string) => {
+    if (generating) return;
+    if (!window.confirm(`确定删除 ${day} 的日记吗？无法恢复。`)) return;
+    const ok = await onDeleteEntry(day);
+    if (ok && day === selectedDay) setLoadedDay(""); // 触发编辑区重灌为空
+  };
+
+  // AI 生成：POST SSE 流，delta 增量追加；流式期间强制预览态形成打字机效果，结束后可切回编辑
+  const generate = async () => {
+    if (generating || selectedDay !== today) return;
+    if (content.trim() && !window.confirm("AI 生成将替换当前内容，确定继续吗？")) return;
+    setGenerating(true);
+    setNotice("");
+    setMode("preview");
+    setContent("");
+    setSaveState("dirty");
+    try {
+      const response = await fetch("/api/diary/generate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ day: selectedDay }) });
+      if (!response.ok || !response.body) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.error || "生成失败，请稍后再试");
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          const text = line.trim();
+          if (!text.startsWith("data:")) continue;
+          let event: { type?: string; text?: string; code?: string; message?: string };
+          try { event = JSON.parse(text.slice(5).trim()); } catch { continue; }
+          if (event.type === "delta" && event.text) setContent((current) => current + event.text);
+          else if (event.type === "error") {
+            setNotice(event.code === "no_material" ? "今天还没有满足条件的阅读记录（需在某篇论文停留满 10 分钟且有提问或批注）" : event.message || "生成失败，请稍后再试");
+          }
+          // "done" 无需处理：流结束自然退出循环
+        }
+      }
+    } catch (error: unknown) {
+      setNotice(errorMessage(error, "生成失败，请稍后再试"));
+    } finally { setGenerating(false); }
+  };
+
+  return (
+    <div className="diary-view" aria-labelledby="diary-title">
+      <div className="settings-heading diary-heading"><div className="modal-icon"><NotebookPen size={23} /></div><div><h2 id="diary-title">日记本</h2><p>记录每天的阅读与思考；AI 可以汇总当天读过的论文和问答，生成日记初稿。</p></div></div>
+      <div className="diary-browser">
+        <aside className="diary-list" aria-label="日记列表">
+          <button className="primary-button diary-new-button" onClick={() => selectDay(today)}><Plus size={14} />写今天的日记</button>
+          {loading ? <div className="diary-empty loading"><LoaderCircle className="spin" size={16} />正在读取日记…</div> : entries.length ? entries.map((entry) => (
+            <div key={entry.id} className={`diary-list-item ${entry.day === selectedDay ? "active" : ""}`} onClick={() => selectDay(entry.day)}>
+              <strong>{entry.day}</strong>
+              <span className="diary-item-title">{entry.title || "无标题"}</span>
+              {entry.content.trim() && <p>{diaryExcerpt(entry.content)}</p>}
+              <button className="folder-action diary-delete" aria-label={`删除 ${entry.day} 的日记`} title="删除日记" onClick={(event) => { event.stopPropagation(); void removeEntry(entry.day); }}><Trash2 size={12} /></button>
+            </div>
+          )) : <div className="diary-empty"><NotebookPen size={26} /><strong>还没有日记</strong><p>点击上方“写今天的日记”，手动记录或让 AI 汇总今天的阅读。</p></div>}
+        </aside>
+        <section className="diary-editor-pane">
+          <input className="diary-title-input" value={title} onChange={(event) => { setTitle(event.target.value); setSaveState("dirty"); }} placeholder={`${selectedDay} 的标题（可选）`} aria-label="日记标题" maxLength={120} />
+          <div className="diary-toolbar">
+            <div className="diary-mode-switch" role="group" aria-label="切换编辑或预览">
+              <button className={mode === "edit" ? "active" : ""} onClick={() => setMode("edit")} disabled={generating}>编辑</button>
+              <button className={mode === "preview" ? "active" : ""} onClick={() => setMode("preview")}>预览</button>
+            </div>
+            <button className="diary-generate" onClick={() => void generate()} disabled={generating || selectedDay !== today} title={selectedDay === today ? "汇总今天的阅读与问答，生成日记初稿" : "只能生成今天的日记"}>
+              {generating ? <LoaderCircle className="spin" size={13} /> : <Sparkles size={13} />}AI 生成
+            </button>
+            <button className={`primary-button diary-save ${dirty ? "dirty" : ""}`} onClick={() => void save()} disabled={saveState === "saving" || generating} title="保存（Ctrl/Cmd+S）">
+              {saveState === "saving" ? <><LoaderCircle className="spin" size={13} />保存中…</> : saveState === "saved" ? <><Check size={13} />已保存</> : "保存"}
+            </button>
+          </div>
+          {notice && <div className="diary-notice"><AlertCircle size={13} /><span>{notice}</span></div>}
+          {mode === "edit" && !generating
+            ? <textarea className="diary-editor" value={content} onChange={(event) => { setContent(event.target.value); setSaveState("dirty"); }} placeholder="用 Markdown 记录今天的阅读收获…" aria-label="日记内容" />
+            : <div className="diary-preview">{content.trim() ? <MarkdownContent content={content} /> : <span className="diary-preview-empty">{generating ? "正在生成日记…" : "还没有内容"}</span>}</div>}
+        </section>
+      </div>
+    </div>
+  );
+}
+
 function formatTokenCount(value: number) {
   if (value >= 100_000_000) return `${(value / 100_000_000).toFixed(1)}亿`;
   if (value >= 10_000) return `${(value / 10_000).toFixed(1)}万`;
@@ -2016,6 +2164,9 @@ export default function Home() {
   const [statsOpen, setStatsOpen] = useState(false);
   const [readingStats, setReadingStats] = useState<ReadingStats | null>(null);
   const [statsLoading, setStatsLoading] = useState(false);
+  const [diaryOpen, setDiaryOpen] = useState(false);
+  const [diaryEntries, setDiaryEntries] = useState<DiaryEntry[]>([]);
+  const [diaryLoading, setDiaryLoading] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [uiFontSize, setUiFontSize] = useStoredPref<"compact" | "standard" | "large" | "xlarge">("lumen-ui-font-size", "standard", UI_FONT_SIZES);
   const [rightOpen, setRightOpen] = useState(true);
@@ -2153,6 +2304,10 @@ export default function Home() {
   // 心跳回调读取的最新页码，避免每翻一页就重建定时器
   const currentPageRef = useRef(1);
   useEffect(() => { currentPageRef.current = currentPage; }, [currentPage]);
+  // 浏览器标签页标题：日记视图 / 已打开的论文 / 默认标题，方便多标签页区分
+  useEffect(() => {
+    document.title = diaryOpen ? "日记本 · 文枢" : paperId ? `${paperTitle} · 文枢` : "文枢 Wenshu";
+  }, [diaryOpen, paperId, paperTitle]);
   // 页码输入框用本地字符串，Enter/blur 才提交，外部翻页时同步
   const [pageInput, setPageInput] = useState("1");
   const [pageInputSyncedTo, setPageInputSyncedTo] = useState(currentPage);
@@ -2422,7 +2577,7 @@ export default function Home() {
   // 键盘翻页：←/→/PageUp/PageDown；焦点在输入控件内、带修饰键或有模态框打开时不响应
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (openModal || libraryOpen || settingsOpen || usageOpen || statsOpen) return;
+      if (openModal || libraryOpen || settingsOpen || usageOpen || statsOpen || diaryOpen) return;
       if (event.ctrlKey || event.metaKey || event.altKey) return;
       const target = event.target as HTMLElement | null;
       if (target && (target.closest("input, textarea, select") || target.isContentEditable)) return;
@@ -2431,7 +2586,7 @@ export default function Home() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [currentPage, goToPage, libraryOpen, openModal, settingsOpen, statsOpen, usageOpen]);
+  }, [currentPage, diaryOpen, goToPage, libraryOpen, openModal, settingsOpen, statsOpen, usageOpen]);
 
   // ===== 论文内全文搜索 =====
   // 换论文时清空搜索状态（与页码输入框同款的渲染期同步写法）
@@ -2568,7 +2723,7 @@ export default function Home() {
   // 焦点在输入控件内时除 Esc 与 Ctrl/Cmd+F 外都不触发；模态框打开时让模态自己的 Esc 处理接管
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (openModal || libraryOpen || settingsOpen || usageOpen || statsOpen) return;
+      if (openModal || libraryOpen || settingsOpen || usageOpen || statsOpen || diaryOpen) return;
       if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "f") {
         if (!source) return; // 演示页没有可检索的 PDF，把浏览器自带查找留给用户
         event.preventDefault();
@@ -2602,7 +2757,7 @@ export default function Home() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [citationPopover, figureLasso, figureRegion, focusComposer, focusMode, formulaAssist, libraryOpen, openModal, openSearch, panMode, pdfContextMenu, searchOpen, selectionPos, setFormulaAssist, settingsOpen, source, statsOpen, toggleFullscreen, tourOpen, usageOpen]);
+  }, [citationPopover, diaryOpen, figureLasso, figureRegion, focusComposer, focusMode, formulaAssist, libraryOpen, openModal, openSearch, panMode, pdfContextMenu, searchOpen, selectionPos, setFormulaAssist, settingsOpen, source, statsOpen, toggleFullscreen, tourOpen, usageOpen]);
 
   // 专注模式边缘唤出（peek）：鼠标贴近屏幕左/右缘（<20px）临时滑出左栏/AI 面板，移开越过栏宽+余量才收回
   // （进出阈值不同，带迟滞防边缘抖动）。只在 focusMode 下挂载；手机端没有 mousemove，天然不触发。
@@ -4014,6 +4169,55 @@ export default function Home() {
     } finally { setStatsLoading(false); }
   }, []);
 
+  const showDiary = useCallback(async () => {
+    setDiaryOpen(true);
+    setSearchOpen(false); // 搜索栏属于阅读器，切到日记视图时收起
+    setDiaryLoading(true);
+    try {
+      const response = await fetch("/api/diary", { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "无法读取日记");
+      setDiaryEntries(Array.isArray(payload.entries) ? payload.entries : []);
+    } catch (error: unknown) {
+      setToast({ text: errorMessage(error, "日记读取失败"), kind: "error" });
+    } finally { setDiaryLoading(false); }
+  }, []);
+
+  // 日记视图的未保存确认由 DiaryView 通过 ref 暴露（dirty 时返回 false 并弹 confirm）
+  const diaryLeaveRef = useRef<() => boolean>(() => true);
+  const backToReader = useCallback(() => {
+    if (diaryLeaveRef.current()) setDiaryOpen(false);
+  }, []);
+
+  // 按天 upsert；成功后把返回的记录并回列表并保持 day 倒序
+  const saveDiaryEntry = useCallback(async (day: string, title: string, content: string) => {
+    try {
+      const response = await fetch("/api/diary", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ day, title, content }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "日记保存失败");
+      const entry = payload.entry as DiaryEntry;
+      setDiaryEntries((entries) => [entry, ...entries.filter((item) => item.day !== entry.day)].sort((a, b) => (a.day < b.day ? 1 : -1)));
+      return entry;
+    } catch (error: unknown) {
+      setToast({ text: errorMessage(error, "日记保存失败"), kind: "error" });
+      return null;
+    }
+  }, []);
+
+  const deleteDiaryEntry = useCallback(async (day: string) => {
+    try {
+      const response = await fetch(`/api/diary?day=${encodeURIComponent(day)}`, { method: "DELETE" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "日记删除失败");
+      setDiaryEntries((entries) => entries.filter((item) => item.day !== day));
+      setToast({ text: "日记已删除" });
+      return true;
+    } catch (error: unknown) {
+      setToast({ text: errorMessage(error, "日记删除失败"), kind: "error" });
+      return false;
+    }
+  }, []);
+
   const createLibraryFolder = useCallback(async (name: string) => {
     try {
       const response = await fetch("/api/folders", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
@@ -4504,9 +4708,10 @@ export default function Home() {
       <aside className="app-rail">
         <BrandMark />
         <nav className="rail-nav">
-          <RailButton icon={<BookOpen size={20} />} label="阅读器" active />
+          <RailButton icon={<BookOpen size={20} />} label="阅读器" active={!diaryOpen} onClick={backToReader} />
           <RailButton icon={<Library size={20} />} label="我的文库" onClick={showLibrary} />
           <RailButton icon={<ChartColumn size={20} />} label="阅读统计" onClick={showStats} />
+          <RailButton icon={<NotebookPen size={20} />} label="日记本" active={diaryOpen} onClick={showDiary} />
           <RailButton icon={<Receipt size={20} />} label="用量账单" onClick={showUsage} />
         </nav>
         <div className="rail-bottom">
@@ -4533,7 +4738,7 @@ export default function Home() {
         </div>
       </aside>
 
-      <section className="workspace">
+      <section className={`workspace${diaryOpen ? " diary-mode" : ""}`}>
         <header className="topbar">
           <div className="paper-identity">
             <div className="file-badge"><FileText size={17} /></div>
@@ -4559,7 +4764,7 @@ export default function Home() {
           </div>
         </header>
 
-        <div className="reader-toolbar">
+        {!diaryOpen && <div className="reader-toolbar">
           <div className="toolbar-group"><button className="icon-button small" aria-label="上一页" title="上一页" onClick={() => goToPage(currentPage - 1)}><ChevronLeft size={17} /></button><span className="page-indicator"><input aria-label="当前页" title="输入页码后回车跳转" value={pageInput} onChange={(e) => setPageInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") { goToPage(Number(pageInput) || 1); (e.target as HTMLInputElement).blur(); } }} onBlur={() => { const next = Math.floor(Number(pageInput)); if (next && next !== currentPage) goToPage(next); else setPageInput(String(currentPage)); }} /> / {pageCount}</span><button className="icon-button small" aria-label="下一页" title="下一页" onClick={() => goToPage(currentPage + 1)}><ChevronRight size={17} /></button></div>
           <div className="toolbar-divider" />
           <div className="toolbar-group"><button className="icon-button small" aria-label="缩小" title="缩小" onClick={() => setZoom(Math.max(.55, zoom - .1))}><ZoomOut size={17} /></button><button className="zoom-label" title="恢复 100% 缩放" onClick={() => setZoom(1)}>{Math.round(zoom * 100)}%</button><button className="icon-button small" aria-label="放大" title="放大" onClick={() => setZoom(Math.min(1.8, zoom + .1))}><ZoomIn size={17} /></button></div>
@@ -4571,7 +4776,7 @@ export default function Home() {
           {source && <button className={`icon-button small ${figureLasso ? "active" : ""}`} aria-label={figureLasso ? "退出框选图表" : "框选图表"} title={figureLasso ? "退出框选模式（ESC 或按 C）" : "框选图表：在页面上拖出矩形，向 AI 询问图表内容（按 C 进入）"} onClick={() => { setFigureLasso(!figureLasso); setFigureRegion(null); setLassoRect(null); lassoStartRef.current = null; lassoRectRef.current = null; }}><Crop size={17} /></button>}
           <button className={`icon-button small ${focusMode ? "active" : ""}`} aria-label="专注模式" title="专注模式：隐藏所有栏位，只留阅读区（按 Z 切换，ESC 退出）" onClick={() => { if (focusMode) setFocusPeek(null); setFocusMode(!focusMode); }}><Scan size={17} /></button>
           <button className="icon-button small" aria-label="全屏" title="切换全屏（按 F）" onClick={toggleFullscreen}><Maximize2 size={17} /></button>
-        </div>
+        </div>}
 
         {searchOpen && (
           <div className="search-bar" role="search">
@@ -4584,7 +4789,7 @@ export default function Home() {
           </div>
         )}
 
-        <div className="reader-main">
+        {diaryOpen ? <DiaryView onBack={backToReader} leaveRef={diaryLeaveRef} entries={diaryEntries} loading={diaryLoading} onSaveEntry={saveDiaryEntry} onDeleteEntry={deleteDiaryEntry} /> : <div className="reader-main">
           {source && thumbsOpen === "show" && (
             <aside ref={thumbRailRef} className={`thumb-rail${thumbResizing ? " resizing" : ""}${thumbPanning ? " panning" : ""}`} aria-label="页面缩略图" style={{ width: thumbWidth }} onPointerDown={startThumbPan} onClickCapture={(event) => { if (thumbPanMovedRef.current) { event.preventDefault(); event.stopPropagation(); } }}>
               {Array.from({ length: pageCount }, (_, index) => index + 1).map((page) => <ThumbItem key={page} page={page} active={currentPage === page} src={pageThumbs[page]} onJump={goToPage} onNear={requestThumbnail} />)}
@@ -4680,7 +4885,7 @@ export default function Home() {
           ))}
           {showReaderTip && <div className="reader-tip"><Sparkles size={14} /><span>选中论文中的任何内容，立即翻译或提问</span><button onClick={dismissReaderTip} aria-label="关闭提示"><X size={13} /></button></div>}
         </div>
-        </div>
+        </div>}
       </section>
 
       <aside className="ai-panel" aria-hidden={!rightOpen}>

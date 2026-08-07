@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { index, integer, primaryKey, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
@@ -104,6 +104,17 @@ export const llmUsage = sqliteTable("llm_usage", {
   completionTokens: integer("completion_tokens").notNull().default(0),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [index("llm_usage_user_id_idx").on(table.userId)]);
+
+// 日记本：每用户每天一篇（客户端本地日期 YYYY-MM-DD 为分组键）
+export const diaryEntries = sqliteTable("diary_entries", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  day: text("day").notNull(),
+  title: text("title").notNull().default(""),
+  content: text("content").notNull().default(""),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [index("diary_entries_user_id_idx").on(table.userId), uniqueIndex("diary_entries_user_day_idx").on(table.userId, table.day)]);
 
 export const userSettings = sqliteTable("user_settings", {
   userId: text("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),

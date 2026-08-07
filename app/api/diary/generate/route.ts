@@ -38,6 +38,9 @@ function renderMessages(messages: Array<Record<string, unknown>>) {
 
 type PaperMaterial = { header: string; blocks: string[] };
 
+// 与 app/page.tsx 的 ANNOTATION_KIND_LABELS 对应（客户端文件不便在服务端引用，此处单独维护）
+const ANNOTATION_KIND_LABELS: Record<string, string> = { translate: "翻译", explain: "解释", ask: "提问", formula: "公式", figure: "图表", highlight: "高亮", "text-note": "批注" };
+
 function renderPaper(item: PaperMaterial) {
   return item.header + item.blocks.join("");
 }
@@ -114,7 +117,13 @@ export async function POST(request: Request) {
               const quote = String(annotation?.text || "").trim().slice(0, 800);
               if (!quote) continue;
               const page = Number(annotation?.pageNumber);
-              let block = `\n【批注${Number.isFinite(page) && page > 0 ? `（P${page}）` : ""}】引用：“${quote}”\n`;
+              const kind = ANNOTATION_KIND_LABELS[String(annotation?.kind || "")] || "批注";
+              let block = `\n【${kind}${Number.isFinite(page) && page > 0 ? `（P${page}）` : ""}】引用：“${quote}”\n`;
+              // result 是划词翻译/解释/公式/图表的首轮回答；note 是高亮上的个人批注
+              const result = String(annotation?.result || "").trim().slice(0, 2000);
+              if (result) block += `答：${result}\n`;
+              const note = String(annotation?.note || "").trim().slice(0, 500);
+              if (note) block += `我的笔记：${note}\n`;
               const thread = renderMessages(Array.isArray(annotation?.thread) ? annotation.thread : []);
               if (thread) block += thread;
               blocks.push(block);

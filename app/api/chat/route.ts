@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { and, eq } from "drizzle-orm";
 import { getDb } from "../../../db";
 import { llmUsage, papers, userSettings } from "../../../db/schema";
-import { DEFAULT_PROMPTS, renderSystemPrompt } from "../../chat-prompts";
+import { DEFAULT_PROMPTS, FREE_CHAT_SYSTEM_PROMPT, renderSystemPrompt } from "../../chat-prompts";
 import { chatCompletionsUrl, resolveModelConfig } from "../../model-config";
 import { cachedChunkPaper, chunkCacheKey, type Chunk } from "./chunks";
 import { complete, streamCompletion, type TokenMeter } from "./completions";
@@ -214,6 +214,8 @@ export async function POST(request: NextRequest) {
     if (!user) return NextResponse.json({ error: "需要登录" }, { status: 401 });
     const body = await request.json();
     const { endpoint, apiKey, model, paperTitle, paperId = "", question, paperContext = "", selectedText = "", surroundingContext = "", mode = "global", history = [], systemPrompts = {}, effort = "medium" } = body;
+    // 无记忆模式：仅对侧边栏全文问答（global）生效，不检索、不注入任何论文上下文
+    const freeChat = body.freeChat === true && mode !== "inline";
     // 输入大小上限：论文全文与对话历史分别限制 200KB / 100KB，避免超大请求体打满 Worker 内存
     if (typeof paperContext === "string" && paperContext.length > 200 * 1024) return NextResponse.json({ error: "论文内容过大" }, { status: 413 });
     if (JSON.stringify(Array.isArray(history) ? history : []).length > 100 * 1024) return NextResponse.json({ error: "对话历史过大" }, { status: 413 });
@@ -327,6 +329,15 @@ export async function POST(request: NextRequest) {
               { role: "user", content: `我正在看下面这段论文。\n\n<selected_text>\n${String(selectedText).slice(0, 6000)}\n</selected_text>\n\n<nearby_text>\n${String(surroundingContext).slice(0, 10000)}\n</nearby_text>${referenceBlock}\n\n我的问题是：\n${questionText}` },
             ];
             for await (const delta of streamCompletion(target, resolvedApiKey, { model: resolvedModel, messages, temperature: 0.3 }, meter)) send({ type: "delta", text: delta });
+          } else if (freeChat) {
+            // 无记忆模式：干净的自由问答，只有对话历史 + 当前问题，模型凭自身知识回答
+            const questionText = String(question);
+            const messages = [
+              { role: "system", content: FREE_CHAT_SYSTEM_PROMPT },
+              ...historyMessages,
+              { role: "user", content: questionText },
+            ];
+            for await (const delta of streamCompletion(target, resolvedApiKey, { model: resolvedModel, messages, temperature: 0.5 }, meter)) send({ type: "delta", text: delta });
           } else {
             const questionText = String(question);
             const chunks = cachedChunkPaper(chunkKey, resolvedPaperContext);

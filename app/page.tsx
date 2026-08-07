@@ -25,6 +25,7 @@ import {
   Copy,
   Crop,
   Download,
+  Eraser,
   FileText,
   FolderOpen,
   Globe2,
@@ -827,14 +828,14 @@ function RailButton({ icon, label, active, onClick }: { icon: React.ReactNode; l
   );
 }
 
-function EffortControl({ effort, onChange }: { effort: ChatEffort; onChange: (value: ChatEffort) => void }) {
+function EffortControl({ effort, onChange, disabled }: { effort: ChatEffort; onChange: (value: ChatEffort) => void; disabled?: boolean }) {
   const effortIndex = CHAT_EFFORT_LEVELS.findIndex((level) => level.value === effort);
   const current = CHAT_EFFORT_LEVELS[effortIndex] || CHAT_EFFORT_LEVELS[0];
   return (
-    <div className={`effort-control level-${effortIndex}`} title={`全文对话 · 思考力度 · ${current.label}：${current.desc}`}>
+    <div className={`effort-control level-${effortIndex}${disabled ? " disabled" : ""}`} title={disabled ? "无记忆模式下不带论文上下文，思考力度（检索深度）不生效" : `全文对话 · 思考力度 · ${current.label}：${current.desc}`}>
       <Zap size={15} className="effort-zap" />
       <span className="effort-caption">思考力度</span>
-      <input type="range" min={0} max={2} step={1} value={effortIndex} onChange={(event) => onChange(CHAT_EFFORT_LEVELS[Number(event.target.value)].value)} style={{ "--fill": `${effortIndex * 50}%` } as React.CSSProperties} aria-label="AI 思考力度" aria-valuetext={current.label} />
+      <input type="range" min={0} max={2} step={1} value={effortIndex} disabled={disabled} onChange={(event) => onChange(CHAT_EFFORT_LEVELS[Number(event.target.value)].value)} style={{ "--fill": `${effortIndex * 50}%` } as React.CSSProperties} aria-label="AI 思考力度" aria-valuetext={current.label} />
       <span className="effort-name">{current.label}</span>
     </div>
   );
@@ -2338,6 +2339,9 @@ export default function Home() {
   const [streaming, setStreaming] = useState(false);
   const [effort, setEffort] = useStoredPref<ChatEffort>("lumen-chat-effort", "medium", CHAT_EFFORTS);
   const [inlineEffort, setInlineEffort] = useStoredPref<ChatEffort>("lumen-inline-effort", "medium", CHAT_EFFORTS);
+  // 无记忆模式：global 提问不携带论文内容，模型凭自身知识回答（仅影响发送时的请求体标志）
+  const [freeChat, setFreeChat] = useStoredPref<"on" | "off">("lumen-free-chat", "off", ["on", "off"]);
+  const freeChatOn = freeChat === "on";
   const [copied, setCopied] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<number | null>(null);
   const [toast, setToast] = useState<ToastMessage | null>(null);
@@ -3034,10 +3038,11 @@ export default function Home() {
     try {
       if (config.apiKey || config.hasApiKey) {
         // 文本已同步入库时只传 paperId（服务端按 paperId 取全文并缓存分块）；刚提取完尚未保存时仍带 paperContext 兜底
+        // 无记忆模式：带 freeChat 标志，服务端跳过检索与论文注入，paperId/paperContext 也不必再传
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: text, mode: "global", history, systemPrompts: promptConfig, effort, ...(paperId ? { paperId } : {}), ...(paperId && paperText === lastSavedTextRef.current ? {} : { paperContext: paperText }) }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: text, mode: "global", history, systemPrompts: promptConfig, effort, ...(freeChatOn ? { freeChat: true } : { ...(paperId ? { paperId } : {}), ...(paperId && paperText === lastSavedTextRef.current ? {} : { paperContext: paperText }) }) }),
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -3101,7 +3106,7 @@ export default function Home() {
     } finally {
       if (chatControllerRef.current === controller) chatControllerRef.current = null;
     }
-  }, [config, effort, embeddingConfig, paperId, paperText, paperTitle, promptConfig, triggerIndexBuild]);
+  }, [config, effort, embeddingConfig, freeChatOn, paperId, paperText, paperTitle, promptConfig, triggerIndexBuild]);
 
   const sendQuestion = useCallback((raw: string) => {
     const text = raw.trim();
@@ -4756,7 +4761,7 @@ export default function Home() {
               </span>
               <ChevronDown size={15} />
             </button>
-            <EffortControl effort={effort} onChange={setEffort} />
+            <EffortControl effort={effort} onChange={setEffort} disabled={freeChatOn} />
             <button className="secondary-button compact" aria-label="打开论文" onClick={() => setOpenModal(true)}><Plus size={16} />打开论文</button>
             {/* 手机端隐藏左栏后，文库入口挪到顶栏（宽屏下由 CSS 隐藏，避免与左栏重复） */}
             <button className="icon-button mobile-library-button" aria-label="我的文库" title="我的文库" onClick={showLibrary}><Library size={19} /></button>
@@ -4904,9 +4909,9 @@ export default function Home() {
           <button className={panelTab === "notes" ? "active" : ""} onClick={() => setPanelTab("notes")}>笔记{annotations.length > 0 && <span className="panel-tab-count">{annotations.length}</span>}</button>
         </div>
         {panelTab === "chat" && !historyOpen && <div className="quick-actions">
-          <button onClick={() => sendQuestion("请用三点总结这篇论文的核心贡献。")}>总结全文</button>
-          <button onClick={() => sendQuestion("请解释这篇论文最重要的方法，并给出直觉理解。")}>解释方法</button>
-          <button onClick={() => sendQuestion("请列出阅读这篇论文前需要了解的概念。")}>前置知识</button>
+          <button className={freeChatOn ? "disabled" : ""} aria-disabled={freeChatOn} title={freeChatOn ? "无记忆模式下不可用" : undefined} onClick={() => { if (!freeChatOn) sendQuestion("请用三点总结这篇论文的核心贡献。"); }}>总结全文</button>
+          <button className={freeChatOn ? "disabled" : ""} aria-disabled={freeChatOn} title={freeChatOn ? "无记忆模式下不可用" : undefined} onClick={() => { if (!freeChatOn) sendQuestion("请解释这篇论文最重要的方法，并给出直觉理解。"); }}>解释方法</button>
+          <button className={freeChatOn ? "disabled" : ""} aria-disabled={freeChatOn} title={freeChatOn ? "无记忆模式下不可用" : undefined} onClick={() => { if (!freeChatOn) sendQuestion("请列出阅读这篇论文前需要了解的概念。"); }}>前置知识</button>
         </div>}
         {panelTab === "notes" ? (
           <div className="notes-panel">
@@ -4963,10 +4968,15 @@ export default function Home() {
         )}
         {panelTab === "chat" && !historyOpen && <div className="composer-wrap">
           <div className="composer-top-row">
-            <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? (extractProgress ? `已解析 ${extractProgress.done}/${extractProgress.total} 页` : "解析中") : paperText ? "上下文已就绪" : "等待文字"}</small>{embeddingIndex === "ready" && <small className="semantic-index-badge">语义索引</small>}{embeddingIndex === "building" && <small className="semantic-index-badge building"><LoaderCircle className="spin" size={9} />索引建立中{indexProgress?.total ? ` ${indexProgress.done}/${indexProgress.total}` : ""}</small>}{embeddingIndex === "missing" && embeddingConfig.model && paperId && Boolean(paperText) && <button type="button" className="semantic-index-trigger" title="为本文建立语义索引（后台进行，期间不影响提问），建立后深入/研究档召回更准" onClick={() => void triggerIndexBuild(paperId, true)}>建立语义索引</button>}</div>
+            {freeChatOn ? (
+              <div className="global-context-chip free-chat"><Eraser size={13} /><span>无记忆模式</span><small>不带论文上下文</small></div>
+            ) : (
+              <div className="global-context-chip"><BookOpen size={13} /><span>整篇论文</span><small>{extractingText ? (extractProgress ? `已解析 ${extractProgress.done}/${extractProgress.total} 页` : "解析中") : paperText ? "上下文已就绪" : "等待文字"}</small>{embeddingIndex === "ready" && <small className="semantic-index-badge">语义索引</small>}{embeddingIndex === "building" && <small className="semantic-index-badge building"><LoaderCircle className="spin" size={9} />索引建立中{indexProgress?.total ? ` ${indexProgress.done}/${indexProgress.total}` : ""}</small>}{embeddingIndex === "missing" && embeddingConfig.model && paperId && Boolean(paperText) && <button type="button" className="semantic-index-trigger" title="为本文建立语义索引（后台进行，期间不影响提问），建立后深入/研究档召回更准" onClick={() => void triggerIndexBuild(paperId, true)}>建立语义索引</button>}</div>
+            )}
+            <button type="button" className={`free-chat-toggle${freeChatOn ? " active" : ""}`} aria-pressed={freeChatOn} title="无记忆模式：不携带论文内容，模型凭自身知识回答，适合普适问题" onClick={() => setFreeChat(freeChatOn ? "off" : "on")}><Eraser size={12} />无记忆</button>
           </div>
           <div className="composer">
-            <textarea ref={composerRef} value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question); } else if (e.key === "Escape" && editingMessageId !== null) cancelEditMessage(); }} placeholder="询问整篇论文…" rows={2} />
+            <textarea ref={composerRef} value={question} onChange={(e) => setQuestion(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendQuestion(question); } else if (e.key === "Escape" && editingMessageId !== null) cancelEditMessage(); }} placeholder={freeChatOn ? "问任何问题（不带论文上下文）…" : "询问整篇论文…"} rows={2} />
             <div className="composer-bottom"><span>{editingMessageId !== null ? "编辑中：Enter 重发 · Esc 放弃" : "Enter 发送 · Shift+Enter 换行"}</span>{loading
               ? <button onClick={stopChatStream} aria-label="停止生成" title="停止生成"><Square size={14} /></button>
               : <button onClick={() => sendQuestion(question)} disabled={!question.trim() || extractingText} aria-label="发送"><Send size={16} /></button>}

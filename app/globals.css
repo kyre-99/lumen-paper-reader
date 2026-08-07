@@ -379,6 +379,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 
 /* AI 思考力度拖动条 */
 .effort-control { height: 42px; display: flex; align-items: center; gap: 7px; padding: 0 13px 0 11px; border: 1px solid var(--line); border-radius: 11px; background: white; transition: border-color .2s var(--ease-out), box-shadow .2s var(--ease-out); }
+.effort-control.disabled { opacity: .45; cursor: not-allowed; }
 .effort-control:hover { border-color: #bcd4c8; box-shadow: 0 4px 12px rgba(47,108,91,.08); }
 .effort-zap { color: #8ba79c; transition: color .2s var(--ease-out); }
 .effort-caption { color: #8a948f; font-size: calc(9px + var(--font-boost, 0px)); white-space: nowrap; }
@@ -412,6 +413,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .global-context-chip .semantic-index-badge.building { display: inline-flex; align-items: center; gap: 3px; color: #7d8983; font-weight: 400; }
 .global-context-chip .semantic-index-trigger { border: 0; background: transparent; color: #7d8983; font-size: 8px; cursor: pointer; border-left: 1px solid #dbe5e0; padding: 0 0 0 5px; text-decoration: underline; text-underline-offset: 2px; }
 .global-context-chip .semantic-index-trigger:hover { color: var(--green); }
+/* 无记忆模式：状态条换琥珀色提示，开关 chip 位于输入框上方状态行右侧 */
+.global-context-chip.free-chat { border-color: #ecd9b8; background: #fdf6ea; color: #8a6d33; }
+.free-chat-toggle { flex: 0 0 auto; height: 24px; display: flex; align-items: center; gap: 4px; padding: 0 9px; border: 1px solid #dfe5e1; border-radius: 12px; background: white; color: #7d8983; font-size: 9px; cursor: pointer; transition: color .16s var(--ease-out), border-color .16s var(--ease-out), background .16s var(--ease-out); }
+.free-chat-toggle:hover { color: var(--ink); border-color: #c9d4cd; }
+.free-chat-toggle.active { border-color: #ecd9b8; background: #fdf6ea; color: #8a6d33; font-weight: 700; }
+/* 论文专属快捷操作在无记忆模式下置灰（不隐藏，避免布局跳动）；不用 disabled 属性以保留 title 提示 */
+.quick-actions button.disabled, .quick-actions button.disabled:hover { opacity: .45; cursor: not-allowed; color: #53615a; border-color: #dfe5e1; box-shadow: none; transform: none; }
+.quick-actions button.disabled::after { display: none; }
 .composer-context { position: relative; margin-bottom: -5px; padding: 8px 34px 11px 10px; border: 1px solid #dfe5e2; border-bottom: 0; border-radius: 10px 10px 0 0; background: #f1f6f3; color: #6b7771; }
 .composer-context span { color: var(--green); font-size: 9px; font-weight: 700; }
 .composer-context p { margin: 2px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
@@ -1087,6 +1096,12 @@ html[data-theme="dark"] .global-context-chip .semantic-index-badge { color: var(
 html[data-theme="dark"] .global-context-chip .semantic-index-badge.building { color: var(--muted); }
 html[data-theme="dark"] .global-context-chip .semantic-index-trigger { color: var(--muted); border-left-color: #35544a; }
 html[data-theme="dark"] .global-context-chip .semantic-index-trigger:hover { color: var(--green); }
+html[data-theme="dark"] .global-context-chip.free-chat { border-color: #4a3f24; background: #33291a; color: #d8b985; }
+html[data-theme="dark"] .global-context-chip.free-chat small { color: var(--muted); }
+html[data-theme="dark"] .free-chat-toggle { border-color: #3a453f; background: var(--d-card); color: var(--muted); }
+html[data-theme="dark"] .free-chat-toggle:hover { color: var(--ink); border-color: #4a554e; }
+html[data-theme="dark"] .free-chat-toggle.active { border-color: #4a3f24; background: #33291a; color: #d8b985; }
+html[data-theme="dark"] .quick-actions button.disabled, html[data-theme="dark"] .quick-actions button.disabled:hover { border-color: #3a453f; background: var(--d-card); color: var(--d-text-2); box-shadow: none; }
 html[data-theme="dark"] .composer-context { border-color: #3a453f; background: #222b26; color: #9aa69f; }
 html[data-theme="dark"] .composer { border-color: #3a453f; background: var(--d-card-2); box-shadow: 0 8px 30px rgba(0,0,0,.3); }
 html[data-theme="dark"] .composer textarea { color: var(--ink); }

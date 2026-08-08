@@ -632,8 +632,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .library-folders > button:hover, .library-folders .folder-main:hover { background: #edf2ef; color: #34423b; transform: translateX(2px); }
 .library-folders > button:active, .library-folders .folder-main:active { transform: scale(.97); }
 .library-folders > button.active, .library-folders .folder-main.active { background: #e4efea; color: var(--green); font-weight: 650; }
-.library-folders > button span, .library-folders .folder-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
-.library-folders > button small, .library-folders .folder-main small { color: #929c97; font-size: 8px; font-weight: 500; }
+.library-folders > button span, .library-folders .folder-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.library-folders > button small, .library-folders .folder-main small { color: #929c97; font-size: 9px; font-weight: 500; }
 .folder-row { display: grid; grid-template-columns: 16px minmax(0,1fr) 22px 22px 22px; align-items: center; gap: 2px; padding-left: calc(var(--depth, 0) * 14px); border-radius: 7px; }
 /* 拖拽悬停目标高亮：文件夹行 / 未分类行 / 左栏空白区（回根级） */
 .folder-row.drop-target, .library-folders > button.drop-target { background: #e4efea; box-shadow: inset 0 0 0 1.5px #a6c5b8; }
@@ -641,6 +641,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 /* 拖拽全程的弱提示：可投放行虚线描边 + 浅底色缓慢呼吸（2s 明暗交替，无位移无旋转）；悬停中的 drop-target 行保持强反馈、不呼吸 */
 @keyframes drop-hint-breathe { from { background: #f4f9f6; outline-color: #c4dcd2; } to { background: #e7f2ec; outline-color: #8fb4a5; } }
 .folder-row.wiggle-hint:not(.drop-target), .library-folders > button.wiggle-hint:not(.drop-target) { animation: drop-hint-breathe 2s ease-in-out infinite alternate; outline: 1px dashed #c4dcd2; outline-offset: -1px; }
+/* 拖拽预览小 chip：离屏挂载（left -9999px），setDragImage 捕获后即移除，替代浏览器默认的整条目幻影 */
+.drag-chip { position: fixed; left: -9999px; top: 0; z-index: 300; max-width: 220px; display: flex; align-items: center; gap: 6px; padding: 6px 11px; border: 1px solid #c4dcd2; border-radius: 14px; background: rgba(255,255,255,.92); color: var(--green); font-size: 11px; font-weight: 600; box-shadow: 0 8px 22px rgba(35,54,45,.18); pointer-events: none; }
+.drag-chip svg { flex: 0 0 auto; }
+.drag-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .folder-chevron, .folder-chevron-spacer { width: 16px; height: 26px; display: grid; place-items: center; flex: 0 0 auto; }
 .folder-chevron { border: 0; border-radius: 5px; background: transparent; color: #9aa5a0; cursor: pointer; transition: background .16s var(--ease-out), color .16s var(--ease-out); }
 .folder-chevron:hover { background: #edf2ef; color: var(--green); }
@@ -652,23 +656,25 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .library-folders .new-folder-button { margin-top: 4px; color: #688178; }
 .folder-divider { height: 1px; margin: 7px 7px; background: #e0e6e3; }
 .new-folder-row { display: grid; grid-template-columns: minmax(0,1fr) 29px; gap: 5px; margin: 6px 2px 0; padding-left: calc(var(--depth, 0) * 14px + 16px); }
-.new-folder-row input { min-width: 0; height: 31px; padding: 0 8px; border: 1px solid #cfdad5; border-radius: 7px; outline: 0; color: #34423b; background: white; font-size: 9px; }
+.new-folder-row input { min-width: 0; height: 31px; padding: 0 8px; border: 1px solid #cfdad5; border-radius: 7px; outline: 0; color: #34423b; background: white; font-size: 10px; }
 .new-folder-row input:focus { border-color: #8fb5a6; box-shadow: 0 0 0 2px rgba(71,128,106,.07); }
 .new-folder-row button { display: grid; place-items: center; border: 0; border-radius: 7px; background: var(--green); color: white; cursor: pointer; }
 .new-folder-row button:disabled { opacity: .45; cursor: default; }
-.library-content { min-width: 0; min-height: 0; display: grid; grid-template-rows: 42px auto auto minmax(0, 1fr); padding: 0 11px 11px; }
-.library-content-title { display: flex; align-items: center; justify-content: space-between; padding: 0 3px; border-bottom: 1px solid #edf0ee; }
-.library-content-title strong { color: #394740; font-size: 11px; }
-.library-content-title span { color: #8a948f; font-size: 9px; }
-.library-list { display: grid; align-content: start; gap: 7px; min-height: 0; padding-top: 10px; overflow-y: auto; }
-.library-item { width: 100%; display: grid; grid-template-columns: minmax(0,1fr) 26px; align-items: center; gap: 3px 7px; padding: 7px; border: 1px solid #e1e6e3; border-radius: 10px; background: white; color: #344039; text-align: left; transition: border-color .18s var(--ease-out), background .18s var(--ease-out), box-shadow .2s var(--ease-out), transform .18s var(--ease-out); }
+.library-content { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto auto auto minmax(0, 1fr); padding: 0 11px 11px; }
+/* 标题行与分隔线、筛选 chips 之间各留 8px，避免字号上调后线与 chips 擦边 */
+.library-content-title { display: flex; align-items: center; justify-content: space-between; padding: 10px 3px 8px; margin-bottom: 8px; border-bottom: 1px solid #edf0ee; }
+.library-content-title strong { color: #394740; font-size: 13px; }
+.library-content-title span { color: #8a948f; font-size: 10px; }
+.library-list { display: grid; align-content: start; gap: 8px; min-height: 0; padding-top: 10px; overflow-y: auto; }
+/* 条目网格三列：标题行（含"打开"）+ 重命名 + 删除同处第一行右侧；评分与 meta 行占满整行 */
+.library-item { width: 100%; display: grid; grid-template-columns: minmax(0,1fr) 26px 26px; align-items: center; gap: 4px 7px; padding: 8px 9px; border: 1px solid #e1e6e3; border-radius: 10px; background: white; color: #344039; text-align: left; transition: border-color .18s var(--ease-out), background .18s var(--ease-out), box-shadow .2s var(--ease-out), transform .18s var(--ease-out); }
 .library-item:hover { border-color: #b8d0c6; background: #f8fbf9; box-shadow: 0 6px 18px rgba(35,54,45,.08); transform: translateY(-1px); }
 .library-item.active { border-color: #a6c5b8; background: #f0f7f4; }
 .library-paper-button { min-width: 0; display: grid; grid-template-columns: 36px minmax(0,1fr) auto; align-items: center; gap: 9px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
 .library-file { width: 36px; height: 39px; display: grid; place-items: center; border-radius: 8px; background: var(--green-soft); color: var(--green); }
 .library-copy { min-width: 0; }
-.library-copy strong { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; font-size: 12px; line-height: 1.45; }
-.library-open { color: var(--green); font-size: 9px; font-weight: 650; }
+.library-copy strong { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; font-size: 13px; line-height: 1.45; }
+.library-open { color: var(--green); font-size: 10px; font-weight: 650; }
 /* 元信息行：来源/日期与状态、文件夹选择器同一行，紧凑小胶囊样式 */
 .library-meta-row { grid-column: 1 / -1; min-width: 0; display: flex; align-items: center; gap: 7px; padding-left: 45px; }
 /* 星级评分行：标题与 meta 行之间，与 meta 行左对齐；0 星时五颗全空心，低调不抢眼 */
@@ -676,20 +682,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .library-rating button { display: grid; place-items: center; padding: 2px; border: 0; background: transparent; color: var(--muted); cursor: pointer; transition: color .16s var(--ease-out), transform .14s var(--ease-spring); }
 .library-rating button:hover { transform: scale(1.18); }
 .library-rating button.filled { color: var(--amber); }
+.library-rating button svg { width: 15px; height: 15px; }
 /* 筛选栏：状态分段 chip + 星级下拉，位于搜索框上方；星级下拉直接复用 .library-folder-select 的胶囊样式（暗色规则一并继承） */
 .library-filters { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; }
 .library-filter-chips { min-width: 0; display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; }
 .library-filter-chips::-webkit-scrollbar { display: none; }
-.library-filter-chips button { flex: 0 0 auto; height: 26px; padding: 0 10px; border: 1px solid var(--line); border-radius: 13px; background: transparent; color: var(--muted); font-size: 10px; cursor: pointer; transition: color .16s var(--ease-out), border-color .16s var(--ease-out), background .16s var(--ease-out), transform .14s var(--ease-spring); }
+.library-filter-chips button { flex: 0 0 auto; height: 28px; padding: 0 12px; border: 1px solid var(--line); border-radius: 14px; background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; transition: color .16s var(--ease-out), border-color .16s var(--ease-out), background .16s var(--ease-out), transform .14s var(--ease-spring); }
 .library-filter-chips button:hover { border-color: #c7dcd3; color: var(--green); }
 .library-filter-chips button:active { transform: scale(.95); }
 .library-filter-chips button.active { border-color: #9bc0b1; background: var(--green-soft); color: var(--green); font-weight: 650; }
-.library-rating-select { flex: 0 0 auto; margin-left: auto; height: 26px; color: var(--amber); }
-.library-meta-row > small { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #818b86; font-size: 9px; }
-.library-folder-select { height: 24px; flex: 0 0 auto; display: flex; align-items: center; gap: 4px; padding: 0 5px; border: 1px solid #e0e5e2; border-radius: 7px; background: rgba(255,255,255,.84); color: #738078; }
-.library-folder-select select { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #66736c; font-size: 9px; cursor: pointer; }
+.library-rating-select { flex: 0 0 auto; margin-left: auto; height: 28px; color: var(--amber); }
+.library-meta-row > small { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #818b86; font-size: 10px; }
+.library-folder-select { height: 26px; flex: 0 0 auto; display: flex; align-items: center; gap: 4px; padding: 0 7px; border: 1px solid #e0e5e2; border-radius: 7px; background: rgba(255,255,255,.84); color: #738078; }
+.library-folder-select select { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #66736c; font-size: 10px; cursor: pointer; }
 /* 文库论文的阅读状态选择器：未读灰 / 阅读中琥珀 / 已阅读绿 */
-.library-status-select { height: 24px; flex: 0 0 auto; display: flex; align-items: center; gap: 4px; padding: 0 6px; border: 1px solid #e0e5e2; border-radius: 7px; background: rgba(255,255,255,.84); transition: border-color .18s var(--ease-out), background .18s var(--ease-out); }
+.library-status-select { height: 26px; flex: 0 0 auto; display: flex; align-items: center; gap: 4px; padding: 0 7px; border: 1px solid #e0e5e2; border-radius: 7px; background: rgba(255,255,255,.84); transition: border-color .18s var(--ease-out), background .18s var(--ease-out); }
 .library-status-select:hover { border-color: #c8d4ce; }
 .status-dot-lib { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: #a8b1ad; box-shadow: 0 0 0 2.5px #eef1ef; transition: background .2s var(--ease-out), box-shadow .2s var(--ease-out); }
 .library-status-select.reading { border-color: #eadfc3; background: #fdf9ef; }
@@ -697,11 +704,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 @keyframes dot-breathe-amber { 0%, 100% { box-shadow: 0 0 0 2.5px #f7ead8; } 50% { box-shadow: 0 0 0 4.5px #f3e2c6; } }
 .library-status-select.done { border-color: #cfe3da; background: #f2f8f5; }
 .library-status-select.done .status-dot-lib { background: #49a07f; box-shadow: 0 0 0 2.5px #e3f2ec; }
-.library-status-select select { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #66736c; font-size: 9px; cursor: pointer; }
-.library-loading, .library-empty { min-height: 230px; display: flex; align-items: center; justify-content: center; gap: 8px; color: #7d8882; font-size: 10px; }
+.library-status-select select { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #66736c; font-size: 10px; cursor: pointer; }
+.library-loading, .library-empty { min-height: 230px; display: flex; align-items: center; justify-content: center; gap: 8px; color: #7d8882; font-size: 11px; }
 .library-empty { flex-direction: column; text-align: center; }
 .library-empty svg { color: #8fb4a5; }
-.library-empty strong { color: #4d5b54; font-size: 12px; }
+.library-empty strong { color: #4d5b54; font-size: 13px; }
 .library-empty p { margin: -2px 0 8px; color: #8a948f; }
 @media (max-width: 720px) {
   .library-card { width: min(560px, calc(100vw - 24px)); padding: 25px 18px; }
@@ -727,7 +734,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .load-error-panel strong { color: #2c3a34; font-size: 14px; }
 .load-error-panel p { margin: 0; color: #8a948f; font-size: 11px; line-height: 1.6; word-break: break-all; }
 .load-error-actions { display: flex; gap: 8px; margin-top: 6px; }
-.library-search { width: 100%; box-sizing: border-box; height: 34px; margin: 0 0 8px; padding: 0 11px; border: 1px solid #dce2df; border-radius: 9px; outline: 0; background: #fcfdfc; color: #344039; font-size: 12px; }
+.library-search { width: 100%; box-sizing: border-box; height: 36px; margin: 0 0 8px; padding: 0 11px; border: 1px solid #dce2df; border-radius: 9px; outline: 0; background: #fcfdfc; color: #344039; font-size: 13px; }
 .library-search:focus { border-color: #8eb4a6; box-shadow: 0 0 0 3px rgba(47,108,91,.08); }
 
 /* ===== 日记本（与阅读区同级的主视图，占据 reader-main 的网格行） ===== */
@@ -850,9 +857,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .app-shell .toolbar-text-button, .app-shell .page-indicator, .app-shell .zoom-label { font-size: calc(11px + var(--font-boost)); }
 .app-shell .modal-card > p, .app-shell .auth-card p { font-size: calc(12px + var(--font-boost)); }
 .app-shell .field-label, .app-shell .settings-tabs button { font-size: calc(10px + var(--font-boost)); }
-.app-shell .library-copy strong { font-size: calc(12px + var(--font-boost)); }
+.app-shell .library-copy strong { font-size: calc(13px + var(--font-boost)); }
 .app-shell .library-copy small { font-size: calc(9px + var(--font-boost)); }
-.app-shell .library-folders > button span, .app-shell .library-folders .folder-main span { font-size: calc(10px + var(--font-boost)); }
+.app-shell .library-folders > button span, .app-shell .library-folders .folder-main span { font-size: calc(11px + var(--font-boost)); }
+.app-shell .library-folders > button small, .app-shell .library-folders .folder-main small { font-size: calc(9px + var(--font-boost)); }
+.app-shell .library-content-title strong { font-size: calc(13px + var(--font-boost)); }
+.app-shell .library-content-title span, .app-shell .library-open, .app-shell .library-meta-row > small { font-size: calc(10px + var(--font-boost)); }
+.app-shell .library-folder-select select, .app-shell .library-status-select select, .app-shell .new-folder-row input { font-size: calc(10px + var(--font-boost)); }
+.app-shell .library-filter-chips button, .app-shell .library-loading, .app-shell .library-empty { font-size: calc(11px + var(--font-boost)); }
+.app-shell .library-search { font-size: calc(13px + var(--font-boost)); }
 .app-shell .paper-section p { font-size: calc(11.5px + var(--font-boost)); }
 .app-shell .demo-paper .authors { font-size: calc(10px + var(--font-boost)); }
 .app-shell .context-quote p, .app-shell .composer-context p { font-size: calc(9px + var(--font-boost)); }
@@ -1215,6 +1228,7 @@ html[data-theme="dark"] .folder-row.drop-target, html[data-theme="dark"] .librar
 html[data-theme="dark"] .library-folders.drop-target { box-shadow: inset 0 0 0 1.5px #3f6a56; }
 @keyframes drop-hint-breathe-dark { from { background: var(--d-hover); outline-color: #35544a; } to { background: #2e3a33; outline-color: #4a7a64; } }
 html[data-theme="dark"] .folder-row.wiggle-hint:not(.drop-target), html[data-theme="dark"] .library-folders > button.wiggle-hint:not(.drop-target) { animation-name: drop-hint-breathe-dark; }
+html[data-theme="dark"] .drag-chip { border-color: #3f5a4d; background: rgba(36,43,39,.94); box-shadow: 0 8px 22px rgba(0,0,0,.5); }
 html[data-theme="dark"] .folder-chevron { color: var(--muted); }
 html[data-theme="dark"] .folder-chevron:hover { background: var(--d-hover); color: var(--green); }
 html[data-theme="dark"] .folder-divider { background: var(--soft-line); }

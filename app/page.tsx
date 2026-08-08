@@ -1461,9 +1461,24 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
       if (draggedFolderId && folderId && draggedFolderId !== folderId && !isFolderDescendant(draggedFolderId, folderId)) void onMoveFolder(draggedFolderId, folderId);
     },
   });
-  const folderDragProps = (folderId: string) => ({
+  // 拖拽预览：浏览器默认拿整个条目当 drag image，太大挡住左栏文字；换成离屏小 chip（图标 + 名称前 20 字），
+  // setDragImage 同步捕获后下一帧移除。原生 DOM 创建，不进 state
+  const setDragChip = (event: React.DragEvent, kind: "paper" | "folder", label: string) => {
+    const chip = document.createElement("div");
+    chip.className = "drag-chip";
+    chip.innerHTML = kind === "paper"
+      ? '<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg>'
+      : '<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>';
+    const text = document.createElement("span");
+    text.textContent = label.length > 20 ? `${label.slice(0, 20)}…` : label;
+    chip.appendChild(text);
+    document.body.appendChild(chip);
+    event.dataTransfer.setDragImage(chip, 14, 16);
+    window.requestAnimationFrame(() => chip.remove());
+  };
+  const folderDragProps = (folderId: string, folderName: string) => ({
     draggable: true,
-    onDragStart: (event: React.DragEvent) => { event.dataTransfer.setData(FOLDER_DND_TYPE, folderId); event.dataTransfer.effectAllowed = "move"; setDraggingFolderId(folderId); },
+    onDragStart: (event: React.DragEvent) => { event.dataTransfer.setData(FOLDER_DND_TYPE, folderId); event.dataTransfer.effectAllowed = "move"; setDragChip(event, "folder", folderName); setDraggingFolderId(folderId); },
     onDragEnd: () => { setDraggingFolderId(null); setDropTarget(null); },
   });
 
@@ -1474,7 +1489,7 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
       const collapsed = Boolean(collapsedFolders[folder.id]);
       return (
         <React.Fragment key={folder.id}>
-          <div className={`folder-row ${dropTarget === `folder:${folder.id}` ? "drop-target" : ""} ${dragHintActive && draggingFolderId !== folder.id ? "wiggle-hint" : ""}`} style={{ "--depth": depth } as React.CSSProperties} {...folderDragProps(folder.id)} {...folderDropProps(`folder:${folder.id}`, folder.id, true)}>
+          <div className={`folder-row ${dropTarget === `folder:${folder.id}` ? "drop-target" : ""} ${dragHintActive && draggingFolderId !== folder.id ? "wiggle-hint" : ""}`} style={{ "--depth": depth } as React.CSSProperties} {...folderDragProps(folder.id, folder.name)} {...folderDropProps(`folder:${folder.id}`, folder.id, true)}>
             {children.length
               ? <button className="folder-chevron" aria-label={collapsed ? `展开“${folder.name}”的子文件夹` : `折叠“${folder.name}”的子文件夹`} title={collapsed ? "展开子文件夹" : "折叠子文件夹"} onClick={() => toggleFolderCollapsed(folder.id)}>{collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}</button>
               : <span className="folder-chevron-spacer" aria-hidden="true" />}
@@ -1525,7 +1540,7 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
             {loading ? <div className="library-loading"><LoaderCircle className="spin" size={18} />正在读取文库…</div> : visiblePapers.length ? (
               <div className="library-list">
                 {visiblePapers.map((paper) => (
-                  <div key={paper.id} className={`library-item ${paper.id === activePaperId ? "active" : ""}`} draggable onDragStart={(event) => { event.dataTransfer.setData(PAPER_DND_TYPE, paper.id); event.dataTransfer.effectAllowed = "move"; setPaperDragging(true); }} onDragEnd={() => { setPaperDragging(false); setDropTarget(null); }}>
+                  <div key={paper.id} className={`library-item ${paper.id === activePaperId ? "active" : ""}`} draggable onDragStart={(event) => { event.dataTransfer.setData(PAPER_DND_TYPE, paper.id); event.dataTransfer.effectAllowed = "move"; setDragChip(event, "paper", paper.title); setPaperDragging(true); }} onDragEnd={() => { setPaperDragging(false); setDropTarget(null); }}>
                     <button className="library-paper-button" onClick={() => onOpenPaper(paper.id)}>
                       <span className="library-file"><FileText size={18} /></span>
                       <span className="library-copy"><strong>{paper.title}</strong></span>

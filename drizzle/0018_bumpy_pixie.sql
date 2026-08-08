@@ -1,0 +1,1 @@
+ALTER TABLE `papers` ADD `meta_checked_at` text DEFAULT '' NOT NULL;

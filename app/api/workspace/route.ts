@@ -3,6 +3,7 @@ import { requireAppUser } from "../../server-user";
 import { getDb } from "../../../db";
 import { papers, paperStates, readerStates, userSettings } from "../../../db/schema";
 import { getIndexState, textStampOf } from "../chat/embeddings";
+import { extractArxivId, fetchArxivMeta } from "../papers/arxiv-meta";
 
 function parseArray(value: string) {
   try {
@@ -98,7 +99,18 @@ export async function PUT(request: Request) {
     if (existing) {
       await db.update(papers).set(hasText ? { ...baseValues, paperText: String(paper.paperText).slice(0, 180000) } : baseValues).where(and(eq(papers.id, id), eq(papers.userId, user.id)));
     } else {
-      await db.insert(papers).values({ ...baseValues, paperText: hasText ? String(paper.paperText).slice(0, 180000) : "" });
+      // 远程 arXiv 导入：顺手抓一次元数据补 authors/publishedAt（title 以客户端为准），失败静默。
+      // 请求成功（含"确实没这篇"）写 metaCheckedAt 防重试；整体失败（null）不写，留给文库回填重试
+      let arxivExtra: { authors?: string; publishedAt?: string; metaCheckedAt?: string } | null = null;
+      const arxivId = baseValues.sourceKind === "remote" ? extractArxivId(baseValues.sourceUrl || "") : null;
+      if (arxivId) {
+        const metaMap = await fetchArxivMeta([arxivId]);
+        if (metaMap !== null) {
+          const meta = metaMap.get(arxivId);
+          arxivExtra = { metaCheckedAt: new Date().toISOString(), ...(meta ? { authors: meta.authors, publishedAt: meta.publishedAt } : {}) };
+        }
+      }
+      await db.insert(papers).values({ ...baseValues, ...(arxivExtra || {}), paperText: hasText ? String(paper.paperText).slice(0, 180000) : "" });
     }
     activePaperId = id;
   }

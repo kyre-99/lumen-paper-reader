@@ -120,6 +120,20 @@
       "when": 1786154922540,
       "tag": "0016_noisy_firebrand",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1786161019745,
+      "tag": "0017_sturdy_angel",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1786162021097,
+      "tag": "0018_bumpy_pixie",
+      "breakpoints": true
     }
   ]
 }

@@ -20,6 +20,7 @@ import {
   ChevronRight,
   ChevronUp,
   CircleHelp,
+  Clock,
   Cloud,
   CloudOff,
   Copy,
@@ -196,7 +197,7 @@ const PAPER_STATUS_OPTIONS: Array<{ value: PaperStatus; label: string }> = [
   { value: "reading", label: "阅读中" },
   { value: "done", label: "已阅读" },
 ];
-type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; sourceKind: PaperSourceKind; sourceUrl: string | null; pageCount: number; status: PaperStatus; rating: number; createdAt: string; updatedAt: string };
+type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; authors: string; publishedAt: string; lastReadAt: string | null; sourceKind: PaperSourceKind; sourceUrl: string | null; pageCount: number; status: PaperStatus; rating: number; createdAt: string; updatedAt: string };
 type LibraryFolder = { id: string; name: string; parentId: string | null; createdAt?: string; updatedAt: string };
 type DiaryEntry = { id: string; day: string; title: string; content: string; updatedAt: string };
 type UsageStats = {
@@ -220,6 +221,44 @@ function localDayString(date = new Date()) {
 function diaryExcerpt(content: string) {
   const plain = content.replace(/[#>*_`~!\[\]()-]/g, "").replace(/\s+/g, " ").trim();
   return plain.length > 40 ? `${plain.slice(0, 40)}…` : plain;
+}
+
+// 发表日期 YYYY-MM-DD → YYYY/M/D（手动拼段，避免 new Date 按 UTC 解析带来的时区偏移）
+function formatPublishedAt(publishedAt: string) {
+  const [year, month, day] = publishedAt.split("-").map(Number);
+  return year && month && day ? `${year}/${month}/${day}` : "";
+}
+
+// 第一作者 + "等"（英文作者用 "et al."）；只有一个作者时只显示名字
+function firstAuthorLabel(authors: string) {
+  const list = authors.split(",").map((name) => name.trim()).filter(Boolean);
+  if (!list.length) return "";
+  if (list.length === 1) return list[0];
+  return `${list[0]}${/[\u4e00-\u9fff]/.test(list[0]) ? " 等" : " et al."}`;
+}
+
+// 文库条目 meta 行：来源（缺省为页数）· 发表日期（缺省回退为打开时间）· 第一作者等
+// 老数据的 meta 里持久化了"真实 PDF"段，展示层按分隔符过滤掉
+function libraryMetaLine(paper: LibraryPaper) {
+  const parts = (paper.meta || "").split("·").map((part) => part.trim()).filter((part) => part && part !== "真实 PDF");
+  const source = parts.length ? parts.join(" · ") : `${paper.pageCount} 页`;
+  const date = formatPublishedAt(paper.publishedAt || "") || new Date(paper.updatedAt).toLocaleDateString("zh-CN");
+  const author = firstAuthorLabel(paper.authors || "");
+  return `${source} · ${date}${author ? ` · ${author}` : ""}`;
+}
+
+// 上次阅读时间：UTC ISO → 本地时区的相对标签（今天/昨天带时分，今年 M/D，更早 YYYY/M/D）
+function lastReadLabel(iso: string) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const now = new Date();
+  const startOfDay = (value: Date) => new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+  const dayDiff = Math.round((startOfDay(now) - startOfDay(date)) / 86400000);
+  const time = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  if (dayDiff === 0) return `今天 ${time}`;
+  if (dayDiff === 1) return `昨天 ${time}`;
+  if (date.getFullYear() === now.getFullYear()) return `${date.getMonth() + 1}/${date.getDate()}`;
+  return `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
 }
 
 // 本周一（本地时区）的日期字符串，作为统计接口的 from 参数
@@ -1557,7 +1596,8 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
                       ))}
                     </div>
                     <div className="library-meta-row">
-                      <small>{paper.meta || `${paper.pageCount} 页`} · {new Date(paper.updatedAt).toLocaleDateString("zh-CN")}</small>
+                      <small title={paper.authors || undefined}>{libraryMetaLine(paper)}</small>
+                      {paper.lastReadAt && lastReadLabel(paper.lastReadAt) && <span className="library-last-read" title={`上次阅读：${new Date(paper.lastReadAt).toLocaleString("zh-CN", { hour12: false })}`}><Clock size={10} />{lastReadLabel(paper.lastReadAt)}</span>}
                       <label className={`library-status-select ${paper.status || "unread"}`} title="阅读状态">
                         <span className="status-dot-lib" aria-hidden="true" />
                         <select aria-label={`设置《${paper.title}》的阅读状态`} value={paper.status || "unread"} onChange={(event) => void onSetStatus(paper.id, event.target.value as PaperStatus)}>
@@ -4607,7 +4647,7 @@ export default function Home() {
     const arxivId = normalized.match(/arxiv\.org\/pdf\/([^?#/]+)/i)?.[1];
     const urlName = decodeURIComponent(parsed.pathname.split("/").filter(Boolean).pop() || "").replace(/\.pdf$/i, "");
     setPaperTitle(arxivId ? `arXiv ${arxivId}` : normalizedDocumentTitle(urlName) || "正在读取论文…");
-    setPaperMeta(`${parsed.hostname} · 真实 PDF`);
+    setPaperMeta(parsed.hostname);
     setMessages([{ id: Date.now(), role: "assistant", content: "论文正在解析。文字提取完成后，我会在这里基于**全文上下文**回答问题。" }]);
     setConversations([]);
     setHistoryOpen(false);

@@ -693,6 +693,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .library-filter-chips button.active { border-color: #9bc0b1; background: var(--green-soft); color: var(--green); font-weight: 650; }
 .library-rating-select { flex: 0 0 auto; margin-left: auto; height: 28px; color: var(--amber); }
 .library-meta-row > small { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #818b86; font-size: 10px; }
+/* 上次阅读时间：meta 行右侧、状态/文件夹下拉之前，与 meta 小字同色系 */
+.library-last-read { flex: 0 0 auto; display: flex; align-items: center; gap: 3px; white-space: nowrap; color: #818b86; font-size: 10px; font-variant-numeric: tabular-nums; }
+.library-last-read svg { color: #a3ada8; }
 .library-folder-select { height: 26px; flex: 0 0 auto; display: flex; align-items: center; gap: 4px; padding: 0 7px; border: 1px solid #e0e5e2; border-radius: 7px; background: rgba(255,255,255,.84); color: #738078; }
 .library-folder-select select { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: #66736c; font-size: 10px; cursor: pointer; }
 /* 文库论文的阅读状态选择器：未读灰 / 阅读中琥珀 / 已阅读绿 */
@@ -862,7 +865,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .app-shell .library-folders > button span, .app-shell .library-folders .folder-main span { font-size: calc(11px + var(--font-boost)); }
 .app-shell .library-folders > button small, .app-shell .library-folders .folder-main small { font-size: calc(9px + var(--font-boost)); }
 .app-shell .library-content-title strong { font-size: calc(13px + var(--font-boost)); }
-.app-shell .library-content-title span, .app-shell .library-open, .app-shell .library-meta-row > small { font-size: calc(10px + var(--font-boost)); }
+.app-shell .library-content-title span, .app-shell .library-open, .app-shell .library-meta-row > small, .app-shell .library-last-read { font-size: calc(10px + var(--font-boost)); }
 .app-shell .library-folder-select select, .app-shell .library-status-select select, .app-shell .new-folder-row input { font-size: calc(10px + var(--font-boost)); }
 .app-shell .library-filter-chips button, .app-shell .library-loading, .app-shell .library-empty { font-size: calc(11px + var(--font-boost)); }
 .app-shell .library-search { font-size: calc(13px + var(--font-boost)); }
@@ -1240,6 +1243,8 @@ html[data-theme="dark"] .library-item { border-color: #3a453f; background: var(-
 html[data-theme="dark"] .library-item:hover { border-color: #3f5a4d; background: var(--d-hover); box-shadow: 0 6px 18px rgba(0,0,0,.35); }
 html[data-theme="dark"] .library-item.active { border-color: #3f6a56; background: var(--green-soft); }
 html[data-theme="dark"] .library-meta-row > small { color: var(--muted); }
+html[data-theme="dark"] .library-last-read { color: var(--muted); }
+html[data-theme="dark"] .library-last-read svg { color: var(--muted); }
 html[data-theme="dark"] .library-folder-select, html[data-theme="dark"] .library-status-select { border-color: #3a453f; background: rgba(36,43,39,.84); }
 html[data-theme="dark"] .library-folder-select select, html[data-theme="dark"] .library-status-select select { color: var(--d-text-2); }
 html[data-theme="dark"] .status-dot-lib { box-shadow: 0 0 0 2.5px var(--soft-line); }

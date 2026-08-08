@@ -26,6 +26,11 @@ export const papers = sqliteTable("papers", {
   folderId: text("folder_id").references(() => paperFolders.id, { onDelete: "set null" }),
   title: text("title").notNull(),
   meta: text("meta").notNull().default(""),
+  // arXiv 元数据：逗号分隔作者（截断存储）；发表日期 YYYY-MM-DD，空串表示未知
+  authors: text("authors").notNull().default(""),
+  publishedAt: text("published_at").notNull().default(""),
+  // arXiv 元数据抓取标记：空串=没查过；ISO 时间=查过（命中与否都标记，整体请求失败才不写，避免永远查不到的论文反复重试）
+  metaCheckedAt: text("meta_checked_at").notNull().default(""),
   sourceKind: text("source_kind", { enum: ["remote", "upload"] }).notNull(),
   sourceUrl: text("source_url"),
   objectKey: text("object_key"),

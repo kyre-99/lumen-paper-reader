@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { index, integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, real, sqliteTable, text, uniqueIndex, type AnySQLiteColumn } from "drizzle-orm/sqlite-core";
 
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
@@ -14,9 +14,11 @@ export const paperFolders = sqliteTable("paper_folders", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   name: text("name").notNull(),
+  // 父文件夹：空表示顶层；删除父级时子文件夹由路由层先重挂到祖父级，FK set null 兜底
+  parentId: text("parent_id").references((): AnySQLiteColumn => paperFolders.id, { onDelete: "set null" }),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-}, (table) => [index("paper_folders_user_id_idx").on(table.userId)]);
+}, (table) => [index("paper_folders_user_id_idx").on(table.userId), index("paper_folders_user_parent_idx").on(table.userId, table.parentId)]);
 
 export const papers = sqliteTable("papers", {
   id: text("id").primaryKey(),

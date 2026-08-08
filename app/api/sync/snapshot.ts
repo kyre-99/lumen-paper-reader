@@ -48,8 +48,15 @@ export async function restoreSnapshot(userId: string, snapshot: SyncSnapshot) {
     db.delete(paperFolders).where(eq(paperFolders.userId, userId)),
     db.update(readerStates).set({ activePaperId: null, updatedAt: now }).where(eq(readerStates.userId, userId)),
   ];
+  // 文件夹先全部以 parentId = null 插入，再统一回填 parentId：
+  // 快照里子文件夹可能排在父文件夹前面，直接带 parentId 插入会违反自引用外键
   for (const folder of snapshot.folders) {
-    statements.push(db.insert(paperFolders).values({ ...folder, id: String(folder.id).slice(0, 64), userId, name: String(folder.name || "文件夹").slice(0, 200) }));
+    statements.push(db.insert(paperFolders).values({ ...folder, id: String(folder.id).slice(0, 64), userId, name: String(folder.name || "文件夹").slice(0, 200), parentId: null }));
+  }
+  for (const folder of snapshot.folders) {
+    const parentId = folder.parentId ? String(folder.parentId).slice(0, 64) : null;
+    if (!parentId) continue;
+    statements.push(db.update(paperFolders).set({ parentId }).where(and(eq(paperFolders.id, String(folder.id).slice(0, 64)), eq(paperFolders.userId, userId))));
   }
   for (const paper of snapshot.papers) {
     // 备份里的 objectKey 可能指向他人目录，统一重写为本用户目录下的合法 key
@@ -104,6 +111,7 @@ export async function mergeSnapshot(userId: string, snapshot: SyncSnapshot): Pro
   const localFolderById = new Map(localFolders.map((folder) => [folder.id, folder]));
   const localFolderByName = new Map(localFolders.map((folder) => [folder.name, folder]));
   const folderIdMap = new Map<string, string>(); // 快照文件夹 id → 合并后的文件夹 id
+  const touchedFolderIds = new Set<string>(); // 本次合并插入或按新更新的文件夹，稍后统一回填 parentId
   for (const folder of snapshot.folders) {
     const id = String(folder.id).slice(0, 64);
     const name = String(folder.name || "文件夹").slice(0, 200);
@@ -112,14 +120,25 @@ export async function mergeSnapshot(userId: string, snapshot: SyncSnapshot): Pro
       folderIdMap.set(id, id);
       if (ts(folder.updatedAt) > ts(byId.updatedAt)) {
         statements.push(db.update(paperFolders).set({ name, updatedAt: String(folder.updatedAt || now) }).where(and(eq(paperFolders.id, id), eq(paperFolders.userId, userId))));
+        touchedFolderIds.add(id);
       }
       continue;
     }
     const byName = localFolderByName.get(name);
     if (byName) { folderIdMap.set(id, byName.id); continue; }
     folderIdMap.set(id, id);
-    statements.push(db.insert(paperFolders).values({ ...folder, id, userId, name }));
+    // 先以 parentId = null 插入：快照里子文件夹可能排在父文件夹前面，直接带 parentId 会违反自引用外键，
+    // 且父级可能被归并到本地同名文件夹，parentId 统一在 folderIdMap 建完后回填（见下方循环）
+    statements.push(db.insert(paperFolders).values({ ...folder, id, userId, name, parentId: null }));
+    touchedFolderIds.add(id);
     summary.foldersAdded++;
+  }
+  // 回填 parentId：快照父级 id 经 folderIdMap 映射到合并后的文件夹；映射不到（悬空引用）则置为顶层
+  for (const folder of snapshot.folders) {
+    const id = String(folder.id).slice(0, 64);
+    if (!touchedFolderIds.has(id)) continue;
+    const parentId = folder.parentId ? folderIdMap.get(String(folder.parentId).slice(0, 64)) ?? null : null;
+    statements.push(db.update(paperFolders).set({ parentId }).where(and(eq(paperFolders.id, id), eq(paperFolders.userId, userId))));
   }
 
   // 论文：新 id 直接并入；同 id 按 updatedAt 较新者胜出；folderId 按合并结果修正

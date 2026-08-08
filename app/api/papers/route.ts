@@ -24,6 +24,7 @@ export async function GET() {
     db.select({
       id: paperFolders.id,
       name: paperFolders.name,
+      parentId: paperFolders.parentId,
       createdAt: paperFolders.createdAt,
       updatedAt: paperFolders.updatedAt,
     }).from(paperFolders).where(eq(paperFolders.userId, user.id)).orderBy(desc(paperFolders.updatedAt)).limit(100),

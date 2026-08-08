@@ -197,7 +197,7 @@ const PAPER_STATUS_OPTIONS: Array<{ value: PaperStatus; label: string }> = [
   { value: "done", label: "已阅读" },
 ];
 type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; sourceKind: PaperSourceKind; sourceUrl: string | null; pageCount: number; status: PaperStatus; rating: number; createdAt: string; updatedAt: string };
-type LibraryFolder = { id: string; name: string; createdAt?: string; updatedAt: string };
+type LibraryFolder = { id: string; name: string; parentId: string | null; createdAt?: string; updatedAt: string };
 type DiaryEntry = { id: string; day: string; title: string; content: string; updatedAt: string };
 type UsageStats = {
   totalCalls: number; promptTokens: number; completionTokens: number; totalTokens: number;
@@ -1105,10 +1105,14 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
   const [pdf, setPdf] = useState<any>(null);
   // scale=1 的第 1 页尺寸，作为未渲染页占位高度的初始估算（拿到前按 A4 估算）
   const [baseSize, setBaseSize] = useState({ width: 595, height: 842 });
+  // 卸载销毁（task.destroy）后，在飞的渲染/取页任务会以 TypeError（transport 置空）拒绝，
+  // 属于正常竞态而非渲染失败，用此标记让错误回调静默
+  const destroyedRef = useRef(false);
 
   useEffect(() => {
     let task: any;
     let cancelled = false;
+    destroyedRef.current = false;
     (async () => {
       const pdfjs = await import("pdfjs-dist");
       pdfjs.GlobalWorkerOptions.workerSrc = await pdfWorkerSrcWithPolyfill(pdfWorkerUrl);
@@ -1176,6 +1180,7 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
     })().catch((error) => !cancelled && onError(error?.message || "PDF 加载失败"));
     return () => {
       cancelled = true;
+      destroyedRef.current = true;
       onPdfReady?.(null);
       task?.destroy?.();
     };
@@ -1186,7 +1191,7 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
   if (!pdf) {
     return <div className="pdf-loading"><LoaderCircle className="spin" size={22} /><span>正在解析论文版面…</span></div>;
   }
-  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} baseSize={baseSize} showFormula={showFormula} onFormula={onFormula} onTextLayerReady={onTextLayerReady} onThumbnail={onThumbnail} onRenderError={(page, message) => onError?.(`第 ${page} 页渲染失败：${message}`)} registerRef={registerRef} registerThumbRequest={registerThumbRequest} />)}</div>;
+  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} baseSize={baseSize} showFormula={showFormula} onFormula={onFormula} onTextLayerReady={onTextLayerReady} onThumbnail={onThumbnail} onRenderError={(page, message) => { if (!destroyedRef.current) onError?.(`第 ${page} 页渲染失败：${message}`); }} registerRef={registerRef} registerThumbRequest={registerThumbRequest} />)}</div>;
 });
 
 // 缩略图窗口化：IntersectionObserver 只给可视区上下约 5 项挂载 <img>，其余保留同尺寸占位（aspect-ratio 固定，布局不抖动）
@@ -1347,7 +1352,11 @@ function TourOverlay({ step, onStep, onClose }: { step: number; onStep: (step: n
   );
 }
 
-function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpenPaper, onAddPaper, onCreateFolder, onMovePaper, onSetStatus, onRatePaper, onDeletePaper, onRenamePaper, onRenameFolder, onDeleteFolder }: { onClose: () => void; papers: LibraryPaper[]; folders: LibraryFolder[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void; onCreateFolder: (name: string) => Promise<LibraryFolder | null>; onMovePaper: (paperId: string, folderId: string | null) => Promise<boolean>; onSetStatus: (paperId: string, status: PaperStatus) => Promise<boolean>; onRatePaper: (paperId: string, rating: number) => Promise<boolean>; onDeletePaper: (id: string) => Promise<boolean>; onRenamePaper: (id: string, title: string) => Promise<boolean>; onRenameFolder: (id: string, name: string) => Promise<boolean>; onDeleteFolder: (id: string) => Promise<boolean> }) {
+// 文库拖拽归档的自定义 dataTransfer 类型：论文移到文件夹 / 文件夹移动层级
+const PAPER_DND_TYPE = "application/x-lumen-paper";
+const FOLDER_DND_TYPE = "application/x-lumen-folder";
+
+function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpenPaper, onAddPaper, onCreateFolder, onMovePaper, onSetStatus, onRatePaper, onDeletePaper, onRenamePaper, onRenameFolder, onDeleteFolder, onMoveFolder }: { onClose: () => void; papers: LibraryPaper[]; folders: LibraryFolder[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void; onCreateFolder: (name: string, parentId?: string | null) => Promise<LibraryFolder | null>; onMovePaper: (paperId: string, folderId: string | null) => Promise<boolean>; onSetStatus: (paperId: string, status: PaperStatus) => Promise<boolean>; onRatePaper: (paperId: string, rating: number) => Promise<boolean>; onDeletePaper: (id: string) => Promise<boolean>; onRenamePaper: (id: string, title: string) => Promise<boolean>; onRenameFolder: (id: string, name: string) => Promise<boolean>; onDeleteFolder: (id: string) => Promise<boolean>; onMoveFolder: (folderId: string, parentId: string | null) => Promise<boolean> }) {
   const [activeFolder, setActiveFolder] = useState("all");
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [folderName, setFolderName] = useState("");
@@ -1356,6 +1365,14 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
   // 筛选栏：阅读状态分段 chip + 星级下拉，只在弹窗生命周期内保持，不持久化
   const [statusFilter, setStatusFilter] = useState<"all" | PaperStatus>("all");
   const [ratingFilter, setRatingFilter] = useState<"all" | number>("all");
+  // 文件夹树：折叠状态、子文件夹内联创建目标、拖拽悬停目标/拖拽中的文件夹，均不持久化
+  const [collapsedFolders, setCollapsedFolders] = useState<Record<string, boolean>>({});
+  const [childCreatingFor, setChildCreatingFor] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const [draggingFolderId, setDraggingFolderId] = useState<string | null>(null);
+  // 论文拖拽中的弱提示标记：与文件夹拖拽一起驱动左栏可投放行的晃动提示
+  const [paperDragging, setPaperDragging] = useState(false);
+  const dragHintActive = paperDragging || draggingFolderId !== null;
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKeyDown);
@@ -1371,36 +1388,121 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
   }, [papers, activeFolder, search, statusFilter, ratingFilter]);
   const filtering = statusFilter !== "all" || ratingFilter !== "all";
   const activeFolderName = activeFolder === "all" ? "全部论文" : activeFolder === "unfiled" ? "未分类" : folders.find((folder) => folder.id === activeFolder)?.name || "文件夹";
-  const createFolder = async () => {
+  const createFolder = async (parentId: string | null) => {
     const name = folderName.trim();
     if (!name || folderSaving) return;
     setFolderSaving(true);
-    const folder = await onCreateFolder(name);
+    const folder = await onCreateFolder(name, parentId);
     setFolderSaving(false);
     if (folder) {
       setFolderName("");
       setCreatingFolder(false);
+      setChildCreatingFor(null);
+      if (parentId) setCollapsedFolders((map) => ({ ...map, [parentId]: false })); // 创建子文件夹后自动展开父级
       setActiveFolder(folder.id);
     }
   };
+  // 文件夹树索引：按 parentId 分组，保持 folders 数组原有顺序（创建顺序）
+  const childrenOf = useMemo(() => {
+    const map = new Map<string | null, LibraryFolder[]>();
+    for (const folder of folders) {
+      const key = folder.parentId ?? null;
+      map.set(key, [...(map.get(key) ?? []), folder]);
+    }
+    return map;
+  }, [folders]);
+  // 论文移动下拉：按树序扁平化，用全角空格缩进体现层级
+  const flatFolders = useMemo(() => {
+    const walk = (parentId: string | null, depth: number): Array<{ folder: LibraryFolder; depth: number }> =>
+      (childrenOf.get(parentId) ?? []).flatMap((folder) => [{ folder, depth }, ...walk(folder.id, depth + 1)]);
+    return walk(null, 0);
+  }, [childrenOf]);
+  // ancestorId 是否为 maybeId 的祖先（拖拽时禁止把文件夹拖进自己的后代，后端另有 400 兜底）
+  const isFolderDescendant = (ancestorId: string, maybeId: string) => {
+    let current = folders.find((folder) => folder.id === maybeId)?.parentId ?? null;
+    while (current) {
+      if (current === ancestorId) return true;
+      current = folders.find((folder) => folder.id === current)?.parentId ?? null;
+    }
+    return false;
+  };
+  const toggleFolderCollapsed = (id: string) => setCollapsedFolders((map) => ({ ...map, [id]: !map[id] }));
+  const startCreateChild = (id: string) => { setCreatingFolder(false); setFolderName(""); setChildCreatingFor(id); };
+
+  // ===== 拖拽归档：论文行可拖到文件夹/未分类行；文件夹行可拖到别的文件夹行（变子级）或左栏空白区（回根级）=====
+  const folderDropProps = (key: string, folderId: string | null, acceptFolder: boolean) => ({
+    onDragOver: (event: React.DragEvent) => {
+      const types = event.dataTransfer.types;
+      const isPaper = types.includes(PAPER_DND_TYPE);
+      const isFolder = types.includes(FOLDER_DND_TYPE);
+      if (!isPaper && !isFolder) return;
+      if (isFolder) {
+        // 未分类行不收文件夹（回根级走空白区）；自身与后代行不可落
+        if (!acceptFolder || !folderId || !draggingFolderId) return;
+        if (draggingFolderId === folderId || isFolderDescendant(draggingFolderId, folderId)) return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      event.dataTransfer.dropEffect = "move";
+      if (dropTarget !== key) setDropTarget(key);
+    },
+    onDragLeave: () => { if (dropTarget === key) setDropTarget(null); },
+    onDrop: (event: React.DragEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setDropTarget(null);
+      const paperId = event.dataTransfer.getData(PAPER_DND_TYPE);
+      if (paperId) {
+        const paper = papers.find((item) => item.id === paperId);
+        if (paper && (paper.folderId ?? null) !== folderId) void onMovePaper(paperId, folderId);
+        return;
+      }
+      const draggedFolderId = event.dataTransfer.getData(FOLDER_DND_TYPE);
+      if (draggedFolderId && folderId && draggedFolderId !== folderId && !isFolderDescendant(draggedFolderId, folderId)) void onMoveFolder(draggedFolderId, folderId);
+    },
+  });
+  const folderDragProps = (folderId: string) => ({
+    draggable: true,
+    onDragStart: (event: React.DragEvent) => { event.dataTransfer.setData(FOLDER_DND_TYPE, folderId); event.dataTransfer.effectAllowed = "move"; setDraggingFolderId(folderId); },
+    onDragEnd: () => { setDraggingFolderId(null); setDropTarget(null); },
+  });
+
+  // 递归渲染文件夹树：chevron 折叠（默认展开）、层级缩进、行内操作（新建子文件夹/重命名/删除）
+  const renderFolderRows = (parentId: string | null, depth: number): React.ReactNode =>
+    (childrenOf.get(parentId) ?? []).map((folder) => {
+      const children = childrenOf.get(folder.id) ?? [];
+      const collapsed = Boolean(collapsedFolders[folder.id]);
+      return (
+        <React.Fragment key={folder.id}>
+          <div className={`folder-row ${dropTarget === `folder:${folder.id}` ? "drop-target" : ""} ${dragHintActive && draggingFolderId !== folder.id ? "wiggle-hint" : ""}`} style={{ "--depth": depth } as React.CSSProperties} {...folderDragProps(folder.id)} {...folderDropProps(`folder:${folder.id}`, folder.id, true)}>
+            {children.length
+              ? <button className="folder-chevron" aria-label={collapsed ? `展开“${folder.name}”的子文件夹` : `折叠“${folder.name}”的子文件夹`} title={collapsed ? "展开子文件夹" : "折叠子文件夹"} onClick={() => toggleFolderCollapsed(folder.id)}>{collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}</button>
+              : <span className="folder-chevron-spacer" aria-hidden="true" />}
+            <button className={`folder-main ${activeFolder === folder.id ? "active" : ""}`} title={folder.name} onClick={() => setActiveFolder(folder.id)}><FolderOpen size={15} /><span>{folder.name}</span><small>{papers.filter((paper) => paper.folderId === folder.id).length}</small></button>
+            <button className="folder-action" aria-label={`在“${folder.name}”下新建子文件夹`} title="新建子文件夹" onClick={() => startCreateChild(folder.id)}><Plus size={12} /></button>
+            <button className="folder-action" aria-label={`重命名文件夹“${folder.name}”`} title="重命名文件夹" onClick={() => { const name = window.prompt("文件夹名称", folder.name)?.trim(); if (name && name !== folder.name) void onRenameFolder(folder.id, name); }}><SquarePen size={12} /></button>
+            <button className="folder-action" aria-label={`删除文件夹“${folder.name}”`} title="删除文件夹（子文件夹移到上一层，论文保留在未分类）" onClick={() => { if (window.confirm(`删除文件夹“${folder.name}”？子文件夹会移到上一层，里面的论文会保留，移到未分类。`)) { if (activeFolder === folder.id) setActiveFolder("all"); void onDeleteFolder(folder.id); } }}><Trash2 size={12} /></button>
+          </div>
+          {childCreatingFor === folder.id && <div className="new-folder-row" style={{ "--depth": depth + 1 } as React.CSSProperties}><input value={folderName} onChange={(event) => setFolderName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createFolder(folder.id); if (event.key === "Escape") { event.stopPropagation(); setChildCreatingFor(null); } }} placeholder="子文件夹名称" autoFocus /><button onClick={() => void createFolder(folder.id)} disabled={!folderName.trim() || folderSaving} aria-label="创建子文件夹">{folderSaving ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}</button></div>}
+          {!collapsed && renderFolderRows(folder.id, depth + 1)}
+        </React.Fragment>
+      );
+    });
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div className="modal-card library-card" role="dialog" aria-modal="true" aria-labelledby="library-title">
         <button className="icon-button modal-close" onClick={onClose} aria-label="关闭"><X size={18} /></button>
         <div className="settings-heading"><div className="modal-icon"><Library size={23} /></div><div><h2 id="library-title">我的文库</h2><p>每篇论文的阅读位置、全文对话和提问批注都会独立保存。</p></div></div>
         <div className="library-browser">
-          <aside className="library-folders" aria-label="论文文件夹">
+          <aside className={`library-folders ${dropTarget === "root" ? "drop-target" : ""}`} aria-label="论文文件夹"
+            onDragOver={(event) => { if (!event.dataTransfer.types.includes(FOLDER_DND_TYPE) || !draggingFolderId) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; if (dropTarget !== "root") setDropTarget("root"); }}
+            onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null) && dropTarget === "root") setDropTarget(null); }}
+            onDrop={(event) => { event.preventDefault(); setDropTarget(null); const draggedFolderId = event.dataTransfer.getData(FOLDER_DND_TYPE); const dragged = folders.find((folder) => folder.id === draggedFolderId); if (dragged && (dragged.parentId ?? null) !== null) void onMoveFolder(draggedFolderId, null); }}>
             <button className={activeFolder === "all" ? "active" : ""} onClick={() => setActiveFolder("all")}><Library size={15} /><span>全部论文</span><small>{papers.length}</small></button>
-            <button className={activeFolder === "unfiled" ? "active" : ""} onClick={() => setActiveFolder("unfiled")}><FolderOpen size={15} /><span>未分类</span><small>{papers.filter((paper) => !paper.folderId).length}</small></button>
+            <button className={`${activeFolder === "unfiled" ? "active" : ""} ${dropTarget === "unfiled" ? "drop-target" : ""} ${dragHintActive ? "wiggle-hint" : ""}`} onClick={() => setActiveFolder("unfiled")} {...folderDropProps("unfiled", null, false)}><FolderOpen size={15} /><span>未分类</span><small>{papers.filter((paper) => !paper.folderId).length}</small></button>
             <div className="folder-divider" />
-            {folders.map((folder) => (
-              <div key={folder.id} className="folder-row">
-                <button className={`folder-main ${activeFolder === folder.id ? "active" : ""}`} onClick={() => setActiveFolder(folder.id)}><FolderOpen size={15} /><span>{folder.name}</span><small>{papers.filter((paper) => paper.folderId === folder.id).length}</small></button>
-                <button className="folder-action" aria-label={`重命名文件夹“${folder.name}”`} title="重命名文件夹" onClick={() => { const name = window.prompt("文件夹名称", folder.name)?.trim(); if (name && name !== folder.name) void onRenameFolder(folder.id, name); }}><SquarePen size={12} /></button>
-                <button className="folder-action" aria-label={`删除文件夹“${folder.name}”`} title="删除文件夹（论文保留，移到未分类）" onClick={() => { if (window.confirm(`删除文件夹“${folder.name}”？里面的论文会保留，移到未分类。`)) { if (activeFolder === folder.id) setActiveFolder("all"); void onDeleteFolder(folder.id); } }}><Trash2 size={12} /></button>
-              </div>
-            ))}
-            {creatingFolder ? <div className="new-folder-row"><input value={folderName} onChange={(event) => setFolderName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createFolder(); if (event.key === "Escape") { event.stopPropagation(); setCreatingFolder(false); } }} placeholder="文件夹名称" autoFocus /><button onClick={() => void createFolder()} disabled={!folderName.trim() || folderSaving} aria-label="创建文件夹">{folderSaving ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}</button></div> : <button className="new-folder-button" onClick={() => setCreatingFolder(true)}><Plus size={14} /><span>新建文件夹</span></button>}
+            {renderFolderRows(null, 0)}
+            {creatingFolder ? <div className="new-folder-row"><input value={folderName} onChange={(event) => setFolderName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createFolder(null); if (event.key === "Escape") { event.stopPropagation(); setCreatingFolder(false); } }} placeholder="文件夹名称" autoFocus /><button onClick={() => void createFolder(null)} disabled={!folderName.trim() || folderSaving} aria-label="创建文件夹">{folderSaving ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}</button></div> : <button className="new-folder-button" onClick={() => { setChildCreatingFor(null); setCreatingFolder(true); }}><Plus size={14} /><span>新建文件夹</span></button>}
           </aside>
           <section className="library-content">
             <div className="library-content-title"><strong>{activeFolderName}</strong><span>{visiblePapers.length} 篇</span></div>
@@ -1423,7 +1525,7 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
             {loading ? <div className="library-loading"><LoaderCircle className="spin" size={18} />正在读取文库…</div> : visiblePapers.length ? (
               <div className="library-list">
                 {visiblePapers.map((paper) => (
-                  <div key={paper.id} className={`library-item ${paper.id === activePaperId ? "active" : ""}`}>
+                  <div key={paper.id} className={`library-item ${paper.id === activePaperId ? "active" : ""}`} draggable onDragStart={(event) => { event.dataTransfer.setData(PAPER_DND_TYPE, paper.id); event.dataTransfer.effectAllowed = "move"; setPaperDragging(true); }} onDragEnd={() => { setPaperDragging(false); setDropTarget(null); }}>
                     <button className="library-paper-button" onClick={() => onOpenPaper(paper.id)}>
                       <span className="library-file"><FileText size={18} /></span>
                       <span className="library-copy"><strong>{paper.title}</strong></span>
@@ -1451,7 +1553,7 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
                         <FolderOpen size={12} />
                         <select aria-label={`移动《${paper.title}》到文件夹`} value={paper.folderId || ""} onChange={(event) => void onMovePaper(paper.id, event.target.value || null)}>
                           <option value="">未分类</option>
-                          {folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+                          {flatFolders.map(({ folder, depth }) => <option key={folder.id} value={folder.id}>{`${"　".repeat(depth)}${folder.name}`}</option>)}
                         </select>
                       </label>
                     </div>
@@ -2282,7 +2384,7 @@ export default function Home() {
   useEffect(() => {
     const move = (event: PointerEvent) => {
       const panelDrag = panelResizeRef.current;
-      if (panelDrag) setPanelWidth(Math.min(680, Math.max(320, panelDrag.startWidth + panelDrag.startX - event.clientX)));
+      if (panelDrag) setPanelWidth(Math.min(Math.min(1200, Math.max(680, window.innerWidth - 480)), Math.max(320, panelDrag.startWidth + panelDrag.startX - event.clientX)));
       const thumbDrag = thumbResizeRef.current;
       if (thumbDrag) setThumbWidth(Math.min(220, Math.max(72, thumbDrag.startWidth + event.clientX - thumbDrag.startX)));
     };
@@ -2413,6 +2515,13 @@ export default function Home() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   // 右侧提问输入框：/ 快捷键聚焦用
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  // 输入框随内容自动拉高（封顶 240px，超出滚动；清空时回落到最小高度）
+  useEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 240)}px`;
+  }, [question]);
   // 自动保存：自增序号用于丢弃过期响应，快照用于跳过未变更的写回
   const saveSeqRef = useRef(0);
   const lastSavedSnapshotRef = useRef("");
@@ -3111,6 +3220,8 @@ export default function Home() {
   const sendQuestion = useCallback((raw: string) => {
     const text = raw.trim();
     if (!text || loading) return;
+    // 全文还在提取时提问必然检索不到上下文（快捷按钮不经发送按钮的禁用检查，在此兜底）
+    if (extractingText && !freeChatOn) { setToast({ text: "正在解析论文全文，解析完成后再提问" }); return; }
     // 编辑重发：发送时才把被编辑的消息及之后内容截掉，基于截断后的列表续写
     const editIndex = editingMessageId !== null ? messages.findIndex((message) => message.id === editingMessageId) : -1;
     const base = editIndex >= 0 ? messages.slice(0, editIndex) : messages;
@@ -3123,7 +3234,7 @@ export default function Home() {
     setSelectionPos(null);
     // 失败消息不进上下文；当前问题走 question 字段，不含在 history 里
     void startChatStream(text, base.filter((message) => !message.failed).slice(-10));
-  }, [editingMessageId, loading, messages, startChatStream]);
+  }, [editingMessageId, extractingText, freeChatOn, loading, messages, setToast, startChatStream]);
 
   // 失败重试：丢弃失败的回复，用同一问题重新请求
   const retryChat = useCallback((failedId: number) => {
@@ -4223,9 +4334,9 @@ export default function Home() {
     }
   }, []);
 
-  const createLibraryFolder = useCallback(async (name: string) => {
+  const createLibraryFolder = useCallback(async (name: string, parentId?: string | null) => {
     try {
-      const response = await fetch("/api/folders", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+      const response = await fetch("/api/folders", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, ...(parentId ? { parentId } : {}) }) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "文件夹创建失败");
       const folder = payload.folder as LibraryFolder;
@@ -4235,6 +4346,21 @@ export default function Home() {
     } catch (error: unknown) {
       setToast({ text: errorMessage(error, "文件夹创建失败"), kind: "error" });
       return null;
+    }
+  }, []);
+
+  // 移动文件夹层级：parentId 为 null 即回根级；拖到后代等非法移动由后端 400 兜底
+  const moveLibraryFolder = useCallback(async (id: string, parentId: string | null) => {
+    try {
+      const response = await fetch(`/api/folders/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ parentId }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "文件夹移动失败");
+      setLibraryFolders((folders) => folders.map((folder) => folder.id === id ? { ...folder, parentId, updatedAt: payload.folder?.updatedAt || folder.updatedAt } : folder));
+      setToast({ text: "文件夹已移动" });
+      return true;
+    } catch (error: unknown) {
+      setToast({ text: errorMessage(error, "文件夹移动失败"), kind: "error" });
+      return false;
     }
   }, []);
 
@@ -4354,7 +4480,11 @@ export default function Home() {
       const response = await fetch(`/api/folders/${encodeURIComponent(id)}`, { method: "DELETE" });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || "文件夹删除失败");
-      setLibraryFolders((folders) => folders.filter((folder) => folder.id !== id));
+      // 子文件夹重挂到被删者的父级（与服务端语义一致）
+      setLibraryFolders((folders) => {
+        const removed = folders.find((folder) => folder.id === id);
+        return folders.filter((folder) => folder.id !== id).map((folder) => removed && folder.parentId === id ? { ...folder, parentId: removed.parentId ?? null } : folder);
+      });
       // 论文保留，变为无文件夹
       setLibraryPapers((papers) => papers.map((paper) => paper.folderId === id ? { ...paper, folderId: null } : paper));
       setToast({ text: "文件夹已删除，论文保留在未分类" });
@@ -4909,9 +5039,15 @@ export default function Home() {
           <button className={panelTab === "notes" ? "active" : ""} onClick={() => setPanelTab("notes")}>笔记{annotations.length > 0 && <span className="panel-tab-count">{annotations.length}</span>}</button>
         </div>
         {panelTab === "chat" && !historyOpen && <div className="quick-actions">
-          <button className={freeChatOn ? "disabled" : ""} aria-disabled={freeChatOn} title={freeChatOn ? "无记忆模式下不可用" : undefined} onClick={() => { if (!freeChatOn) sendQuestion("请用三点总结这篇论文的核心贡献。"); }}>总结全文</button>
-          <button className={freeChatOn ? "disabled" : ""} aria-disabled={freeChatOn} title={freeChatOn ? "无记忆模式下不可用" : undefined} onClick={() => { if (!freeChatOn) sendQuestion("请解释这篇论文最重要的方法，并给出直觉理解。"); }}>解释方法</button>
-          <button className={freeChatOn ? "disabled" : ""} aria-disabled={freeChatOn} title={freeChatOn ? "无记忆模式下不可用" : undefined} onClick={() => { if (!freeChatOn) sendQuestion("请列出阅读这篇论文前需要了解的概念。"); }}>前置知识</button>
+          {([
+            ["总结全文", "请用三点总结这篇论文的核心贡献。"],
+            ["解释方法", "请解释这篇论文最重要的方法，并给出直觉理解。"],
+            ["前置知识", "请列出阅读这篇论文前需要了解的概念。"],
+          ] as Array<[string, string]>).map(([label, prompt]) => {
+            const blocked = freeChatOn || extractingText;
+            const hint = freeChatOn ? "无记忆模式下不可用" : extractingText ? "正在解析论文全文，完成后可用" : undefined;
+            return <button key={label} className={blocked ? "disabled" : ""} aria-disabled={blocked} title={hint} onClick={() => { if (!blocked) sendQuestion(prompt); }}>{label}</button>;
+          })}
         </div>}
         {panelTab === "notes" ? (
           <div className="notes-panel">
@@ -5041,7 +5177,7 @@ export default function Home() {
       </div>}
       {tourOpen && <TourOverlay step={tourStep} onStep={setTourStep} onClose={() => setTourOpen(false)} />}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
-      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} onRatePaper={rateLibraryPaper} onDeletePaper={deleteLibraryPaper} onRenamePaper={renameLibraryPaper} onRenameFolder={renameLibraryFolder} onDeleteFolder={deleteLibraryFolder} />}
+      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} onRatePaper={rateLibraryPaper} onDeletePaper={deleteLibraryPaper} onRenamePaper={renameLibraryPaper} onRenameFolder={renameLibraryFolder} onDeleteFolder={deleteLibraryFolder} onMoveFolder={moveLibraryFolder} />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} visionConfig={visionConfig} setVisionConfig={setVisionConfig} embeddingConfig={embeddingConfig} setEmbeddingConfig={setEmbeddingConfig} />}
       {usageOpen && <UsageModal onClose={() => setUsageOpen(false)} stats={usageStats} loading={usageLoading} />}
       {statsOpen && <StatsModal onClose={() => setStatsOpen(false)} stats={readingStats} loading={statsLoading} onOpenPaper={(id) => { setStatsOpen(false); void openLibraryPaper(id); }} />}

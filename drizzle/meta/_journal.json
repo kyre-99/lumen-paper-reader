@@ -113,6 +113,13 @@
       "when": 1786068024390,
       "tag": "0015_volatile_lorna_dane",
       "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "6",
+      "when": 1786154922540,
+      "tag": "0016_noisy_firebrand",
+      "breakpoints": true
     }
   ]
 }

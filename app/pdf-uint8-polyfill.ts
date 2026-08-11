@@ -24,6 +24,25 @@ export function applyUint8Polyfill() {
       return { promise, resolve, reject };
     };
   }
+  // URL.parse / URL.canParse（Chrome 126/120+）：new URL 的"不抛异常"版本，pdf.js 6 的路径解析依赖
+  const urlCtor = URL as unknown as Record<string, unknown>;
+  if (!urlCtor.parse) {
+    urlCtor.parse = function (url: string | URL, base?: string | URL) {
+      try { return new URL(url, base); } catch { return null; }
+    };
+  }
+  if (!urlCtor.canParse) {
+    urlCtor.canParse = function (url: string | URL, base?: string | URL) {
+      try { new URL(url, base); return true; } catch { return false; }
+    };
+  }
+  // Object.hasOwn（Chrome 93+）兜底保险
+  const objectCtor = Object as unknown as Record<string, unknown>;
+  if (!objectCtor.hasOwn) {
+    objectCtor.hasOwn = function (obj: object, key: PropertyKey) {
+      return Object.prototype.hasOwnProperty.call(obj, key);
+    };
+  }
   if (!Uint8Array.prototype.toHex) {
     Uint8Array.prototype.toHex = function (this: Uint8Array) {
       let out = "";
@@ -81,6 +100,8 @@ export async function pdfWorkerSrcWithPolyfill(rawWorkerUrl: string) {
   const weakMapProto = WeakMap.prototype as unknown as Record<string, unknown>;
   const nativeSupported = Boolean(
     (Promise as unknown as Record<string, unknown>).withResolvers
+    && (URL as unknown as Record<string, unknown>).parse && (URL as unknown as Record<string, unknown>).canParse
+    && (Object as unknown as Record<string, unknown>).hasOwn
     && Uint8Array.prototype.toHex && Uint8Array.prototype.toBase64 && Uint8Array.fromBase64
     && mapProto.getOrInsert && mapProto.getOrInsertComputed && weakMapProto.getOrInsert && weakMapProto.getOrInsertComputed,
   );

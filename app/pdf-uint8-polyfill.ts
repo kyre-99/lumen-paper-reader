@@ -39,6 +39,26 @@ export function applyUint8Polyfill() {
       return bytes;
     };
   }
+  // Map/WeakMap 的 getOrInsert / getOrInsertComputed（ES2026 提案，约 Chrome 135+），
+  // pdf.js 6 的缓存逻辑依赖；旧 WebView 没有会直接崩渲染（this[#t].getOrInsertComputed is not a function）
+  for (const ctor of [Map, WeakMap]) {
+    const proto = ctor.prototype as unknown as Record<string, unknown>;
+    if (!proto.getOrInsert) {
+      proto.getOrInsert = function (this: Pick<Map<unknown, unknown>, "has" | "get" | "set">, key: unknown, value: unknown) {
+        if (this.has(key)) return this.get(key);
+        this.set(key, value);
+        return value;
+      };
+    }
+    if (!proto.getOrInsertComputed) {
+      proto.getOrInsertComputed = function (this: Pick<Map<unknown, unknown>, "has" | "get" | "set">, key: unknown, callback: (key: unknown) => unknown) {
+        if (this.has(key)) return this.get(key);
+        const value = callback(key);
+        this.set(key, value);
+        return value;
+      };
+    }
+  }
 }
 
 let cachedWorkerSrc: string | null = null;
@@ -47,7 +67,12 @@ let cachedWorkerSrc: string | null = null;
 // 老内核（如 Android WebView 138）把 polyfill 与 worker 源码拼成 Blob 再加载。
 export async function pdfWorkerSrcWithPolyfill(rawWorkerUrl: string) {
   // 必须先探测原生支持、再打主线程补丁——顺序反了探测会永远为真，老内核就会拿到没补丁的 worker
-  const nativeSupported = Boolean(Uint8Array.prototype.toHex && Uint8Array.prototype.toBase64 && Uint8Array.fromBase64);
+  const mapProto = Map.prototype as unknown as Record<string, unknown>;
+  const weakMapProto = WeakMap.prototype as unknown as Record<string, unknown>;
+  const nativeSupported = Boolean(
+    Uint8Array.prototype.toHex && Uint8Array.prototype.toBase64 && Uint8Array.fromBase64
+    && mapProto.getOrInsert && mapProto.getOrInsertComputed && weakMapProto.getOrInsert && weakMapProto.getOrInsertComputed,
+  );
   applyUint8Polyfill();
   if (cachedWorkerSrc) return cachedWorkerSrc;
   if (nativeSupported) {

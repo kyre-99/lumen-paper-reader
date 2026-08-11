@@ -2533,6 +2533,8 @@ export default function Home() {
   const resizeRef = useRef<{ id: number; startX: number; startY: number; startWidth: number; startHeight: number } | null>(null);
   const lastDraggedPinRef = useRef<number | null>(null);
   const selectionPointerRef = useRef<{ x: number; y: number; root: Element } | null>(null);
+  // 最近一次按下的指针类型：触屏/手写笔长按文字时让位给系统划词，不弹自定义批注菜单（见 handlePdfContextMenu）
+  const lastPointerTypeRef = useRef<string>("mouse");
   // 引用点击判定：mousedown 时的屏幕坐标，mouseup/click 时对比位移区分「点按」与「划词」
   const citationDownRef = useRef<{ x: number; y: number } | null>(null);
   const citationFlashTimerRef = useRef<number | null>(null);
@@ -3781,6 +3783,7 @@ export default function Home() {
 
   // 框选图表：lasso 模式下左键按下开始拖框，否则走原有的平移逻辑
   const handleReaderPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    lastPointerTypeRef.current = event.pointerType || "mouse";
     if (figureLasso && event.button === 0) {
       const page = (event.target as HTMLElement).closest(".pdf-page") as HTMLElement | null;
       if (!page) return;
@@ -3883,8 +3886,12 @@ export default function Home() {
   }, [createFigureAnnotation, figureRegion]);
 
   const handlePdfContextMenu = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
-    const page = (event.target as HTMLElement).closest(".pdf-page") as HTMLElement | null;
+    const target = event.target as HTMLElement;
+    const page = target.closest(".pdf-page") as HTMLElement | null;
     if (!page) return;
+    // 触屏/手写笔的长按落在文字上时是系统划词入口：不拦截 contextmenu、不弹批注菜单，
+    // 让 iPad/手机的原生选区正常出现（松手后由 touchend 路径弹出划词工具条）；文字外的空白处仍弹批注菜单
+    if (lastPointerTypeRef.current !== "mouse" && target.closest(".textLayer, .demo-paper")) return;
     event.preventDefault();
     const rect = page.getBoundingClientRect();
     setPdfContextMenu({ x: Math.min(event.clientX, window.innerWidth - 210), y: Math.min(event.clientY, window.innerHeight - 110), pageNumber: Number(page.dataset.pageNumber || 1), pageX: Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)), pageY: Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)) });

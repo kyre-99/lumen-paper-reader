@@ -14,6 +14,16 @@ declare global {
 }
 
 export function applyUint8Polyfill() {
+  // Promise.withResolvers（Chrome 119+），pdf.js 6 的异步任务管理依赖
+  const promiseCtor = Promise as unknown as { withResolvers?<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void; reject: (reason?: unknown) => void } };
+  if (!promiseCtor.withResolvers) {
+    promiseCtor.withResolvers = function <T>() {
+      let resolve!: (value: T | PromiseLike<T>) => void;
+      let reject!: (reason?: unknown) => void;
+      const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+      return { promise, resolve, reject };
+    };
+  }
   if (!Uint8Array.prototype.toHex) {
     Uint8Array.prototype.toHex = function (this: Uint8Array) {
       let out = "";
@@ -70,7 +80,8 @@ export async function pdfWorkerSrcWithPolyfill(rawWorkerUrl: string) {
   const mapProto = Map.prototype as unknown as Record<string, unknown>;
   const weakMapProto = WeakMap.prototype as unknown as Record<string, unknown>;
   const nativeSupported = Boolean(
-    Uint8Array.prototype.toHex && Uint8Array.prototype.toBase64 && Uint8Array.fromBase64
+    (Promise as unknown as Record<string, unknown>).withResolvers
+    && Uint8Array.prototype.toHex && Uint8Array.prototype.toBase64 && Uint8Array.fromBase64
     && mapProto.getOrInsert && mapProto.getOrInsertComputed && weakMapProto.getOrInsert && weakMapProto.getOrInsertComputed,
   );
   applyUint8Polyfill();

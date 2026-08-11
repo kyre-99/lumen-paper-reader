@@ -1152,11 +1152,30 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
     let task: any;
     let cancelled = false;
     destroyedRef.current = false;
+    // 加载看门狗：老 WebView 上 pdf.js 可能静默挂住（promise 不 resolve 也不 reject），
+    // 30 秒无进展就把当前阶段 + 捕获到的全局错误 + WebView 版本报出来，便于诊断
+    let stage = "加载解析引擎";
+    const captured: string[] = [];
+    const onGlobalError = (event: Event) => {
+      const message = (event as ErrorEvent).message || (event as PromiseRejectionEvent).reason;
+      if (captured.length < 3) captured.push(String(message || event.type).slice(0, 200));
+    };
+    window.addEventListener("error", onGlobalError);
+    window.addEventListener("unhandledrejection", onGlobalError);
+    const watchdog = window.setTimeout(() => {
+      if (cancelled) return;
+      const engine = /Chrome\/[\d.]+/.test(navigator.userAgent) ? navigator.userAgent.match(/Chrome\/[\d.]+/)?.[0] : navigator.userAgent.slice(0, 80);
+      onError(`解析超时（卡在：${stage}）${captured.length ? ` · 捕获错误：${captured.join("；")}` : ""} · 内核：${engine}`);
+    }, 30000);
     (async () => {
       const pdfjs = await import("pdfjs-dist");
+      stage = "准备解析内核";
       pdfjs.GlobalWorkerOptions.workerSrc = await pdfWorkerSrcWithPolyfill(pdfWorkerUrl);
+      stage = "下载并解析文档";
       task = pdfjs.getDocument(typeof source === "string" ? { url: source } : { data: source });
       const loaded = await task.promise;
+      stage = "渲染首页";
+      window.clearTimeout(watchdog);
       if (!cancelled) {
         setPdf(loaded);
         onPdfReady?.(loaded);
@@ -1220,6 +1239,9 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
     return () => {
       cancelled = true;
       destroyedRef.current = true;
+      window.clearTimeout(watchdog);
+      window.removeEventListener("error", onGlobalError);
+      window.removeEventListener("unhandledrejection", onGlobalError);
       onPdfReady?.(null);
       task?.destroy?.();
     };

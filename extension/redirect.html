@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>检测到 PDF — 文枢</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #f4f5f7;
+      color: #1f2329;
+    }
+    .card {
+      width: 360px;
+      max-width: calc(100vw - 48px);
+      padding: 28px 28px 20px;
+      background: #fff;
+      border-radius: 14px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.12);
+      text-align: center;
+    }
+    .logo {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+    }
+    h1 {
+      margin: 12px 0 6px;
+      font-size: 17px;
+      font-weight: 600;
+    }
+    .url {
+      margin: 0 0 20px;
+      font-size: 13px;
+      color: #8a8f99;
+      word-break: break-all;
+    }
+    .actions {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    button {
+      padding: 10px 16px;
+      font-size: 14px;
+      border-radius: 8px;
+      border: 1px solid #d9dce1;
+      background: #fff;
+      color: #1f2329;
+      cursor: pointer;
+    }
+    button:hover { border-color: #b3b8c0; }
+    button.primary {
+      background: #2f6fed;
+      border-color: #2f6fed;
+      color: #fff;
+    }
+    button.primary:hover { background: #275fd1; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .tip {
+      margin: 16px 0 0;
+      font-size: 12px;
+      color: #a0a5ae;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #17181a; color: #e8eaed; }
+      .card { background: #232427; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4); }
+      button { background: #2a2c30; border-color: #3c3f45; color: #e8eaed; }
+      button:hover { border-color: #54585f; }
+      button.primary { background: #3b74e7; border-color: #3b74e7; color: #fff; }
+      .url { color: #9aa0a8; }
+      .tip { color: #7d828a; }
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <img class="logo" src="icons/icon-192.png" alt="" />
+    <h1>检测到 PDF 文档</h1>
+    <p class="url" id="url"></p>
+    <div class="actions">
+      <button id="open-reader" class="primary" type="button">在文枢中打开</button>
+      <button id="open-original" type="button">直接查看原文件</button>
+    </div>
+    <p class="tip">需要登录或无需解析的 PDF，选「直接查看原文件」。</p>
+  </main>
+  <!-- MV3 扩展页面 CSP 禁止内联脚本，逻辑在外部 redirect.js 里 -->
+  <script src="redirect.js"></script>
+</body>
+</html>

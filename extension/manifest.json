@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "文枢 Wenshu — PDF 自动打开",
-  "version": "0.1.0",
-  "description": "在网页中打开 PDF 时，自动跳转到文枢阅读器解析阅读；也可右键链接选择在文枢中打开。",
+  "name": "文枢 Wenshu — PDF 阅读助手",
+  "version": "0.2.0",
+  "description": "打开网页 PDF 时先询问：在文枢阅读器解析，或直接查看原文件；也可右键链接手动打开。",
   "permissions": ["declarativeNetRequest", "declarativeNetRequestWithHostAccess", "contextMenus", "tabs"],
   "host_permissions": ["<all_urls>"],
   "background": {
@@ -18,13 +18,10 @@
     "192": "icons/icon-192.png",
     "512": "icons/icon-512.png"
   },
-  "declarative_net_request": {
-    "rule_resources": [
-      {
-        "id": "pdf_redirect",
-        "enabled": true,
-        "path": "rules.json"
-      }
-    ]
-  }
+  "web_accessible_resources": [
+    {
+      "resources": ["redirect.html"],
+      "matches": ["<all_urls>"]
+    }
+  ]
 }

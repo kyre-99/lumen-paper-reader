@@ -3062,9 +3062,20 @@ export default function Home() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      // /api/session 是登录状态确认的唯一来源：它失败/超时时绝不能让 authReady 永远停在
+      // false，否则页面卡在"正在确认登录状态"无限转圈。按未登录处理，让用户能进登录页重试
+      let sessionChecked = false;
       try {
-        const sessionResponse = await fetch("/api/session", { cache: "no-store" });
+        const controller = new AbortController();
+        const sessionTimer = window.setTimeout(() => controller.abort(), 15000);
+        let sessionResponse: Response;
+        try {
+          sessionResponse = await fetch("/api/session", { cache: "no-store", signal: controller.signal });
+        } finally {
+          window.clearTimeout(sessionTimer);
+        }
         const sessionPayload = await sessionResponse.json();
+        sessionChecked = true;
         if (!sessionResponse.ok) {
           if (!cancelled) { setUser(null); setGuestDisabled(Boolean(sessionPayload.guestDisabled)); setTurnstileSite(String(sessionPayload.turnstileSiteKey || "")); setAuthReady(true); setHydrated(true); setSaveStatus("error"); }
           return;
@@ -3141,7 +3152,14 @@ export default function Home() {
         }
         setSaveStatus("saved");
       } catch {
-        if (!cancelled) setSaveStatus("error");
+        if (cancelled) return;
+        setSaveStatus("error");
+        if (!sessionChecked) {
+          // 会话校验本身失败（断网/超时/服务异常）：按未登录展示登录页并提示，避免无限转圈
+          setUser(null);
+          setAuthMessage("暂时无法确认登录状态，请检查网络后刷新重试");
+          setAuthReady(true);
+        }
       } finally {
         if (!cancelled) setHydrated(true);
       }

@@ -25,6 +25,7 @@ export async function GET() {
       sourceKind: papers.sourceKind,
       sourceUrl: papers.sourceUrl,
       pageCount: papers.pageCount,
+      paperText: papers.paperText,
       status: papers.status,
       rating: papers.rating,
       createdAt: papers.createdAt,
@@ -68,10 +69,11 @@ export async function GET() {
   }
 
   // 带上每篇论文的"上次阅读时间"（从未读过为 null），并按 最近阅读 ?? 更新时间 ?? 创建时间 倒序排
+  // paperText 不落给前端（体积太大），只带 hasText 布尔位，用于识别"从未打开成功"的失败记录
   const result = library.map((paper) => {
-    const { metaCheckedAt: _metaCheckedAt, ...rest } = paper;
+    const { metaCheckedAt: _metaCheckedAt, paperText, ...rest } = paper;
     void _metaCheckedAt;
-    return { ...rest, lastReadAt: lastReadByPaperId.get(paper.id) ?? null };
+    return { ...rest, hasText: Boolean(paperText), lastReadAt: lastReadByPaperId.get(paper.id) ?? null };
   });
   const stamp = (paper: (typeof result)[number]) => Date.parse(paper.lastReadAt || paper.updatedAt || paper.createdAt) || 0;
   result.sort((a, b) => stamp(b) - stamp(a));

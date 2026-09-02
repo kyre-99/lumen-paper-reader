@@ -197,7 +197,7 @@ const PAPER_STATUS_OPTIONS: Array<{ value: PaperStatus; label: string }> = [
   { value: "reading", label: "阅读中" },
   { value: "done", label: "已阅读" },
 ];
-type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; authors: string; publishedAt: string; lastReadAt: string | null; sourceKind: PaperSourceKind; sourceUrl: string | null; pageCount: number; status: PaperStatus; rating: number; createdAt: string; updatedAt: string };
+type LibraryPaper = { id: string; folderId: string | null; title: string; meta: string; authors: string; publishedAt: string; lastReadAt: string | null; sourceKind: PaperSourceKind; sourceUrl: string | null; pageCount: number; hasText: boolean; status: PaperStatus; rating: number; createdAt: string; updatedAt: string };
 type LibraryFolder = { id: string; name: string; parentId: string | null; createdAt?: string; updatedAt: string };
 type DiaryEntry = { id: string; day: string; title: string; content: string; updatedAt: string };
 type UsageStats = {
@@ -301,6 +301,13 @@ function normalizePaperUrl(raw: string) {
   const arxiv = trimmed.match(/arxiv\.org\/(?:abs|html|pdf)\/([^?#/]+)/i);
   if (arxiv) return `https://arxiv.org/pdf/${arxiv[1]}`;
   return trimmed;
+}
+
+// 远程论文"从未打开成功"的判定：没拿到正文且页数仍是初始值 1（页数只在真实载入后写入）。
+// 用于同链接重开时自动清理失败记录、按新论文重新解析——否则死记录会永远挡住同链接去重，
+// 用户只能手动删掉旧记录再找链接。特例：1 页且无文本的远程扫描件会被误判，可接受
+function isFailedRemotePaper(paper: LibraryPaper) {
+  return paper.sourceKind === "remote" && (paper.pageCount || 1) <= 1 && !paper.hasText;
 }
 
 function normalizedDocumentTitle(raw: unknown) {
@@ -2329,6 +2336,7 @@ export default function Home() {
   // 深链消费 effect 通过 ref 调用 openUrl（定义在组件后部），避免前向引用
   const openUrlRef = useRef<(url: string) => void>(() => {});
   const openLibraryPaperRef = useRef<(id: string) => Promise<void>>(async () => {});
+  const retryFailedRemotePaperRef = useRef<(paper: { id: string; sourceUrl: string | null }) => void>(() => {});
   const [accountOpen, setAccountOpen] = useState(false);
   const [fontMenuOpen, setFontMenuOpen] = useState(false);
   const [saveStatus, setSaveStatus] = useState<"loading" | "saved" | "saving" | "error" | "dirty">("loading");
@@ -3036,6 +3044,11 @@ export default function Home() {
           setLibraryFolders(Array.isArray(payload.folders) ? payload.folders : []);
           const existing = papers.find((paper: LibraryPaper) => paper.sourceUrl === pending);
           if (existing) {
+            // 从未打开成功的失败记录：走 ref 直接清理重试，不依赖尚未刷新的 libraryPapers 状态
+            if (isFailedRemotePaper(existing)) {
+              void retryFailedRemotePaperRef.current(existing);
+              return;
+            }
             setToast({ text: "这篇论文已在文库中，已为你打开原有记录" });
             await openLibraryPaperRef.current(existing.id);
             return;
@@ -3075,11 +3088,17 @@ export default function Home() {
         }
         const workspace = workspacePayload.workspace;
         if (workspace?.paper) {
+          const paper = workspace.paper;
+          // 活动论文是"从未打开成功"的远程记录：不恢复错误占位，直接重新解析（同链接重开/点文库条目同一条逻辑）
+          if (paper.sourceKind === "remote" && paper.sourceUrl && !paper.paperText && (paper.pageCount || 1) <= 1) {
+            setSaveStatus("saved");
+            retryFailedRemotePaperRef.current({ id: paper.id, sourceUrl: paper.sourceUrl });
+            return;
+          }
           setEmbeddingIndex(workspace.embeddingIndex === "ready" || workspace.embeddingIndex === "building" ? workspace.embeddingIndex : "missing");
           restoringWorkspaceRef.current = true;
           suppressDirtyRef.current = true;
           clearPaperAnnotations();
-          const paper = workspace.paper;
           const restoredMessages: ChatMessage[] = Array.isArray(workspace.messages) && workspace.messages.length ? workspace.messages : [{ id: Date.now(), role: "assistant", content: "已恢复这篇论文的阅读记录。" }];
           const restoredAnnotations: Annotation[] = (Array.isArray(workspace.annotations) ? workspace.annotations : []).map((item: Annotation) => ({ ...item, loading: false, draft: "", thread: Array.isArray(item.thread) ? item.thread : [], pageNumber: item.pageNumber || 1 }));
           const restoredConversations: SavedConversation[] = Array.isArray(workspace.conversations) ? workspace.conversations : [];
@@ -4589,6 +4608,11 @@ export default function Home() {
       if (!response.ok || !payload.workspace?.paper) throw new Error(payload.error || "论文记录不存在");
       const workspace = payload.workspace;
       const paper = workspace.paper;
+      // 从未打开成功的远程记录（无正文、页数还是初始值 1）：点它就直接重新解析，而不是恢复出错误占位页
+      if (paper.sourceKind === "remote" && paper.sourceUrl && !paper.paperText && (paper.pageCount || 1) <= 1) {
+        retryFailedRemotePaperRef.current({ id: paper.id, sourceUrl: paper.sourceUrl });
+        return;
+      }
       setEmbeddingIndex(workspace.embeddingIndex === "ready" || workspace.embeddingIndex === "building" ? workspace.embeddingIndex : "missing");
       restoringWorkspaceRef.current = true;
       suppressDirtyRef.current = true;
@@ -4640,28 +4664,12 @@ export default function Home() {
 
   useEffect(() => { openLibraryPaperRef.current = openLibraryPaper; });
 
-  const openUrl = (raw: string) => {
-    const normalized = normalizePaperUrl(raw);
-    if (!/^https?:\/\//i.test(normalized)) { setToast({ text: "请输入有效的公开链接", kind: "error" }); return; }
-    let parsed: URL;
-    try {
-      parsed = new URL(normalized);
-    } catch {
-      setToast({ text: "链接格式不正确", kind: "error" });
-      return;
-    }
-    // 同链接去重：已在文库里的论文直接打开原有记录，保留阅读进度、对话和批注
-    const existingByUrl = libraryPapers.find((paper) => paper.sourceUrl === normalized);
-    if (existingByUrl) {
-      setOpenModal(false);
-      setToast({ text: "这篇论文已在文库中，已为你打开原有记录" });
-      void openLibraryPaper(existingByUrl.id);
-      return;
-    }
+  // 按全新远程论文解析（openUrl 去重命中失败记录时的共同出口；reuseId 复用原记录 id）
+  const openRemoteFresh = (normalized: string, parsed: URL, reuseId?: string) => {
     void performSave("background"); // 切换前先把当前论文存掉
     restoringWorkspaceRef.current = false;
     clearPaperAnnotations();
-    setPaperId(crypto.randomUUID());
+    setPaperId(reuseId ?? crypto.randomUUID());
     setEmbeddingIndex("missing");
     setPaperStatus("unread");
     setPaperSourceKind("remote");
@@ -4682,6 +4690,41 @@ export default function Home() {
     setHistoryOpen(false);
     setOpenModal(false);
     setToast({ text: "论文已加入阅读区" });
+  };
+
+  // 失败记录重开：复用原记录 id 原地重新解析，而不是删了重建——删除后几秒内落盘的
+  // 自动保存还带着旧快照，会把记录重新 upsert 回来，导致同一链接留下两条死记录。
+  // 参数只取 id/sourceUrl，便于文库点击与刷新恢复路径直接构造
+  const retryFailedRemotePaper = (paper: { id: string; sourceUrl: string | null }) => {
+    const normalized = paper.sourceUrl;
+    if (!normalized) return;
+    setToast({ text: "之前的记录打开失败，正在重新解析" });
+    openRemoteFresh(normalized, new URL(normalized), paper.id);
+  };
+
+  useEffect(() => { retryFailedRemotePaperRef.current = retryFailedRemotePaper; });
+
+  const openUrl = (raw: string) => {
+    const normalized = normalizePaperUrl(raw);
+    if (!/^https?:\/\//i.test(normalized)) { setToast({ text: "请输入有效的公开链接", kind: "error" }); return; }
+    let parsed: URL;
+    try {
+      parsed = new URL(normalized);
+    } catch {
+      setToast({ text: "链接格式不正确", kind: "error" });
+      return;
+    }
+    // 同链接去重：已在文库里的论文直接打开原有记录，保留阅读进度、对话和批注；
+    // 但从未打开成功的失败记录不能原样恢复（只会再失败一次），原地重置后重新解析
+    const existingByUrl = libraryPapers.find((paper) => paper.sourceUrl === normalized);
+    if (existingByUrl) {
+      if (isFailedRemotePaper(existingByUrl)) { retryFailedRemotePaper(existingByUrl); return; }
+      setOpenModal(false);
+      setToast({ text: "这篇论文已在文库中，已为你打开原有记录" });
+      void openLibraryPaper(existingByUrl.id);
+      return;
+    }
+    openRemoteFresh(normalized, parsed);
   };
 
   // 深链 effect 通过 ref 调用 openUrl：保持依赖稳定，不在每次渲染重建

@@ -456,6 +456,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .color-picker button { width: 19px; height: 19px; min-width: 19px; padding: 0; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 0 1px #ccd2cf; cursor: pointer; transition: transform .16s var(--ease-spring), box-shadow .16s var(--ease-out); }
 .color-picker button:hover { transform: scale(1.25); box-shadow: 0 0 0 2px #9fb8ae; }
 .color-picker button.yellow { background: #f2cc52; }.color-picker button.green { background: #68ba97; }.color-picker button.blue { background: #6ca9df; }.color-picker button.rose { background: #dd8298; }
+.color-picker .color-picker-custom-wrap { position: relative; display: inline-grid; place-items: center; width: 19px; height: 19px; min-width: 19px; transition: transform .16s var(--ease-spring); }
+.color-picker .color-picker-custom-wrap:hover { transform: scale(1.25); }
+/* "+" 提示层：pointer-events 置空，点击穿透到下面的取色控件 */
+.color-picker .color-picker-custom-wrap::after { content: "+"; position: absolute; inset: 0; display: grid; place-items: center; font-size: 11px; font-weight: 600; line-height: 1; color: #fff; text-shadow: 0 0 3px rgba(0,0,0,.6); pointer-events: none; }
+.color-picker .color-picker-custom { width: 19px; height: 19px; min-width: 19px; padding: 0; border: 2px solid white; border-radius: 50%; box-shadow: 0 0 0 1px #ccd2cf; cursor: pointer; background: none; overflow: hidden; transition: box-shadow .16s var(--ease-out); }
+.color-picker .color-picker-custom:hover { box-shadow: 0 0 0 2px #9fb8ae; }
+.color-picker .color-picker-custom::-webkit-color-swatch-wrapper { padding: 0; }
+.color-picker .color-picker-custom::-webkit-color-swatch { border: none; border-radius: 50%; }
 
 .annotation-pin { position: absolute; z-index: 21; width: 27px; height: 27px; display: grid; place-items: center; transform: translateY(-50%); border: 2px solid rgba(255,255,255,.72); border-radius: 50% 50% 50% 4px; color: #35403b; box-shadow: 0 5px 14px rgba(26,39,33,.14); cursor: grab; touch-action: none; opacity: .68; transition: opacity .18s var(--ease-out), transform .22s var(--ease-spring), box-shadow .2s var(--ease-out); animation: pin-in .34s var(--ease-spring) both; }
 @keyframes pin-in { from { opacity: 0; transform: translateY(-50%) scale(.4); } }
@@ -1184,6 +1192,7 @@ html[data-theme="dark"] .inline-card > footer button:hover { background: var(--d
 html[data-theme="dark"] .color-picker { background: var(--d-card); border-color: #3a453f; box-shadow: 0 10px 30px rgba(0,0,0,.5); }
 html[data-theme="dark"] .color-picker::before { background: var(--d-card); border-left-color: #3a453f; border-top-color: #3a453f; }
 html[data-theme="dark"] .color-picker button { border-color: var(--d-card); }
+html[data-theme="dark"] .color-picker .color-picker-custom { border-color: var(--d-card); }
 
 /* 弹层（设置 / 文库 / 用量 / 统计 / 快捷键帮助） */
 html[data-theme="dark"] .modal-backdrop { background: rgba(8,11,9,.55); }

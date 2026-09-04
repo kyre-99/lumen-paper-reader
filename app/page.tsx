@@ -141,8 +141,46 @@ async function consumeChatStream(response: Response, handlers: { onStep?: (label
   if (failed) throw new Error(failed);
 }
 type ToolAction = "translate" | "explain" | "ask" | "formula" | "figure";
-type HighlightColor = "yellow" | "green" | "blue" | "rose";
-const HIGHLIGHT_COLOR_LABELS: Record<HighlightColor, string> = { yellow: "黄色", green: "绿色", blue: "蓝色", rose: "玫红色" };
+type PresetHighlightColor = "yellow" | "green" | "blue" | "rose";
+// 自定义色存为 "c-rrggbb"（不带 #），保证能安全用于 CSS 类名与 ::highlight 注册名
+type HighlightColor = PresetHighlightColor | `c-${string}`;
+const HIGHLIGHT_COLOR_LABELS: Record<PresetHighlightColor, string> = { yellow: "黄色", green: "绿色", blue: "蓝色", rose: "玫红色" };
+const PRESET_HIGHLIGHT_COLORS: PresetHighlightColor[] = ["yellow", "green", "blue", "rose"];
+
+function isCustomHighlightColor(color: HighlightColor): color is `c-${string}` {
+  return color.startsWith("c-");
+}
+function highlightColorLabel(color: HighlightColor) {
+  return HIGHLIGHT_COLOR_LABELS[color as PresetHighlightColor] ?? "自定义";
+}
+function customColorHex(color: HighlightColor) {
+  return isCustomHighlightColor(color) ? `#${color.slice(2)}` : null;
+}
+function hexToRgba(hex: string, alpha: number) {
+  const match = /^#?([0-9a-f]{6})$/i.exec(hex);
+  if (!match) return null;
+  const n = parseInt(match[1], 16);
+  return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+
+// 自定义高亮色取色控件。注意：React 的 onChange 在 input[type=color] 上对应原生 input
+// 事件（取色弹窗里拖动会连续触发），一触发就关菜单会把弹窗连带销毁；原生 change 只在
+// 弹窗关闭时触发一次，所以这里用 ref 直接监听原生 change。defaultValue + 外部 key 控制重挂载
+function CustomHighlightColorInput({ value, onPick, onPrepare }: { value: string; onPick: (hex: string) => void; onPrepare: () => void }) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    const handler = () => onPick(el.value);
+    el.addEventListener("change", handler);
+    return () => el.removeEventListener("change", handler);
+  }, [onPick]);
+  return (
+    <span className="color-picker-custom-wrap">
+      <input ref={inputRef} type="color" defaultValue={value} className="color-picker-custom" aria-label="自定义颜色高亮" title="自定义颜色" onMouseDown={onPrepare} />
+    </span>
+  );
+}
 type Annotation = {
   id: number;
   kind: ToolAction | "highlight" | "text-note";
@@ -2515,6 +2553,15 @@ export default function Home() {
   const [pdfContextMenu, setPdfContextMenu] = useState<{ x: number; y: number; pageNumber: number; pageX: number; pageY: number } | null>(null);
   const [selectionAnchor, setSelectionAnchor] = useState<{ top: number; left: number; cardTop: number; cardLeft: number; pageNumber: number } | null>(null);
   const [showColors, setShowColors] = useState(false);
+  // 自定义高亮色：记住上次选择，跨会话持久化到 localStorage
+  const [customHighlightColor, setCustomHighlightColor] = useState(() => {
+    try { return typeof window !== "undefined" ? localStorage.getItem("lumen-custom-highlight-color") || "#a78bfa" : "#a78bfa"; } catch { return "#a78bfa"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("lumen-custom-highlight-color", customHighlightColor); } catch { /* 隐私模式下静默 */ }
+  }, [customHighlightColor]);
+  // 自定义取色弹窗打开期间浏览器可能收掉划词选区：点取色钮时先暂存，取色完成后按快照创建
+  const pendingHighlightSelectionRef = useRef<{ text: string; context: string; anchor: NonNullable<typeof selectionAnchor>; range: Range } | null>(null);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [paperText, setPaperText] = useState(demoParagraphs.map((item) => `${item.heading || ""}\n${item.body}`).join("\n\n"));
   const [extractingText, setExtractingText] = useState(false);
@@ -3394,19 +3441,31 @@ export default function Home() {
     if (stream && chatStickRef.current) stream.scrollTop = stream.scrollHeight;
   }, [messages, loading, statusText]);
 
-  const refreshHighlights = useCallback((color: HighlightColor) => {
-    if (!(CSS as any).highlights || !(window as any).Highlight) return;
-    if (!document.getElementById("lumen-highlight-styles")) {
-      const style = document.createElement("style");
+  // ::highlight 规则注入：预设色一次性写入；自定义色按需追加（"c-rrggbb" → lumen-c-rrggbb）
+  const injectedCustomHighlightColorsRef = useRef(new Set<string>());
+  const ensureHighlightRule = useCallback((color: HighlightColor) => {
+    let style = document.getElementById("lumen-highlight-styles") as HTMLStyleElement | null;
+    if (!style) {
+      style = document.createElement("style");
       style.id = "lumen-highlight-styles";
       style.textContent = "::highlight(lumen-yellow){background:rgba(244,207,86,.30)}::highlight(lumen-green){background:rgba(100,190,151,.26)}::highlight(lumen-blue){background:rgba(104,168,226,.24)}::highlight(lumen-rose){background:rgba(226,126,151,.22)}";
       document.head.appendChild(style);
     }
+    if (!isCustomHighlightColor(color) || injectedCustomHighlightColorsRef.current.has(color)) return;
+    const rgba = hexToRgba(customColorHex(color) || "", 0.28);
+    if (!rgba) return;
+    style.textContent += `::highlight(lumen-${color}){background:${rgba}}`;
+    injectedCustomHighlightColorsRef.current.add(color);
+  }, []);
+
+  const refreshHighlights = useCallback((color: HighlightColor) => {
+    if (!(CSS as any).highlights || !(window as any).Highlight) return;
+    ensureHighlightRule(color);
     const ranges = [...annotationRangesRef.current.entries()].filter(([id, item]) => item.color === color && (item.persistent || activeRangeIdsRef.current.has(id))).map(([, item]) => item.range);
     const name = `lumen-${color}`;
     if (ranges.length) (CSS as any).highlights.set(name, new (window as any).Highlight(...ranges));
     else (CSS as any).highlights.delete(name);
-  }, []);
+  }, [ensureHighlightRule]);
 
   const addAnnotationRange = useCallback((id: number, range: Range, color: HighlightColor, persistent: boolean) => {
     annotationRangesRef.current.set(id, { range: range.cloneRange(), color, persistent });
@@ -3787,18 +3846,24 @@ export default function Home() {
     setCitationFlash([]);
   }
 
-  const createAnnotation = useCallback((kind: ToolAction | "highlight", color: HighlightColor = "green") => {
-    if (!selectedText || !selectionAnchor || !selectionRangeRef.current) return;
+  // 划词选区快照：自定义取色弹窗打开期间浏览器可能收掉选区，取色完成后用暂存的快照创建高亮
+  type SelectionSnapshot = { text: string; context: string; anchor: NonNullable<typeof selectionAnchor>; range: Range };
+  const createAnnotation = useCallback((kind: ToolAction | "highlight", color: HighlightColor = "green", snapshot?: SelectionSnapshot) => {
+    const text = snapshot?.text ?? selectedText;
+    const context = snapshot?.context ?? selectionContext;
+    const anchor = snapshot?.anchor ?? selectionAnchor;
+    const range = snapshot?.range ?? selectionRangeRef.current;
+    if (!text || !anchor || !range) return;
     const id = Date.now() + Math.floor(Math.random() * 1000);
-    const annotation: Annotation = { id, kind, color, text: selectedText, surrounding: selectionContext, ...selectionAnchor, pinOffsetX: 0, pinOffsetY: 0, cardOffsetX: selectionAnchor.cardLeft - selectionAnchor.left, cardOffsetY: selectionAnchor.cardTop - selectionAnchor.top, open: kind !== "highlight", loading: false, result: "", draft: "", thread: [], fresh: true };
-    annotationAnchorsRef.current.set(id, { top: selectionAnchor.top, left: selectionAnchor.left });
-    addAnnotationRange(id, selectionRangeRef.current, color, kind === "highlight");
+    const annotation: Annotation = { id, kind, color, text, surrounding: context, ...anchor, pinOffsetX: 0, pinOffsetY: 0, cardOffsetX: anchor.cardLeft - anchor.left, cardOffsetY: anchor.cardTop - anchor.top, open: kind !== "highlight", loading: false, result: "", draft: "", thread: [], fresh: true };
+    annotationAnchorsRef.current.set(id, { top: anchor.top, left: anchor.left });
+    addAnnotationRange(id, range, color, kind === "highlight");
     setAnnotations((items) => [...items, annotation]);
     setSelectionPos(null);
     setSelectionRects([]);
     setShowColors(false);
     window.getSelection()?.removeAllRanges();
-    if (kind === "translate" || kind === "explain") void requestInlineAnswer(id, kind, selectedText, selectionContext);
+    if (kind === "translate" || kind === "explain") void requestInlineAnswer(id, kind, text, context);
     if (kind !== "highlight") window.setTimeout(() => flashAnnotationRange(id), 0);
     setSelectedText("");
     setSelectionContext("");
@@ -4048,7 +4113,8 @@ export default function Home() {
     setFlashedFormulaIds(new Set());
     annotationRangesRef.current.clear();
     annotationAnchorsRef.current.clear();
-    if ((CSS as any).highlights) (["yellow", "green", "blue", "rose"] as HighlightColor[]).forEach((color) => (CSS as any).highlights.delete(`lumen-${color}`));
+    const highlightRegistry = (CSS as any).highlights as Map<string, unknown> | undefined;
+    if (highlightRegistry) for (const key of [...highlightRegistry.keys()]) { if (key.startsWith("lumen-")) highlightRegistry.delete(key); }
     setAnnotations([]);
     setSelectedText("");
     setSelectionPos(null);
@@ -5110,9 +5176,9 @@ export default function Home() {
           ) : (
             <React.Fragment key={annotation.id}>
               <button
-                className={`annotation-pin ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`}
+                className={`annotation-pin ${isCustomHighlightColor(annotation.color) ? "custom" : annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`}
                 data-annotation-id={annotation.id}
-                style={{ top: annotation.top, left: annotation.left }}
+                style={{ top: annotation.top, left: annotation.left, ...(isCustomHighlightColor(annotation.color) ? { background: customColorHex(annotation.color) ?? "#a78bfa" } : {}) }}
                 onPointerDown={(event) => startAnnotationDrag(event, annotation, "pin")}
                 onClick={() => annotation.open ? closeAnnotation(annotation) : openAnnotationFromPin(annotation)}
                 aria-label="打开原文旁批注"
@@ -5121,7 +5187,7 @@ export default function Home() {
                 {annotation.kind === "translate" ? <Languages size={14} /> : annotation.kind === "figure" ? <Scan size={14} /> : annotation.kind === "formula" || annotation.kind === "explain" ? <Sparkles size={14} /> : annotation.kind === "ask" ? <MessageSquareText size={14} /> : <Highlighter size={14} />}
               </button>
               {annotation.open && (
-                <section className={`inline-card ${annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`} data-annotation-id={annotation.id} style={{ top: annotation.cardTop, left: annotation.cardLeft, width: annotation.cardWidth, ...(annotation.cardHeight ? { height: annotation.cardHeight, maxHeight: "none" as const } : {}) }} onMouseDown={(event) => event.stopPropagation()}>
+                <section className={`inline-card ${isCustomHighlightColor(annotation.color) ? "custom" : annotation.color} ${draggingId === annotation.id ? "dragging" : ""}`} data-annotation-id={annotation.id} style={{ top: annotation.cardTop, left: annotation.cardLeft, width: annotation.cardWidth, ...(annotation.cardHeight ? { height: annotation.cardHeight, maxHeight: "none" as const } : {}), ...(isCustomHighlightColor(annotation.color) ? { borderTopColor: customColorHex(annotation.color) ?? undefined } : {}) }} onMouseDown={(event) => event.stopPropagation()}>
                   <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")} title="拖动移动悬浮卡片">
                     <div className="inline-card-title">
                       <MoreHorizontal className="drag-grip" size={15} />
@@ -5147,7 +5213,7 @@ export default function Home() {
                       <button className="vision-hint-close" onClick={dismissVisionHint} aria-label="不再提醒"><X size={12} /></button>
                     </div>
                   )}
-                  {annotation.kind === "highlight" && <><p className="highlight-saved"><Check size={14} />已保存为{annotation.color === "yellow" ? "黄色" : annotation.color === "green" ? "绿色" : annotation.color === "blue" ? "蓝色" : "玫红色"}高亮</p><label className="highlight-note"><span>个人批注</span><textarea value={annotation.note || ""} onChange={(event) => updateAnnotation(annotation.id, { note: event.target.value })} placeholder="记录你对这段内容的想法…" rows={3} /></label></>}
+                  {annotation.kind === "highlight" && <><p className="highlight-saved"><Check size={14} />已保存为{highlightColorLabel(annotation.color)}高亮</p><label className="highlight-note"><span>个人批注</span><textarea value={annotation.note || ""} onChange={(event) => updateAnnotation(annotation.id, { note: event.target.value })} placeholder="记录你对这段内容的想法…" rows={3} /></label></>}
                   {annotation.thread.length > 0 && <div className="inline-thread">{annotation.thread.map((message) => <div key={message.id} className={`inline-message ${message.role}`}>{message.role === "assistant" ? <MarkdownContent content={message.content} compact maxPage={pageCount} onPageJump={handlePageJump} /> : <p>{message.content}</p>}{message.failed && !annotation.loading && <button className="inline-retry" onClick={() => retryInlineAnswer(annotation)}><RotateCcw size={11} />重试</button>}</div>)}</div>}
                   {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />{annotation.loadingLabel || "正在结合相邻段落分析…"}</div>}
                   {annotation.kind !== "highlight" && !annotation.loading && (
@@ -5207,7 +5273,7 @@ export default function Home() {
               <div className="notes-list">
                 {visibleNotes.map((annotation) => (
                   <div key={annotation.id} className="note-row" role="button" tabIndex={0} title="跳到原文位置" onClick={() => jumpToAnnotation(annotation)} onKeyDown={(event) => { if (event.key === "Enter") jumpToAnnotation(annotation); }}>
-                    <span className={`note-dot ${annotation.color}`} />
+                    <span className={`note-dot ${isCustomHighlightColor(annotation.color) ? "" : annotation.color}`} style={isCustomHighlightColor(annotation.color) ? { background: customColorHex(annotation.color) ?? undefined } : undefined} />
                     <div className="note-row-body">
                       <div className="note-row-head"><strong>{ANNOTATION_KIND_LABELS[annotation.kind]}</strong><span>第 {annotation.pageNumber} 页</span></div>
                       <p>{(annotation.kind === "text-note" ? annotation.note : annotation.text || annotation.result)?.replace(/\s+/g, " ").trim() || "（暂无内容）"}</p>
@@ -5294,7 +5360,7 @@ export default function Home() {
           <button onClick={() => setShowColors(!showColors)} className={showColors ? "active" : ""}><Palette size={15} />高亮</button>
           <span />
           <button className="menu-icon" aria-label="复制" onClick={async () => { await navigator.clipboard.writeText(selectedText); setCopied(true); setTimeout(() => setCopied(false), 1000); }}>{copied ? <Check size={15} /> : <Copy size={15} />}</button>
-          {showColors && <div className="color-picker" aria-label="选择高亮颜色">{(["yellow", "green", "blue", "rose"] as HighlightColor[]).map((color) => <button key={color} className={color} aria-label={`${HIGHLIGHT_COLOR_LABELS[color]}高亮`} onClick={() => createAnnotation("highlight", color)} />)}</div>}
+          {showColors && <div className="color-picker" aria-label="选择高亮颜色">{PRESET_HIGHLIGHT_COLORS.map((color) => <button key={color} className={color} aria-label={`${HIGHLIGHT_COLOR_LABELS[color]}高亮`} onClick={() => createAnnotation("highlight", color)} />)}<CustomHighlightColorInput key={customHighlightColor} value={customHighlightColor} onPrepare={() => { pendingHighlightSelectionRef.current = selectedText && selectionAnchor && selectionRangeRef.current ? { text: selectedText, context: selectionContext, anchor: selectionAnchor, range: selectionRangeRef.current } : null; }} onPick={(hex) => { setCustomHighlightColor(hex); const snapshot = pendingHighlightSelectionRef.current ?? undefined; pendingHighlightSelectionRef.current = null; createAnnotation("highlight", `c-${hex.slice(1)}`, snapshot); }} /></div>}
         </div>
       )}
       {citationPopover && (

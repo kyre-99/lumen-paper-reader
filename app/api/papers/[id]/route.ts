@@ -9,12 +9,12 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
   const user = await requireAppUser();
   if (!user) return Response.json({ error: "需要登录" }, { status: 401 });
   const { id } = await params;
-  const payload = await request.json() as { folderId?: unknown; title?: unknown; status?: unknown; rating?: unknown };
+  const payload = await request.json() as { folderId?: unknown; title?: unknown; status?: unknown; rating?: unknown; sourceUrl?: unknown };
   const db = getDb();
   const [paper] = await db.select({ id: papers.id }).from(papers).where(and(eq(papers.id, id), eq(papers.userId, user.id))).limit(1);
   if (!paper) return Response.json({ error: "论文不存在" }, { status: 404 });
 
-  const updates: { folderId?: string | null; title?: string; status?: "unread" | "reading" | "done"; rating?: number; updatedAt: string } = { updatedAt: new Date().toISOString() };
+  const updates: { folderId?: string | null; title?: string; status?: "unread" | "reading" | "done"; rating?: number; sourceUrl?: string; updatedAt: string } = { updatedAt: new Date().toISOString() };
   if (Object.prototype.hasOwnProperty.call(payload, "folderId")) {
     const folderId = payload.folderId ? String(payload.folderId).slice(0, 80) : null;
     if (folderId) {
@@ -37,6 +37,12 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     const rating = Number(payload.rating);
     if (!Number.isInteger(rating) || rating < 0 || rating > 5) return Response.json({ error: "无效的评分" }, { status: 400 });
     updates.rating = rating;
+  }
+  // 换绑论文链接：源站挂掉/失效时给用户一条保留笔记的自救路径。只允许 https（与 /api/pdf 抓取约束一致）
+  if (Object.prototype.hasOwnProperty.call(payload, "sourceUrl")) {
+    const sourceUrl = String(payload.sourceUrl || "").trim();
+    if (!/^https:\/\/\S+$/i.test(sourceUrl) || sourceUrl.length > 2000) return Response.json({ error: "无效的论文链接（仅支持 https）" }, { status: 400 });
+    updates.sourceUrl = sourceUrl;
   }
   await db.update(papers).set(updates).where(and(eq(papers.id, id), eq(papers.userId, user.id)));
   return Response.json({ saved: true, paper: { id, ...updates } });

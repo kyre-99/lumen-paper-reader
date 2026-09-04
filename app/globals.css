@@ -745,6 +745,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .load-error-panel strong { color: #2c3a34; font-size: 14px; }
 .load-error-panel p { margin: 0; color: #8a948f; font-size: 11px; line-height: 1.6; word-break: break-all; }
 .load-error-actions { display: flex; gap: 8px; margin-top: 6px; }
+.load-error-rebind-toggle { margin-top: 4px; font-size: 12px; }
+.load-error-rebind { display: flex; gap: 8px; margin-top: 10px; width: 100%; }
+.load-error-rebind input { flex: 1; min-width: 0; padding: 8px 11px; font-size: 12px; border: 1px solid #dce2df; border-radius: 8px; outline: 0; background: #fcfdfc; color: #344039; }
+.load-error-rebind input:focus { border-color: #8eb4a6; box-shadow: 0 0 0 3px rgba(47,108,91,.08); }
 .library-search { width: 100%; box-sizing: border-box; height: 36px; margin: 0 0 8px; padding: 0 11px; border: 1px solid #dce2df; border-radius: 9px; outline: 0; background: #fcfdfc; color: #344039; font-size: 13px; }
 .library-search:focus { border-color: #8eb4a6; box-shadow: 0 0 0 3px rgba(47,108,91,.08); }
 
@@ -1314,6 +1318,7 @@ html[data-theme="dark"] .load-error-badge { border-color: #5a3626; background: #
 html[data-theme="dark"] .load-error-panel { border-color: #3a453f; background: #1e2421; color: var(--d-text-2); box-shadow: 0 12px 36px rgba(0,0,0,.4); }
 html[data-theme="dark"] .load-error-panel strong { color: var(--ink); }
 html[data-theme="dark"] .load-error-panel p { color: var(--muted); }
+html[data-theme="dark"] .load-error-rebind input { border-color: #3a453f; background: rgba(31,38,34,.9); color: #d7e0da; }
 html[data-theme="dark"] .auth-gate { background: rgba(12,16,13,.82); }
 html[data-theme="dark"] .auth-card { border-color: #3a453f; background: rgba(30,36,33,.96); box-shadow: 0 24px 70px rgba(0,0,0,.55); }
 html[data-theme="dark"] .auth-card p { color: var(--muted); }

@@ -1190,13 +1190,14 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
   // scale=1 的第 1 页尺寸，作为未渲染页占位高度的初始估算（拿到前按 A4 估算）
   const [baseSize, setBaseSize] = useState({ width: 595, height: 842 });
   // 卸载销毁（task.destroy）后，在飞的渲染/取页任务会以 TypeError（transport 置空）拒绝，
-  // 属于正常竞态而非渲染失败，用此标记让错误回调静默
-  const destroyedRef = useRef(false);
+  // 属于正常竞态而非渲染失败。不能只靠"已销毁"布尔位：换源时新 effect 一启动就把标记复位，
+  // 但旧 pdf 仍在 state 里、旧 PdfPage 还在渲染，错误会漏报成"第 N 页渲染失败"。
+  // 用 livePdfRef 记录当前存活文档，错误回调只在页面属于当前文档时才上报
+  const livePdfRef = useRef<unknown>(null);
 
   useEffect(() => {
     let task: any;
     let cancelled = false;
-    destroyedRef.current = false;
     // 加载看门狗：老 WebView 上 pdf.js 可能静默挂住（promise 不 resolve 也不 reject），
     // 30 秒无进展就把当前阶段 + 捕获到的全局错误 + WebView 版本报出来，便于诊断
     let stage = "加载解析引擎";
@@ -1222,6 +1223,7 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
       stage = "渲染首页";
       window.clearTimeout(watchdog);
       if (!cancelled) {
+        livePdfRef.current = loaded;
         setPdf(loaded);
         onPdfReady?.(loaded);
         onReady(loaded.numPages);
@@ -1283,7 +1285,7 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
     })().catch((error) => !cancelled && onError(error?.message || "PDF 加载失败"));
     return () => {
       cancelled = true;
-      destroyedRef.current = true;
+      livePdfRef.current = null;
       window.clearTimeout(watchdog);
       window.removeEventListener("error", onGlobalError);
       window.removeEventListener("unhandledrejection", onGlobalError);
@@ -1297,7 +1299,7 @@ const PdfDocument = React.memo(function PdfDocument({ source, zoom, showFormula,
   if (!pdf) {
     return <div className="pdf-loading"><LoaderCircle className="spin" size={22} /><span>正在解析论文版面…</span></div>;
   }
-  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} baseSize={baseSize} showFormula={showFormula} onFormula={onFormula} onTextLayerReady={onTextLayerReady} onThumbnail={onThumbnail} onRenderError={(page, message) => { if (!destroyedRef.current) onError?.(`第 ${page} 页渲染失败：${message}`); }} registerRef={registerRef} registerThumbRequest={registerThumbRequest} />)}</div>;
+  return <div className="pdf-stack">{Array.from({ length: pdf.numPages }, (_, i) => <PdfPage key={i + 1} pdf={pdf} pageNumber={i + 1} zoom={zoom} baseSize={baseSize} showFormula={showFormula} onFormula={onFormula} onTextLayerReady={onTextLayerReady} onThumbnail={onThumbnail} onRenderError={(page, message) => { if (livePdfRef.current === pdf) onError?.(`第 ${page} 页渲染失败：${message}`); }} registerRef={registerRef} registerThumbRequest={registerThumbRequest} />)}</div>;
 });
 
 // 缩略图窗口化：IntersectionObserver 只给可视区上下约 5 项挂载 <img>，其余保留同尺寸占位（aspect-ratio 固定，布局不抖动）
@@ -2585,6 +2587,10 @@ export default function Home() {
   const dismissReaderTip = useCallback(() => setReaderTipSeen("1"), [setReaderTipSeen]);
   // PDF 加载失败后的阅读区占位态：保留错误信息，由用户选择重新打开或回到演示
   const [loadError, setLoadError] = useState<string | null>(null);
+  // 换绑论文链接（错误页"更换链接"）：原链接失效时的自救路径，复用原记录 id，笔记/对话保留
+  const [rebindOpen, setRebindOpen] = useState(false);
+  const [rebindUrl, setRebindUrl] = useState("");
+  const [rebindBusy, setRebindBusy] = useState(false);
   // 全文文字提取进度（分批并发，每批完成上报）；null 表示无进行中的提取或已完成
   const [extractProgress, setExtractProgress] = useState<{ done: number; total: number } | null>(null);
   const [draggingId, setDraggingId] = useState<number | null>(null);
@@ -4898,6 +4904,31 @@ export default function Home() {
     setLoadError(text || "无法读取这份 PDF");
   }, []);
 
+  // 换绑链接：原链接失效（源站删除/改地址/开始要登录）时给当前论文换个新地址。
+  // 复用原记录 id，笔记/对话/阅读进度全部保留——绝不能走 openRemoteFresh 那套清空逻辑
+  const rebindPaperUrl = async () => {
+    const normalized = normalizePaperUrl(rebindUrl);
+    if (!/^https:\/\//i.test(normalized)) { setToast({ text: "请输入有效的 https 链接", kind: "error" }); return; }
+    if (!paperId || paperSourceKind !== "remote") return;
+    setRebindBusy(true);
+    try {
+      const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sourceUrl: normalized }) });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || "更换链接失败");
+      setPaperSourceUrl(normalized);
+      setLibraryPapers((papers) => papers.map((paper) => paper.id === paperId ? { ...paper, sourceUrl: normalized } : paper));
+      setRebindOpen(false);
+      setLoadError(null);
+      setExtractingText(!paperText);
+      setSource(`/api/pdf?url=${encodeURIComponent(normalized)}`);
+      setToast({ text: "已更换链接，正在重新加载" });
+    } catch (error: unknown) {
+      setToast({ text: errorMessage(error, "更换链接失败"), kind: "error" });
+    } finally {
+      setRebindBusy(false);
+    }
+  };
+
   const startGuestSession = async () => {
     if (guestSubmitting) return;
     setGuestSubmitting(true);
@@ -5154,6 +5185,16 @@ export default function Home() {
                 <button className="primary-button" onClick={() => setOpenModal(true)}>重新打开</button>
                 <button className="secondary-button" onClick={() => setLoadError(null)}>回到演示</button>
               </div>
+              {paperId && paperSourceKind === "remote" && (
+                rebindOpen ? (
+                  <form className="load-error-rebind" onSubmit={(event) => { event.preventDefault(); void rebindPaperUrl(); }}>
+                    <input value={rebindUrl} onChange={(event) => setRebindUrl(event.target.value)} placeholder="粘贴同一篇论文的新链接（https://…）" autoFocus />
+                    <button type="submit" className="primary-button" disabled={rebindBusy}>{rebindBusy ? "更换中…" : "确认更换"}</button>
+                  </form>
+                ) : (
+                  <button className="secondary-button load-error-rebind-toggle" onClick={() => { setRebindUrl(""); setRebindOpen(true); }}>更换链接（保留笔记）</button>
+                )
+              )}
             </div>
           ) : readerWidth > 0 && readerWidth <= 768 ? (
             // 窄屏：演示稿保持 760px 设计宽度，用 CSS zoom 整体缩放到屏宽（zoom 会改变布局尺寸，不留横向滚动空白）

@@ -540,14 +540,39 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px
 .pdf-text-note > header { height: 25px; display: flex; align-items: center; justify-content: space-between; color: rgba(86,70,42,.68); cursor: grab; touch-action: none; user-select: none; }
 .pdf-text-note.dragging > header { cursor: grabbing; }
 .pdf-text-note > header span { display: flex; align-items: center; gap: 4px; font-size: 8px; font-weight: 700; }
-.pdf-text-note > header button { width: 22px; height: 22px; display: grid; place-items: center; border: 0; border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
+.pdf-text-note > header button { width: 27px; height: 27px; display: grid; place-items: center; border: 0; border-radius: 7px; background: transparent; color: inherit; cursor: pointer; }
 .pdf-text-note > header button:hover { background: rgba(116,80,20,.08); }
-.pdf-text-note > textarea { width: 100%; min-height: 52px; resize: both; padding: 2px 3px; border: 0; outline: 0; background: transparent; font-family: ui-sans-serif, sans-serif; line-height: 1.45; }
+.pdf-text-note > textarea { width: 100%; min-height: 52px; max-height: 480px; resize: none; overflow-y: auto; box-sizing: border-box; padding: 2px 3px; border: 0; outline: 0; background: transparent; font-family: ui-sans-serif, sans-serif; line-height: 1.45; }
 .pdf-text-note > textarea::placeholder { color: rgba(112,91,50,.45); }
 .pdf-text-note > footer { display: flex; align-items: center; justify-content: space-between; gap: 7px; padding-top: 5px; border-top: 1px solid rgba(139,106,43,.12); }
 .pdf-text-note > footer label { display: flex; align-items: center; gap: 4px; color: #837458; font-size: 8px; }
 .pdf-text-note > footer select { height: 23px; border: 1px solid rgba(139,106,43,.18); border-radius: 5px; outline: 0; background: rgba(255,255,255,.45); color: #675c48; font-size: 8px; }
 .note-colors { display: flex; gap: 4px; }
+/* 图形标记（方框/圆圈/箭头）：portal 进 .pdf-page，百分比定位。方框/圆圈用 CSS 边框（虚线不变形），整个外框可点选；箭头只有线条可点 */
+.pdf-shape-wrap { position: absolute; z-index: 18; pointer-events: none; }
+.pdf-shape-wrap.rect, .pdf-shape-wrap.ellipse { pointer-events: auto; border: 2.4px solid currentColor; box-sizing: border-box; cursor: pointer; }
+.pdf-shape-wrap.rect { border-radius: 4px; }
+.pdf-shape-wrap.ellipse { border-radius: 50%; }
+.pdf-shape-wrap:is(.rect, .ellipse).dashed { border-style: dashed; }
+.pdf-shape-wrap.selected:is(.rect, .ellipse) { filter: drop-shadow(0 0 3px currentColor); }
+.pdf-shape-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.pdf-shape-svg line { pointer-events: visibleStroke; cursor: pointer; }
+.pdf-shape-wrap.selected .pdf-shape-svg line { filter: drop-shadow(0 0 3px currentColor); }
+.pdf-shape-toolbar { position: absolute; bottom: calc(100% + 7px); left: 0; display: flex; align-items: center; gap: 6px; padding: 5px 7px; border-radius: 9px; background: #fff; border: 1px solid #e0e4e2; box-shadow: 0 8px 24px rgba(20,31,26,.2); pointer-events: auto; white-space: nowrap; animation: pop-in .18s var(--ease-spring) both; }
+.pdf-shape-toolbar > button { width: 16px; height: 16px; min-width: 16px; padding: 0; border: 2px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px #ccd2cf; cursor: pointer; }
+.pdf-shape-toolbar > button.active { box-shadow: 0 0 0 2px #2f6c5b; }
+.pdf-shape-toolbar .color-picker-custom-wrap, .pdf-shape-toolbar .color-picker-custom { width: 16px; height: 16px; min-width: 16px; }
+.pdf-shape-toolbar .pdf-shape-dash, .pdf-shape-toolbar .pdf-shape-delete { width: 22px; height: 22px; min-width: 22px; border: 0; border-radius: 6px; box-shadow: none; background: transparent; display: grid; place-items: center; cursor: pointer; }
+.pdf-shape-toolbar .pdf-shape-dash { color: #78827d; }
+.pdf-shape-toolbar .pdf-shape-dash:hover { background: #f1f3f2; }
+.pdf-shape-toolbar .pdf-shape-dash.active { color: #2f6c5b; background: rgba(47,108,91,.12); box-shadow: none; }
+.pdf-shape-toolbar .pdf-shape-delete { color: #a65a4a; }
+.pdf-shape-toolbar .pdf-shape-delete:hover { background: rgba(180,70,50,.1); }
+/* 拖拽绘制中的预览（fixed 屏幕坐标） */
+.pdf-shape-draft { position: fixed; z-index: 40; pointer-events: none; border: 2px dashed currentColor; border-radius: 4px; }
+.pdf-shape-draft.ellipse { border-radius: 50%; }
+.pdf-shape-draft.arrow { border: none; }
+.reader-viewport.shape-mode { cursor: crosshair; }
 .note-colors button { width: 13px; height: 13px; padding: 0; border: 2px solid transparent; border-radius: 50%; box-shadow: 0 0 0 1px rgba(62,66,63,.16); cursor: pointer; transition: transform .16s var(--ease-spring), box-shadow .16s var(--ease-out); }
 .note-colors button:hover { transform: scale(1.2); }
 .note-colors button.active { border-color: white; box-shadow: 0 0 0 1px currentColor; transform: scale(1.08); }
@@ -1319,6 +1344,8 @@ html[data-theme="dark"] .load-error-panel { border-color: #3a453f; background: #
 html[data-theme="dark"] .load-error-panel strong { color: var(--ink); }
 html[data-theme="dark"] .load-error-panel p { color: var(--muted); }
 html[data-theme="dark"] .load-error-rebind input { border-color: #3a453f; background: rgba(31,38,34,.9); color: #d7e0da; }
+html[data-theme="dark"] .pdf-shape-toolbar { background: var(--d-card); border-color: #3a453f; box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+html[data-theme="dark"] .pdf-shape-toolbar > button { border-color: var(--d-card); }
 html[data-theme="dark"] .auth-gate { background: rgba(12,16,13,.82); }
 html[data-theme="dark"] .auth-card { border-color: #3a453f; background: rgba(30,36,33,.96); box-shadow: 0 24px 70px rgba(0,0,0,.55); }
 html[data-theme="dark"] .auth-card p { color: var(--muted); }

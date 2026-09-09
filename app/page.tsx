@@ -68,8 +68,10 @@ import {
   Zap,
   ZoomIn,
   ZoomOut,
+  Circle,
 } from "lucide-react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { pdfWorkerSrcWithPolyfill } from "./pdf-uint8-polyfill";
 import { DEFAULT_PROMPTS, type PromptConfig } from "./chat-prompts";
@@ -141,6 +143,9 @@ async function consumeChatStream(response: Response, handlers: { onStep?: (label
   if (failed) throw new Error(failed);
 }
 type ToolAction = "translate" | "explain" | "ask" | "formula" | "figure";
+// 图形标记：箭头/方框/圆圈，拖拽绘制在页面上（kind = "shape"）
+type ShapeType = "arrow" | "rect" | "ellipse";
+const SHAPE_TYPE_LABELS: Record<ShapeType, string> = { arrow: "箭头", rect: "方框", ellipse: "圆圈" };
 type PresetHighlightColor = "yellow" | "green" | "blue" | "rose";
 // 自定义色存为 "c-rrggbb"（不带 #），保证能安全用于 CSS 类名与 ::highlight 注册名
 type HighlightColor = PresetHighlightColor | `c-${string}`;
@@ -181,9 +186,74 @@ function CustomHighlightColorInput({ value, onPick, onPrepare }: { value: string
     </span>
   );
 }
+
+// 图形标记的描边色：预设色用比高亮更深的色值（线条要压得住白底），自定义色直接取 hex
+const SHAPE_PRESET_HEX: Record<PresetHighlightColor, string> = { yellow: "#d9a419", green: "#2f8f6b", blue: "#2f6fb3", rose: "#c94f6d" };
+function shapeColorCss(color: HighlightColor) {
+  return customColorHex(color) ?? SHAPE_PRESET_HEX[color as PresetHighlightColor] ?? "#d9a419";
+}
+
+// 单个图形标记：portal 进对应 .pdf-page，全部百分比坐标，缩放/翻页天然自适应。
+// 方框/圆圈用 CSS 边框渲染（虚线不走 SVG dasharray，避免非等比拉伸变形），整个外框可点选；
+// 箭头（旧数据兼容）用 SVG 描边，只有线条本身可点
+function ShapeMark({ annotation, pageEl, selected, customColor, onSelect, onColor, onToggleDash, onDelete }: {
+  annotation: Annotation;
+  pageEl: HTMLElement | null;
+  selected: boolean;
+  customColor: string;
+  onSelect: (id: number) => void;
+  onColor: (id: number, color: HighlightColor) => void;
+  onToggleDash: (id: number) => void;
+  onDelete: (id: number) => void;
+}) {
+  if (!pageEl || annotation.shapeX1 === undefined || annotation.shapeY1 === undefined || annotation.shapeX2 === undefined || annotation.shapeY2 === undefined) return null;
+  const left = Math.min(annotation.shapeX1, annotation.shapeX2) * 100;
+  const top = Math.min(annotation.shapeY1, annotation.shapeY2) * 100;
+  const width = Math.abs(annotation.shapeX2 - annotation.shapeX1) * 100;
+  const height = Math.abs(annotation.shapeY2 - annotation.shapeY1) * 100;
+  const id = annotation.id;
+  const select = (event: React.SyntheticEvent) => { event.stopPropagation(); onSelect(id); };
+  const isArrow = annotation.shapeType === "arrow";
+  return createPortal(
+    <div
+      className={`pdf-shape-wrap ${annotation.shapeType}${annotation.shapeDash ? " dashed" : ""}${selected ? " selected" : ""}`}
+      data-annotation-id={id}
+      style={{ left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%`, color: shapeColorCss(annotation.color) }}
+      onPointerDown={isArrow ? undefined : (event) => event.stopPropagation()}
+      onClick={isArrow ? undefined : select}
+    >
+      {isArrow && (
+        <svg className="pdf-shape-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <marker id={`shape-arrowhead-${id}`} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="3.4" markerHeight="3.4" orient="auto-start-reverse" markerUnits="strokeWidth">
+              <path d="M0,0 L8,4 L0,8 z" fill="currentColor" />
+            </marker>
+          </defs>
+          <line
+            x1={annotation.shapeX1 < annotation.shapeX2 ? 1 : 99} y1={annotation.shapeY1 < annotation.shapeY2 ? 1 : 99}
+            x2={annotation.shapeX1 < annotation.shapeX2 ? 99 : 1} y2={annotation.shapeY1 < annotation.shapeY2 ? 99 : 1}
+            stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeDasharray={annotation.shapeDash ? "7 5" : undefined} vectorEffect="non-scaling-stroke" markerEnd={`url(#shape-arrowhead-${id})`}
+            pointerEvents="visibleStroke" onPointerDown={(event) => event.stopPropagation()} onClick={select}
+          />
+        </svg>
+      )}
+      {selected && (
+        <div className="pdf-shape-toolbar" onPointerDown={(event) => event.stopPropagation()} onMouseDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()}>
+          {PRESET_HIGHLIGHT_COLORS.map((color) => (
+            <button key={color} type="button" className={annotation.color === color ? "active" : ""} style={{ background: SHAPE_PRESET_HEX[color] }} onClick={() => onColor(id, color)} aria-label={`${HIGHLIGHT_COLOR_LABELS[color]}标记`} />
+          ))}
+          <CustomHighlightColorInput key={customColor} value={customColor} onPrepare={() => undefined} onPick={(hex) => onColor(id, `c-${hex.slice(1)}`)} />
+          <button type="button" className={`pdf-shape-dash${annotation.shapeDash ? " active" : ""}`} onClick={() => onToggleDash(id)} aria-label="切换虚线" title={annotation.shapeDash ? "切换为实线" : "切换为虚线"}><MoreHorizontal size={13} /></button>
+          <button type="button" className="pdf-shape-delete" onClick={() => onDelete(id)} aria-label="删除标记" title="删除标记"><Trash2 size={13} /></button>
+        </div>
+      )}
+    </div>,
+    pageEl,
+  );
+}
 type Annotation = {
   id: number;
-  kind: ToolAction | "highlight" | "text-note";
+  kind: ToolAction | "highlight" | "text-note" | "shape";
   color: HighlightColor;
   text: string;
   surrounding: string;
@@ -217,13 +287,20 @@ type Annotation = {
   formulaRegionTop?: number;
   formulaRegionPixelWidth?: number;
   formulaRegionPixelHeight?: number;
+  // 图形标记（kind = "shape"）：归一化页面坐标（0-1），方框/圆圈存对角点；shapeDash 为虚线样式
+  shapeType?: ShapeType;
+  shapeDash?: boolean;
+  shapeX1?: number;
+  shapeY1?: number;
+  shapeX2?: number;
+  shapeY2?: number;
   // 框选图表的截图（dataURL），持久化时会剥离，只保留区域坐标
   figureImage?: string;
   // 本次会话内新建标记：只有新建批注的输入框自动聚焦，恢复工作区渲染的不抢焦点（持久化时剥离）
   fresh?: boolean;
 };
 // 批注类型的中文标签（右侧「笔记」汇总面板用）
-const ANNOTATION_KIND_LABELS: Record<Annotation["kind"], string> = { translate: "翻译", explain: "解释", ask: "提问", formula: "公式", figure: "图表", highlight: "高亮", "text-note": "批注" };
+const ANNOTATION_KIND_LABELS: Record<Annotation["kind"], string> = { translate: "翻译", explain: "解释", ask: "提问", formula: "公式", figure: "图表", highlight: "高亮", "text-note": "批注", shape: "标记" };
 type FormulaAnchor = { text: string; label?: string; pageNumber: number; pageX: number; pageY: number; regionX: number; regionY: number; regionWidth: number; regionHeight: number };
 // 框选图表的选区：region* 为相对页面的归一化坐标，barX/barY 为操作条的屏幕坐标
 type FigureRegionSelection = { pageNumber: number; regionX: number; regionY: number; regionWidth: number; regionHeight: number; barX: number; barY: number };
@@ -361,7 +438,7 @@ function errorMessage(error: unknown, fallback: string) {
 
 // 判断按下位置是否适合直接触发平移：文字上保持划词选择，按钮/输入框/批注卡片保持原有交互，空白区域才允许左键拖动
 function isReaderPanSafeTarget(target: HTMLElement) {
-  return !target.closest(".textLayer span, .demo-paper p, .demo-paper h1, .demo-paper h2, .demo-paper .authors, .demo-paper .formula-card, .inline-card, .pdf-text-note, .citation-popover, .pdf-context-menu, .selection-menu, .figure-lasso-actions, .formula-assist, [class*='annotation'], button, a, input, textarea, select, label, .reader-tip");
+  return !target.closest(".textLayer span, .demo-paper p, .demo-paper h1, .demo-paper h2, .demo-paper .authors, .demo-paper .formula-card, .inline-card, .pdf-text-note, .citation-popover, .pdf-context-menu, .selection-menu, .figure-lasso-actions, .formula-assist, .pdf-shape-wrap, .pdf-shape-toolbar, [class*='annotation'], button, a, input, textarea, select, label, .reader-tip");
 }
 
 function titleFromFirstPage(text: string) {
@@ -373,6 +450,27 @@ function titleFromFirstPage(text: string) {
 function shouldPersistAnnotation(annotation: Annotation) {
   if (annotation.kind !== "translate") return true;
   return annotation.thread.filter((message) => message.role === "user").length > 1;
+}
+
+// PDF 文字批注自适应尺寸：高度随内容增长（封顶后滚动）；内容过高时卡片自动加宽一档再看。
+// 每次都从最小宽度重新评估，删字后能收回来。默认 CSS 宽度 210px 只作初值
+function autoSizeTextNote(el: HTMLTextAreaElement) {
+  const card = el.closest(".pdf-text-note") as HTMLElement | null;
+  if (!card) return;
+  const minWidth = 210;
+  const maxWidth = 430;
+  const growThreshold = 170; // 约 8 行：再高就尝试加宽
+  let width = minWidth;
+  card.style.width = `${width}px`;
+  el.style.height = "52px";
+  let height = el.scrollHeight;
+  while (height > growThreshold && width < maxWidth) {
+    width = Math.min(maxWidth, width + 110);
+    card.style.width = `${width}px`;
+    el.style.height = "52px";
+    height = el.scrollHeight;
+  }
+  el.style.height = `${Math.min(height, 480)}px`;
 }
 
 // 需要持久化的批注序列化，自动保存与水合恢复的快照共用，保证两处结果一致
@@ -2553,6 +2651,23 @@ export default function Home() {
   const [citationFlash, setCitationFlash] = useState<SelectionOverlayRect[]>([]);
   const [selectionRects, setSelectionRects] = useState<SelectionOverlayRect[]>([]);
   const [pdfContextMenu, setPdfContextMenu] = useState<{ x: number; y: number; pageNumber: number; pageX: number; pageY: number } | null>(null);
+  // 图形标记：绘制模式（右键菜单选形状后进入，拖一个就退出）、拖拽预览、当前选中的标记
+  const [shapeTool, setShapeTool] = useState<ShapeType | null>(null);
+  const [shapeDraft, setShapeDraft] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
+  const shapeStartRef = useRef<{ x: number; y: number; page: HTMLElement } | null>(null);
+  const [selectedShapeId, setSelectedShapeId] = useState<number | null>(null);
+  // 页面元素的 state 副本：供形状 portal 渲染期读取（ref 在渲染期读会被 lint 拦），pageElsRef 仍服务命令式逻辑
+  const [pageEls, setPageEls] = useState<ReadonlyMap<number, HTMLElement>>(new Map());
+  // 形状描边色：记住上次选择（预设名或 c-rrggbb 自定义色）
+  const [shapeColor, setShapeColorState] = useState<HighlightColor>(() => {
+    try {
+      const stored = typeof window !== "undefined" ? localStorage.getItem("lumen-shape-color") : null;
+      return stored && (PRESET_HIGHLIGHT_COLORS.includes(stored as PresetHighlightColor) || /^c-[0-9a-f]{6}$/i.test(stored)) ? stored as HighlightColor : "rose";
+    } catch { return "rose"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("lumen-shape-color", shapeColor); } catch { /* 隐私模式下静默 */ }
+  }, [shapeColor]);
   const [selectionAnchor, setSelectionAnchor] = useState<{ top: number; left: number; cardTop: number; cardLeft: number; pageNumber: number } | null>(null);
   const [showColors, setShowColors] = useState(false);
   // 自定义高亮色：记住上次选择，跨会话持久化到 localStorage
@@ -2634,6 +2749,7 @@ export default function Home() {
   const registerPageEl = useCallback((page: number, el: HTMLElement | null) => {
     if (el) pageElsRef.current.set(page, el);
     else pageElsRef.current.delete(page);
+    setPageEls(new Map(pageElsRef.current));
   }, []);
   const restoringWorkspaceRef = useRef(false);
   // 恢复论文时已弹过“已恢复…”toast，PDF 就绪的 toast 跳过一次，避免 1 秒内互相覆盖
@@ -2819,7 +2935,7 @@ export default function Home() {
     scrollToPage(annotation.pageNumber, "auto");
     window.setTimeout(() => {
       // 优先闪已打开的 inline 卡片/文字批注；批注收起着闪锚点图钉
-      const target = readerRef.current?.querySelector(`.inline-card[data-annotation-id="${annotation.id}"], .pdf-text-note[data-annotation-id="${annotation.id}"]`)
+      const target = readerRef.current?.querySelector(`.inline-card[data-annotation-id="${annotation.id}"], .pdf-text-note[data-annotation-id="${annotation.id}"], .pdf-shape-wrap[data-annotation-id="${annotation.id}"]`)
         || readerRef.current?.querySelector(`[data-annotation-id="${annotation.id}"]`);
       if (!target) return;
       target.classList.add("annotation-flash");
@@ -2987,6 +3103,8 @@ export default function Home() {
       if (event.key === "Escape") {
         if (searchOpen) { setSearchOpen(false); return; }
         if (citationPopover) { setCitationPopover(null); return; }
+        if (shapeTool) { setShapeTool(null); setShapeDraft(null); shapeStartRef.current = null; return; }
+        if (selectedShapeId !== null) { setSelectedShapeId(null); return; }
         if (selectionPos) { setSelectionPos(null); setSelectionRects([]); window.getSelection()?.removeAllRanges(); return; }
         if (pdfContextMenu) { setPdfContextMenu(null); return; }
         if (tourOpen) { setTourOpen(false); return; }
@@ -3010,7 +3128,7 @@ export default function Home() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [citationPopover, diaryOpen, figureLasso, figureRegion, focusComposer, focusMode, formulaAssist, libraryOpen, openModal, openSearch, panMode, pdfContextMenu, searchOpen, selectionPos, setFormulaAssist, settingsOpen, source, statsOpen, toggleFullscreen, tourOpen, usageOpen]);
+  }, [citationPopover, diaryOpen, figureLasso, figureRegion, focusComposer, focusMode, formulaAssist, libraryOpen, openModal, openSearch, panMode, pdfContextMenu, searchOpen, selectedShapeId, selectionPos, setFormulaAssist, settingsOpen, shapeTool, source, statsOpen, toggleFullscreen, tourOpen, usageOpen]);
 
   // 专注模式边缘唤出（peek）：鼠标贴近屏幕左/右缘（<20px）临时滑出左栏/AI 面板，移开越过栏宽+余量才收回
   // （进出阈值不同，带迟滞防边缘抖动）。只在 focusMode 下挂载；手机端没有 mousemove，天然不触发。
@@ -3719,7 +3837,7 @@ export default function Home() {
     const readerRect = readerRef.current.getBoundingClientRect();
     const node = range.commonAncestorContainer.nodeType === Node.TEXT_NODE ? range.commonAncestorContainer.parentElement : range.commonAncestorContainer as HTMLElement;
     // 在批注卡片/气泡等浮层内部划词时不弹出工具栏，避免对翻译结果再套一层「翻译/解释」
-    if (node?.closest?.(".inline-card, .pdf-text-note, .citation-popover, .pdf-context-menu, .selection-menu, .figure-lasso-actions, .formula-assist")) { setSelectionRects([]); return; }
+    if (node?.closest?.(".inline-card, .pdf-text-note, .citation-popover, .pdf-context-menu, .selection-menu, .figure-lasso-actions, .formula-assist, .pdf-shape-wrap")) { setSelectionRects([]); return; }
     const contextRoot = node?.closest?.(".pdf-page, .demo-paper") as HTMLElement | null;
     const pageRect = contextRoot?.getBoundingClientRect();
     const rects = tightRangeClientRects(range, contextRoot);
@@ -3773,7 +3891,7 @@ export default function Home() {
         const node = range.commonAncestorContainer.nodeType === Node.TEXT_NODE ? range.commonAncestorContainer.parentElement : range.commonAncestorContainer as HTMLElement;
         if (!node?.closest?.(".textLayer, .demo-paper")) return;
         // 与鼠标路径一致：批注卡片/气泡等浮层内的选区不弹工具条
-        if (node.closest(".inline-card, .pdf-text-note, .citation-popover, .pdf-context-menu, .selection-menu, .figure-lasso-actions, .formula-assist")) return;
+        if (node.closest(".inline-card, .pdf-text-note, .citation-popover, .pdf-context-menu, .selection-menu, .figure-lasso-actions, .formula-assist, .pdf-shape-wrap")) return;
         presentSelection(range);
       }, 60);
     };
@@ -3911,9 +4029,26 @@ export default function Home() {
     void requestInlineAnswer(id, "formula", formula.text, surrounding);
   }, [flashFormulaRegion, requestInlineAnswer]);
 
+  // 右键菜单选形状 → 进入绘制模式：页面上左键拖出形状，Esc 取消
+  const startShapeTool = useCallback((type: ShapeType) => {
+    setShapeTool(type);
+    setPdfContextMenu(null);
+    setSelectionPos(null);
+    setSelectedShapeId(null);
+    setToast({ text: `在页面上拖出${SHAPE_TYPE_LABELS[type]}即可，Esc 取消` });
+  }, []);
+
   // 框选图表：lasso 模式下左键按下开始拖框，否则走原有的平移逻辑
   const handleReaderPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     lastPointerTypeRef.current = event.pointerType || "mouse";
+    if (shapeTool && event.button === 0) {
+      const page = (event.target as HTMLElement).closest(".pdf-page") as HTMLElement | null;
+      if (!page) return;
+      event.preventDefault();
+      shapeStartRef.current = { x: event.clientX, y: event.clientY, page };
+      setShapeDraft(null);
+      return;
+    }
     if (figureLasso && event.button === 0) {
       const page = (event.target as HTMLElement).closest(".pdf-page") as HTMLElement | null;
       if (!page) return;
@@ -3924,7 +4059,52 @@ export default function Home() {
       return;
     }
     startReaderPan(event);
-  }, [figureLasso, startReaderPan]);
+  }, [figureLasso, startReaderPan, shapeTool]);
+
+  // 图形标记拖拽绘制：拖动实时预览（屏幕坐标），松手按归一化坐标落成批注。
+  // 位移 <10px 视为误触不创建；画完一个就退出绘制模式，要再画从右键菜单再选
+  useEffect(() => {
+    if (!shapeTool) return;
+    const move = (event: PointerEvent) => {
+      const start = shapeStartRef.current;
+      if (!start) return;
+      const pageRect = start.page.getBoundingClientRect();
+      setShapeDraft({
+        x1: start.x,
+        y1: start.y,
+        x2: Math.min(Math.max(event.clientX, pageRect.left), pageRect.right),
+        y2: Math.min(Math.max(event.clientY, pageRect.top), pageRect.bottom),
+      });
+    };
+    const up = (event: PointerEvent) => {
+      const start = shapeStartRef.current;
+      shapeStartRef.current = null;
+      setShapeDraft(null);
+      if (!start) return;
+      const pageRect = start.page.getBoundingClientRect();
+      const x2 = Math.min(Math.max(event.clientX, pageRect.left), pageRect.right);
+      const y2 = Math.min(Math.max(event.clientY, pageRect.top), pageRect.bottom);
+      if (Math.hypot(x2 - start.x, y2 - start.y) < 10) return;
+      const width = Math.max(1, pageRect.width);
+      const height = Math.max(1, pageRect.height);
+      const id = Date.now() + Math.floor(Math.random() * 1000);
+      const annotation: Annotation = {
+        id, kind: "shape", shapeType: shapeTool,
+        shapeX1: (start.x - pageRect.left) / width, shapeY1: (start.y - pageRect.top) / height,
+        shapeX2: (x2 - pageRect.left) / width, shapeY2: (y2 - pageRect.top) / height,
+        color: shapeColor, text: SHAPE_TYPE_LABELS[shapeTool], surrounding: "",
+        top: 0, left: 0, cardTop: 0, cardLeft: 0, open: false, loading: false, result: "", draft: "", thread: [],
+        pageNumber: Number(start.page.dataset.pageNumber || 1), pinOffsetX: 0, pinOffsetY: 0, cardOffsetX: 0, cardOffsetY: 0,
+      };
+      setAnnotations((items) => [...items, annotation]);
+      setSelectedShapeId(id);
+      setShapeTool(null);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+    return () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", up); };
+  }, [shapeTool, shapeColor]);
 
   // 框选拖动与松手：矩形钳制在起始页内；松手时矩形 ≥12×12 才确认选区并弹出操作条
   useEffect(() => {
@@ -4092,6 +4272,16 @@ export default function Home() {
     }
     handleSelectionStart(event);
   }, [annotations, closeAnnotation, handleSelectionStart]);
+
+  // 全局取消形状选中：点页面任何非形状/工具条区域都关闭（含右栏、顶栏等阅读区外位置）
+  useEffect(() => {
+    if (selectedShapeId === null) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!(event.target as HTMLElement).closest(".pdf-shape-wrap, .pdf-shape-toolbar")) setSelectedShapeId(null);
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => document.removeEventListener("pointerdown", onPointerDown, true);
+  }, [selectedShapeId]);
 
   const openAnnotationFromPin = useCallback((annotation: Annotation) => {
     if (lastDraggedPinRef.current === annotation.id) return;
@@ -5173,7 +5363,7 @@ export default function Home() {
             </aside>
           )}
           {source && thumbsOpen === "show" && <div className="thumb-resize-handle" style={{ left: thumbWidth - 4 }} onPointerDown={startThumbResize} title="拖动调整缩略图栏宽度" aria-label="拖动调整缩略图栏宽度" role="separator" aria-orientation="vertical" />}
-          <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}${panMode ? " pan-mode" : ""}${readerPanning ? " panning" : ""}${figureLasso ? " figure-lasso-mode" : ""}`} ref={readerRef} onPointerDown={handleReaderPointerDown} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleReaderMouseDown} onClick={handleCitationClick} onScroll={() => { if (selectionPos) setSelectionPos(null); if (citationPopover) setCitationPopover(null); if (figureRegion) setFigureRegion(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); const reader = readerRef.current; if (!reader || scrollFrameRef.current) return; scrollFrameRef.current = window.requestAnimationFrame(() => { scrollFrameRef.current = 0; const probe = reader.scrollTop + 42; let visiblePage = 1; for (const [page, el] of pageElsRef.current) { if (el.offsetTop <= probe) visiblePage = page; else break; } setCurrentPage((prev) => (prev === visiblePage ? prev : visiblePage)); }); }}>
+          <div className={`reader-viewport ${selectionRects.length ? "custom-selection-active" : ""}${panMode ? " pan-mode" : ""}${readerPanning ? " panning" : ""}${figureLasso ? " figure-lasso-mode" : ""}${shapeTool ? " shape-mode" : ""}`} ref={readerRef} onPointerDown={handleReaderPointerDown} onMouseUp={handleSelection} onMouseMove={handleSelectionMove} onContextMenu={handlePdfContextMenu} onMouseDown={handleReaderMouseDown} onClick={handleCitationClick} onScroll={() => { if (selectionPos) setSelectionPos(null); if (citationPopover) setCitationPopover(null); if (figureRegion) setFigureRegion(null); if (selectionRects.length) { setSelectionRects([]); window.getSelection()?.removeAllRanges(); } if (pdfContextMenu) setPdfContextMenu(null); const reader = readerRef.current; if (!reader || scrollFrameRef.current) return; scrollFrameRef.current = window.requestAnimationFrame(() => { scrollFrameRef.current = 0; const probe = reader.scrollTop + 42; let visiblePage = 1; for (const [page, el] of pageElsRef.current) { if (el.offsetTop <= probe) visiblePage = page; else break; } setCurrentPage((prev) => (prev === visiblePage ? prev : visiblePage)); }); }}>
           {source ? (
             <PdfDocument source={source} zoom={zoom} showFormula={formulaAssist === "show"} onReady={handlePdfReady} onMetadata={handlePaperMetadata} onFormula={createFormulaAnnotation} onTextLayerReady={handleTextLayerReady} onTextExtracted={handleTextExtracted} onExtractProgress={handleExtractProgress} onError={handlePdfError} onThumbnail={handleThumbnail} onPdfReady={handlePdfInstance} registerRef={registerPageEl} registerThumbRequest={registerThumbRequest} skipExtraction={Boolean(paperText)} />
           ) : loadError ? (
@@ -5207,8 +5397,8 @@ export default function Home() {
           ))}
           {annotations.map((annotation) => annotation.kind === "text-note" ? (
             <section key={annotation.id} className={`pdf-text-note ${draggingId === annotation.id ? "dragging" : ""}`} data-annotation-id={annotation.id} style={{ top: annotation.cardTop, left: annotation.cardLeft, color: annotation.textColor || "#9a5a16" }} onMouseDown={(event) => event.stopPropagation()}>
-              <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")}><span><MoreHorizontal size={13} />PDF 文字批注</span><button onClick={() => removeAnnotation(annotation.id)} aria-label="删除 PDF 批注"><X size={13} /></button></header>
-              <textarea value={annotation.note || ""} onChange={(event) => updateAnnotation(annotation.id, { note: event.target.value })} placeholder="输入批注…" autoFocus={Boolean(annotation.fresh)} style={{ fontSize: annotation.fontSize || 14, color: annotation.textColor || "#9a5a16" }} />
+              <header onPointerDown={(event) => startAnnotationDrag(event, annotation, "card")}><span title="拖动移动批注"><MoreHorizontal size={13} /></span><button onClick={() => removeAnnotation(annotation.id)} aria-label="删除 PDF 批注" title="删除批注"><X size={16} /></button></header>
+              <textarea ref={(el) => { if (el) requestAnimationFrame(() => autoSizeTextNote(el)); }} value={annotation.note || ""} onChange={(event) => { updateAnnotation(annotation.id, { note: event.target.value }); autoSizeTextNote(event.currentTarget); }} placeholder="输入批注…" autoFocus={Boolean(annotation.fresh)} style={{ fontSize: annotation.fontSize || 14, color: annotation.textColor || "#9a5a16" }} />
               <footer>
                 <label>字号<select value={annotation.fontSize || 14} onChange={(event) => updateAnnotation(annotation.id, { fontSize: Number(event.target.value) })}><option value="12">12</option><option value="14">14</option><option value="16">16</option><option value="20">20</option><option value="24">24</option></select></label>
                 <div className="note-colors" aria-label="文字颜色">{["#9a5a16", "#b4233b", "#2563a7", "#237052", "#333333"].map((color) => <button key={color} className={annotation.textColor === color ? "active" : ""} style={{ background: color }} onClick={() => updateAnnotation(annotation.id, { textColor: color })} aria-label={`设置颜色 ${color}`} />)}</div>
@@ -5375,6 +5565,41 @@ export default function Home() {
       </aside>
 
       {lassoRect && <div className="figure-lasso-rect" style={lassoRect} aria-hidden="true" />}
+      {/* 拖拽绘制中的形状预览（屏幕坐标、fixed 定位，松手即消失） */}
+      {shapeDraft && shapeTool && (() => {
+        const left = Math.min(shapeDraft.x1, shapeDraft.x2);
+        const top = Math.min(shapeDraft.y1, shapeDraft.y2);
+        const width = Math.abs(shapeDraft.x2 - shapeDraft.x1);
+        const height = Math.abs(shapeDraft.y2 - shapeDraft.y1);
+        return (
+          <div className={`pdf-shape-draft ${shapeTool}`} style={{ left, top, width, height, color: shapeColorCss(shapeColor) }} aria-hidden="true">
+            {shapeTool === "arrow" && (
+              <svg className="pdf-shape-svg" viewBox={`0 0 ${Math.max(1, width)} ${Math.max(1, height)}`} preserveAspectRatio="none">
+                <defs>
+                  <marker id="shape-draft-arrowhead" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="3.4" markerHeight="3.4" orient="auto-start-reverse" markerUnits="strokeWidth">
+                    <path d="M0,0 L8,4 L0,8 z" fill="currentColor" />
+                  </marker>
+                </defs>
+                <line x1={shapeDraft.x1 < shapeDraft.x2 ? 0 : width} y1={shapeDraft.y1 < shapeDraft.y2 ? 0 : height} x2={shapeDraft.x1 < shapeDraft.x2 ? width : 0} y2={shapeDraft.y1 < shapeDraft.y2 ? height : 0} stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" markerEnd="url(#shape-draft-arrowhead)" />
+              </svg>
+            )}
+          </div>
+        );
+      })()}
+      {/* 已保存的图形标记：portal 进各自页面元素，百分比坐标随缩放自适应 */}
+      {annotations.filter((annotation) => annotation.kind === "shape").map((annotation) => (
+        <ShapeMark
+          key={annotation.id}
+          annotation={annotation}
+          pageEl={pageEls.get(annotation.pageNumber || 1) ?? null}
+          selected={selectedShapeId === annotation.id}
+          customColor={customHighlightColor}
+          onSelect={setSelectedShapeId}
+          onColor={(id, color) => { updateAnnotation(id, { color }); setShapeColorState(color); }}
+          onToggleDash={(id) => { const target = annotations.find((item) => item.id === id); if (target) updateAnnotation(id, { shapeDash: !target.shapeDash }); }}
+          onDelete={(id) => { removeAnnotation(id); setSelectedShapeId((current) => (current === id ? null : current)); }}
+        />
+      ))}
       {figureRegion && (
         <div className="figure-lasso-actions" style={{ left: figureRegion.barX, top: figureRegion.barY }}>
           <button onClick={askAboutFigureRegion}><Scan size={14} />问图表</button>
@@ -5426,6 +5651,8 @@ export default function Home() {
       )}
       {pdfContextMenu && <div className="pdf-context-menu" style={{ left: pdfContextMenu.x, top: pdfContextMenu.y }} onMouseDown={(event) => event.stopPropagation()}>
         <button onClick={createPdfTextNote}><MessageSquareText size={15} /><span><strong>添加文字批注</strong><small>写在当前 PDF 位置</small></span></button>
+        <button onClick={() => startShapeTool("rect")}><Square size={15} /><span><strong>画方框</strong><small>圈出一块内容</small></span></button>
+        <button onClick={() => startShapeTool("ellipse")}><Circle size={15} /><span><strong>画圆圈</strong><small>圈出重点位置</small></span></button>
       </div>}
       {tourOpen && <TourOverlay step={tourStep} onStep={setTourStep} onClose={() => setTourOpen(false)} />}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}

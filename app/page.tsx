@@ -194,9 +194,9 @@ function shapeColorCss(color: HighlightColor) {
 }
 
 // 单个图形标记：portal 进对应 .pdf-page，全部百分比坐标，缩放/翻页天然自适应。
-// 方框/圆圈用 CSS 边框渲染（虚线不走 SVG dasharray，避免非等比拉伸变形），整个外框可点选；
+// 方框/圆圈用 CSS 边框渲染（虚线不走 SVG dasharray，避免非等比拉伸变形），按住可拖动换位（pointer capture）；
 // 箭头（旧数据兼容）用 SVG 描边，只有线条本身可点
-function ShapeMark({ annotation, pageEl, selected, customColor, onSelect, onColor, onToggleDash, onDelete }: {
+function ShapeMark({ annotation, pageEl, selected, customColor, onSelect, onColor, onToggleDash, onMove, onDelete }: {
   annotation: Annotation;
   pageEl: HTMLElement | null;
   selected: boolean;
@@ -204,23 +204,74 @@ function ShapeMark({ annotation, pageEl, selected, customColor, onSelect, onColo
   onSelect: (id: number) => void;
   onColor: (id: number, color: HighlightColor) => void;
   onToggleDash: (id: number) => void;
+  onMove: (id: number, x1: number, y1: number, x2: number, y2: number) => void;
   onDelete: (id: number) => void;
 }) {
+  // 拖动状态：记录按下点与原始坐标；位移 >3px 才算拖动，否则按点击选中处理
+  const dragRef = useRef<{ startX: number; startY: number; x1: number; y1: number; x2: number; y2: number; moved: boolean } | null>(null);
+  // 四角手柄改大小：corner 决定哪两个坐标跟随指针
+  const resizeRef = useRef<{ corner: "nw" | "ne" | "sw" | "se"; startX: number; startY: number; x1: number; y1: number; x2: number; y2: number } | null>(null);
   if (!pageEl || annotation.shapeX1 === undefined || annotation.shapeY1 === undefined || annotation.shapeX2 === undefined || annotation.shapeY2 === undefined) return null;
   const left = Math.min(annotation.shapeX1, annotation.shapeX2) * 100;
   const top = Math.min(annotation.shapeY1, annotation.shapeY2) * 100;
   const width = Math.abs(annotation.shapeX2 - annotation.shapeX1) * 100;
   const height = Math.abs(annotation.shapeY2 - annotation.shapeY1) * 100;
   const id = annotation.id;
-  const select = (event: React.SyntheticEvent) => { event.stopPropagation(); onSelect(id); };
   const isArrow = annotation.shapeType === "arrow";
+  const select = (event: React.SyntheticEvent) => { event.stopPropagation(); onSelect(id); };
+  const startMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    event.stopPropagation();
+    event.preventDefault();
+    dragRef.current = { startX: event.clientX, startY: event.clientY, x1: annotation.shapeX1!, y1: annotation.shapeY1!, x2: annotation.shapeX2!, y2: annotation.shapeY2!, moved: false };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const moveShape = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const pageRect = pageEl.getBoundingClientRect();
+    const dxn = (event.clientX - drag.startX) / Math.max(1, pageRect.width);
+    const dyn = (event.clientY - drag.startY) / Math.max(1, pageRect.height);
+    if (!drag.moved && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 3) drag.moved = true;
+    if (!drag.moved) return;
+    // 位移钳制：整个形状不出页面边界
+    const shiftX = Math.max(-Math.min(drag.x1, drag.x2), Math.min(1 - Math.max(drag.x1, drag.x2), dxn));
+    const shiftY = Math.max(-Math.min(drag.y1, drag.y2), Math.min(1 - Math.max(drag.y1, drag.y2), dyn));
+    onMove(id, drag.x1 + shiftX, drag.y1 + shiftY, drag.x2 + shiftX, drag.y2 + shiftY);
+  };
+  const endMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    if (!drag?.moved) select(event);
+  };
+  const startResize = (corner: "nw" | "ne" | "sw" | "se") => (event: React.PointerEvent<HTMLSpanElement>) => {
+    event.stopPropagation();
+    event.preventDefault();
+    resizeRef.current = { corner, startX: event.clientX, startY: event.clientY, x1: annotation.shapeX1!, y1: annotation.shapeY1!, x2: annotation.shapeX2!, y2: annotation.shapeY2! };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const resizeMove = (event: React.PointerEvent<HTMLSpanElement>) => {
+    const drag = resizeRef.current;
+    if (!drag) return;
+    const pageRect = pageEl.getBoundingClientRect();
+    const dxn = (event.clientX - drag.startX) / Math.max(1, pageRect.width);
+    const dyn = (event.clientY - drag.startY) / Math.max(1, pageRect.height);
+    let { x1, y1, x2, y2 } = drag;
+    if (drag.corner.includes("e")) x2 = Math.min(1, Math.max(0, drag.x2 + dxn));
+    if (drag.corner.includes("w")) x1 = Math.min(1, Math.max(0, drag.x1 + dxn));
+    if (drag.corner.includes("s")) y2 = Math.min(1, Math.max(0, drag.y2 + dyn));
+    if (drag.corner.includes("n")) y1 = Math.min(1, Math.max(0, drag.y1 + dyn));
+    // 最小尺寸约 0.5% 页宽/页高，防止拖成一条线后找不到手柄；允许拖过对角（渲染用 min/max 自适应翻转）
+    if (Math.abs(x2 - x1) >= 0.005 && Math.abs(y2 - y1) >= 0.005) onMove(id, x1, y1, x2, y2);
+  };
+  const endResize = () => { resizeRef.current = null; };
   return createPortal(
     <div
       className={`pdf-shape-wrap ${annotation.shapeType}${annotation.shapeDash ? " dashed" : ""}${selected ? " selected" : ""}`}
       data-annotation-id={id}
       style={{ left: `${left}%`, top: `${top}%`, width: `${width}%`, height: `${height}%`, color: shapeColorCss(annotation.color) }}
-      onPointerDown={isArrow ? undefined : (event) => event.stopPropagation()}
-      onClick={isArrow ? undefined : select}
+      onPointerDown={isArrow ? undefined : startMove}
+      onPointerMove={isArrow ? undefined : moveShape}
+      onPointerUp={isArrow ? undefined : endMove}
     >
       {isArrow && (
         <svg className="pdf-shape-svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
@@ -237,6 +288,9 @@ function ShapeMark({ annotation, pageEl, selected, customColor, onSelect, onColo
           />
         </svg>
       )}
+      {selected && !isArrow && (["nw", "ne", "sw", "se"] as const).map((corner) => (
+        <span key={corner} className={`pdf-shape-handle ${corner}`} onPointerDown={startResize(corner)} onPointerMove={resizeMove} onPointerUp={endResize} onPointerCancel={endResize} />
+      ))}
       {selected && (
         <div className="pdf-shape-toolbar" onPointerDown={(event) => event.stopPropagation()} onMouseDown={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()}>
           {PRESET_HIGHLIGHT_COLORS.map((color) => (
@@ -5597,6 +5651,7 @@ export default function Home() {
           onSelect={setSelectedShapeId}
           onColor={(id, color) => { updateAnnotation(id, { color }); setShapeColorState(color); }}
           onToggleDash={(id) => { const target = annotations.find((item) => item.id === id); if (target) updateAnnotation(id, { shapeDash: !target.shapeDash }); }}
+          onMove={(id, x1, y1, x2, y2) => updateAnnotation(id, { shapeX1: x1, shapeY1: y1, shapeX2: x2, shapeY2: y2 })}
           onDelete={(id) => { removeAnnotation(id); setSelectedShapeId((current) => (current === id ? null : current)); }}
         />
       ))}

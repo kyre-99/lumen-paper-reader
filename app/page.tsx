@@ -472,6 +472,29 @@ function normalizePaperUrl(raw: string) {
   return trimmed;
 }
 
+// 批量导入解析：支持本应用导出的 Markdown（### 标题 与 - 链接：行成对还原），也支持一行一个裸链接；
+// 统一走 normalizePaperUrl 归一化并按 URL 去重，标题只附着在其后第一条链接上
+function parseImportText(text: string) {
+  const items: Array<{ url: string; title: string }> = [];
+  const seen = new Set<string>();
+  let pendingTitle = "";
+  const push = (rawUrl: string) => {
+    const url = normalizePaperUrl(rawUrl);
+    if (!/^https?:\/\//i.test(url) || seen.has(url)) return;
+    seen.add(url);
+    items.push({ url, title: pendingTitle });
+  };
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    const heading = line.match(/^#{2,4}\s+(.+)$/);
+    if (heading) { pendingTitle = heading[1].trim(); continue; }
+    const link = line.match(/^[-*]\s*链接[：:]\s*(\S+)/);
+    if (link) { push(link[1]); pendingTitle = ""; continue; }
+    if (/^https?:\/\/\S+$/i.test(line)) { push(line); pendingTitle = ""; }
+  }
+  return items;
+}
+
 // 远程论文"从未打开成功"的判定：没拿到正文且页数仍是初始值 1（页数只在真实载入后写入）。
 // 用于同链接重开时自动清理失败记录、按新论文重新解析——否则死记录会永远挡住同链接去重，
 // 用户只能手动删掉旧记录再找链接。特例：1 页且无文本的远程扫描件会被误判，可接受
@@ -1616,7 +1639,7 @@ function TourOverlay({ step, onStep, onClose }: { step: number; onStep: (step: n
 const PAPER_DND_TYPE = "application/x-lumen-paper";
 const FOLDER_DND_TYPE = "application/x-lumen-folder";
 
-function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpenPaper, onAddPaper, onCreateFolder, onMovePaper, onSetStatus, onRatePaper, onDeletePaper, onRenamePaper, onRenameFolder, onDeleteFolder, onMoveFolder }: { onClose: () => void; papers: LibraryPaper[]; folders: LibraryFolder[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void; onCreateFolder: (name: string, parentId?: string | null) => Promise<LibraryFolder | null>; onMovePaper: (paperId: string, folderId: string | null) => Promise<boolean>; onSetStatus: (paperId: string, status: PaperStatus) => Promise<boolean>; onRatePaper: (paperId: string, rating: number) => Promise<boolean>; onDeletePaper: (id: string) => Promise<boolean>; onRenamePaper: (id: string, title: string) => Promise<boolean>; onRenameFolder: (id: string, name: string) => Promise<boolean>; onDeleteFolder: (id: string) => Promise<boolean>; onMoveFolder: (folderId: string, parentId: string | null) => Promise<boolean> }) {
+function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpenPaper, onAddPaper, onCreateFolder, onMovePaper, onSetStatus, onRatePaper, onDeletePaper, onRenamePaper, onRenameFolder, onDeleteFolder, onMoveFolder, onImportPapers }: { onClose: () => void; papers: LibraryPaper[]; folders: LibraryFolder[]; loading: boolean; activePaperId: string | null; onOpenPaper: (id: string) => void; onAddPaper: () => void; onCreateFolder: (name: string, parentId?: string | null) => Promise<LibraryFolder | null>; onMovePaper: (paperId: string, folderId: string | null) => Promise<boolean>; onSetStatus: (paperId: string, status: PaperStatus) => Promise<boolean>; onRatePaper: (paperId: string, rating: number) => Promise<boolean>; onDeletePaper: (id: string) => Promise<boolean>; onRenamePaper: (id: string, title: string) => Promise<boolean>; onRenameFolder: (id: string, name: string) => Promise<boolean>; onDeleteFolder: (id: string) => Promise<boolean>; onMoveFolder: (folderId: string, parentId: string | null) => Promise<boolean>; onImportPapers: (items: Array<{ url: string; title: string }>, folderId: string | null) => Promise<{ added: number; skipped: number } | null> }) {
   const [activeFolder, setActiveFolder] = useState("all");
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [folderName, setFolderName] = useState("");
@@ -1633,6 +1656,15 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
   // 论文拖拽中的弱提示标记：与文件夹拖拽一起驱动左栏可投放行的晃动提示
   const [paperDragging, setPaperDragging] = useState(false);
   const dragHintActive = paperDragging || draggingFolderId !== null;
+  // 导出模式：勾选要导出的论文（跨文件夹/筛选累积），纯前端拼 Markdown 触发下载，不持久化
+  const [exportMode, setExportMode] = useState(false);
+  const [exportSelected, setExportSelected] = useState<Record<string, boolean>>({});
+  // 导入模式：粘贴导出 md 或裸链接列表，与导出模式互斥，不持久化
+  const [importMode, setImportMode] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [importFolderId, setImportFolderId] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<{ added: number; skipped: number } | null>(null);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKeyDown);
@@ -1688,6 +1720,75 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
   };
   const toggleFolderCollapsed = (id: string) => setCollapsedFolders((map) => ({ ...map, [id]: !map[id] }));
   const startCreateChild = (id: string) => { setCreatingFolder(false); setFolderName(""); setChildCreatingFor(id); };
+
+  // ===== 导出文献库：勾选论文 → 按文件夹分组生成 Markdown → Blob 下载 =====
+  const exportCount = papers.reduce((sum, paper) => sum + (exportSelected[paper.id] ? 1 : 0), 0);
+  const allVisibleSelected = visiblePapers.length > 0 && visiblePapers.every((paper) => exportSelected[paper.id]);
+  const toggleExportPaper = (id: string) => setExportSelected((map) => ({ ...map, [id]: !map[id] }));
+  // "全选当前列表"是切换语义：已全选时再次点击把当前列表全部取消，未全选的论文不受影响
+  const toggleSelectVisible = () => setExportSelected((map) => {
+    const next = { ...map };
+    for (const paper of visiblePapers) next[paper.id] = !allVisibleSelected;
+    return next;
+  });
+  const exitExportMode = () => { setExportMode(false); setExportSelected({}); };
+  const exportLibrary = () => {
+    const selected = papers.filter((paper) => exportSelected[paper.id]);
+    if (!selected.length) return;
+    const statusLabel = (status: PaperStatus) => PAPER_STATUS_OPTIONS.find((option) => option.value === status)?.label || status;
+    const byFolder = new Map<string | null, LibraryPaper[]>();
+    for (const paper of selected) {
+      const key = paper.folderId ?? null;
+      byFolder.set(key, [...(byFolder.get(key) ?? []), paper]);
+    }
+    // 分组顺序：文件夹树序在前、未分类殿后；组内保持文库列表排序
+    const orderedKeys: Array<string | null> = [];
+    for (const { folder } of flatFolders) if (byFolder.has(folder.id)) orderedKeys.push(folder.id);
+    for (const key of byFolder.keys()) if (key !== null && !orderedKeys.includes(key)) orderedKeys.push(key);
+    if (byFolder.has(null)) orderedKeys.push(null);
+    const lines: string[] = ["# 我的文献库", "", `> 导出于 ${new Date().toLocaleString("zh-CN", { hour12: false })} · 共 ${selected.length} 篇`, ""];
+    for (const key of orderedKeys) {
+      const items = byFolder.get(key) ?? [];
+      lines.push(`## ${key === null ? "未分类" : folders.find((folder) => folder.id === key)?.name || "未分类"}`, "");
+      for (const paper of items) {
+        lines.push(`### ${paper.title}`, "");
+        if (paper.sourceUrl) lines.push(`- 链接：${paper.sourceUrl}`);
+        if (paper.authors.trim()) lines.push(`- 作者：${paper.authors.trim()}`);
+        if (formatPublishedAt(paper.publishedAt || "")) lines.push(`- 发表：${formatPublishedAt(paper.publishedAt)}`);
+        lines.push(`- 状态：${statusLabel(paper.status || "unread")} · 评分：${paper.rating > 0 ? "★".repeat(paper.rating) : "未评分"}`);
+        if (paper.lastReadAt) lines.push(`- 上次阅读：${new Date(paper.lastReadAt).toLocaleString("zh-CN", { hour12: false })}`);
+        lines.push("");
+      }
+    }
+    const url = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `文献库-${localDayString()}.md`;
+    link.click();
+    URL.revokeObjectURL(url);
+    exitExportMode();
+  };
+
+  // ===== 批量导入：解析文本（导出 md 或裸链接）→ 调接口建记录 → 父组件刷新文库 =====
+  const importItems = useMemo(() => parseImportText(importText), [importText]);
+  const enterImportMode = () => { setExportMode(false); setExportSelected({}); setImportMode(true); setImportText(""); setImportResult(null); };
+  const enterExportMode = () => { setImportMode(false); setExportMode(true); setExportSelected({}); };
+  const readImportFile = (file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => setImportText(String(reader.result || ""));
+    reader.readAsText(file);
+  };
+  const startImport = async () => {
+    if (!importItems.length || importing) return;
+    setImporting(true);
+    setImportResult(null);
+    const result = await onImportPapers(importItems, importFolderId || null);
+    setImporting(false);
+    if (result) {
+      setImportResult(result);
+      if (result.added > 0) setImportText("");
+    }
+  };
 
   // ===== 拖拽归档：论文行可拖到文件夹/未分类行；文件夹行可拖到别的文件夹行（变子级）或左栏空白区（回根级）=====
   const folderDropProps = (key: string, folderId: string | null, acceptFolder: boolean) => ({
@@ -1778,9 +1879,52 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
             <div className="folder-divider" />
             {renderFolderRows(null, 0)}
             {creatingFolder ? <div className="new-folder-row"><input value={folderName} onChange={(event) => setFolderName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void createFolder(null); if (event.key === "Escape") { event.stopPropagation(); setCreatingFolder(false); } }} placeholder="文件夹名称" autoFocus /><button onClick={() => void createFolder(null)} disabled={!folderName.trim() || folderSaving} aria-label="创建文件夹">{folderSaving ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}</button></div> : <button className="new-folder-button" onClick={() => { setChildCreatingFor(null); setCreatingFolder(true); }}><Plus size={14} /><span>新建文件夹</span></button>}
+            <div className="folder-divider" />
+            <button className="import-library-button" onClick={enterImportMode}><Upload size={14} /><span>导入文献库</span></button>
+            <button className="export-library-button" onClick={enterExportMode}><Download size={14} /><span>导出文献库</span></button>
           </aside>
           <section className="library-content">
+            {importMode ? (
+              <>
+                <div className="library-content-title"><strong>批量导入</strong><span>{importItems.length} 个链接待导入</span></div>
+                <div className="library-import">
+                  <p className="library-import-hint">支持本应用导出的 Markdown 文件（按「标题 + 链接」还原），或直接粘贴链接、一行一个（arXiv 或 PDF 直链）。导入的论文首次打开时才解析正文。</p>
+                  <div className="library-import-toolbar">
+                    <label className="library-import-file" title="选择导出的 Markdown 文件">
+                      <Upload size={12} />选择 .md 文件
+                      <input type="file" accept=".md,.markdown,text/markdown" onChange={(event) => { const file = event.target.files?.[0]; if (file) readImportFile(file); event.target.value = ""; }} />
+                    </label>
+                    <label className="library-folder-select" title="导入到文件夹">
+                      <FolderOpen size={12} />
+                      <select aria-label="导入到文件夹" value={importFolderId} onChange={(event) => setImportFolderId(event.target.value)}>
+                        <option value="">未分类</option>
+                        {flatFolders.map(({ folder, depth }) => <option key={folder.id} value={folder.id}>{`${"　".repeat(depth)}${folder.name}`}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                  <textarea className="library-import-textarea" value={importText} onChange={(event) => { setImportText(event.target.value); setImportResult(null); }} placeholder={"### 论文标题\n- 链接：https://arxiv.org/pdf/2301.12345\n\n或直接一行一个链接"} aria-label="导入内容" />
+                  {importResult && <div className="library-import-result"><Check size={13} />成功导入 {importResult.added} 篇{importResult.skipped ? `，跳过 ${importResult.skipped} 篇（已存在）` : ""}</div>}
+                  <div className="library-import-footer">
+                    <button onClick={() => { setImportMode(false); setImportText(""); setImportResult(null); }}>返回文库</button>
+                    <button className="library-export-submit" onClick={() => void startImport()} disabled={!importItems.length || importing}>
+                      {importing ? <LoaderCircle className="spin" size={12} /> : <Check size={12} />}开始导入{importItems.length ? `（${importItems.length}）` : ""}
+                    </button>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
             <div className="library-content-title"><strong>{activeFolderName}</strong><span>{visiblePapers.length} 篇</span></div>
+            {/* 导出工具条：仅导出模式下显示，勾选跨文件夹/筛选累积，"全选"作用于当前筛选列表 */}
+            {exportMode && (
+              <div className="library-export-bar">
+                <span className="library-export-count">已选 <strong>{exportCount}</strong> 篇</span>
+                <button onClick={toggleSelectVisible} disabled={!visiblePapers.length}>{allVisibleSelected ? "取消全选" : "全选当前列表"}</button>
+                <button onClick={() => setExportSelected({})} disabled={!exportCount}>清空</button>
+                <button onClick={exitExportMode}>取消</button>
+                <button className="library-export-submit" onClick={exportLibrary} disabled={!exportCount}><Download size={12} />导出 Markdown</button>
+              </div>
+            )}
             {/* 筛选栏：状态分段 chip + 星级下拉，与搜索框、左侧文件夹叠加生效 */}
             <div className="library-filters">
               <div className="library-filter-chips" role="group" aria-label="按阅读状态筛选">
@@ -1800,14 +1944,23 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
             {loading ? <div className="library-loading"><LoaderCircle className="spin" size={18} />正在读取文库…</div> : visiblePapers.length ? (
               <div className="library-list">
                 {visiblePapers.map((paper) => (
-                  <div key={paper.id} className={`library-item ${paper.id === activePaperId ? "active" : ""}`} draggable onDragStart={(event) => { event.dataTransfer.setData(PAPER_DND_TYPE, paper.id); event.dataTransfer.effectAllowed = "move"; setDragChip(event, "paper", paper.title); setPaperDragging(true); }} onDragEnd={() => { setPaperDragging(false); setDropTarget(null); }}>
-                    <button className="library-paper-button" onClick={() => onOpenPaper(paper.id)}>
+                  <div key={paper.id} className={`library-item ${paper.id === activePaperId ? "active" : ""} ${exportMode ? "exporting" : ""} ${exportMode && exportSelected[paper.id] ? "selected" : ""}`} draggable={!exportMode} onDragStart={(event) => { event.dataTransfer.setData(PAPER_DND_TYPE, paper.id); event.dataTransfer.effectAllowed = "move"; setDragChip(event, "paper", paper.title); setPaperDragging(true); }} onDragEnd={() => { setPaperDragging(false); setDropTarget(null); }}>
+                    {exportMode && (
+                      <label className="library-export-check" title="选择这篇论文">
+                        <input type="checkbox" checked={Boolean(exportSelected[paper.id])} onChange={() => toggleExportPaper(paper.id)} aria-label={`选择《${paper.title}》`} />
+                      </label>
+                    )}
+                    <button className="library-paper-button" onClick={() => (exportMode ? toggleExportPaper(paper.id) : onOpenPaper(paper.id))}>
                       <span className="library-file"><FileText size={18} /></span>
                       <span className="library-copy"><strong>{paper.title}</strong></span>
-                      <span className="library-open">{paper.id === activePaperId ? "正在阅读" : "打开"}</span>
+                      <span className="library-open">{exportMode ? (exportSelected[paper.id] ? "已选" : "选择") : paper.id === activePaperId ? "正在阅读" : "打开"}</span>
                     </button>
-                    <button className="folder-action" aria-label={`重命名《${paper.title}》`} title="重命名论文（自动识别的标题有误时可以手动改）" onClick={() => { const title = window.prompt("论文标题", paper.title)?.trim(); if (title && title !== paper.title) void onRenamePaper(paper.id, title); }}><SquarePen size={14} /></button>
-                    <button className="folder-action library-delete" aria-label={`删除《${paper.title}》`} title="删除论文（对话和批注一起删除）" onClick={() => { if (window.confirm(`确定删除《${paper.title}》吗？对话和批注会一起删除，无法恢复。`)) void onDeletePaper(paper.id); }}><Trash2 size={14} /></button>
+                    {!exportMode && (
+                      <>
+                        <button className="folder-action" aria-label={`重命名《${paper.title}》`} title="重命名论文（自动识别的标题有误时可以手动改）" onClick={() => { const title = window.prompt("论文标题", paper.title)?.trim(); if (title && title !== paper.title) void onRenamePaper(paper.id, title); }}><SquarePen size={14} /></button>
+                        <button className="folder-action library-delete" aria-label={`删除《${paper.title}》`} title="删除论文（对话和批注一起删除）" onClick={() => { if (window.confirm(`确定删除《${paper.title}》吗？对话和批注会一起删除，无法恢复。`)) void onDeletePaper(paper.id); }}><Trash2 size={14} /></button>
+                      </>
+                    )}
                     {/* 星级评分：点第 N 颗评 N 星，再点当前分值那颗清零；0 星时五颗全空心 */}
                     <div className="library-rating" role="group" aria-label={`《${paper.title}》的评分`}>
                       {[1, 2, 3, 4, 5].map((star) => (
@@ -1837,6 +1990,8 @@ function LibraryModal({ onClose, papers, folders, loading, activePaperId, onOpen
                 ))}
               </div>
             ) : <div className="library-empty"><FolderOpen size={28} /><strong>{search.trim() ? "没有标题匹配的论文" : filtering ? "没有符合筛选的论文" : papers.length ? "这个文件夹还是空的" : "文库还是空的"}</strong><p>{search.trim() ? "换个关键词试试，或清空搜索。" : filtering ? "调整筛选条件试试。" : papers.length ? "可以从其他文件夹把论文移动到这里。" : "打开链接或上传 PDF 后会自动出现在这里。"}</p></div>}
+              </>
+            )}
           </section>
         </div>
         <button className="primary-button wide" onClick={onAddPaper}><Plus size={16} />添加论文</button>
@@ -4696,6 +4851,27 @@ export default function Home() {
     } finally { setLibraryLoading(false); }
   }, []);
 
+  // 批量导入文献：服务端建记录（不解析 PDF），成功后重新拉文库刷新列表
+  const importLibraryPapers = useCallback(async (items: Array<{ url: string; title: string }>, folderId: string | null) => {
+    try {
+      const response = await fetch("/api/papers/batch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items, folderId }) });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "导入失败");
+      if (payload.added > 0) {
+        const listResponse = await fetch("/api/papers", { cache: "no-store" });
+        const listPayload = await listResponse.json();
+        if (listResponse.ok) {
+          setLibraryPapers(Array.isArray(listPayload.papers) ? listPayload.papers : []);
+          setLibraryFolders(Array.isArray(listPayload.folders) ? listPayload.folders : []);
+        }
+      }
+      return { added: payload.added || 0, skipped: payload.skipped || 0 };
+    } catch (error: unknown) {
+      setToast({ text: errorMessage(error, "导入失败，请稍后再试"), kind: "error" });
+      return null;
+    }
+  }, []);
+
   const showUsage = useCallback(async () => {
     setUsageOpen(true);
     setUsageLoading(true);
@@ -5711,7 +5887,7 @@ export default function Home() {
       </div>}
       {tourOpen && <TourOverlay step={tourStep} onStep={setTourStep} onClose={() => setTourOpen(false)} />}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}
-      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} onRatePaper={rateLibraryPaper} onDeletePaper={deleteLibraryPaper} onRenamePaper={renameLibraryPaper} onRenameFolder={renameLibraryFolder} onDeleteFolder={deleteLibraryFolder} onMoveFolder={moveLibraryFolder} />}
+      {libraryOpen && <LibraryModal onClose={() => setLibraryOpen(false)} papers={libraryPapers} folders={libraryFolders} loading={libraryLoading} activePaperId={paperId} onOpenPaper={openLibraryPaper} onAddPaper={() => { setLibraryOpen(false); setOpenModal(true); }} onCreateFolder={createLibraryFolder} onMovePaper={moveLibraryPaper} onSetStatus={setLibraryPaperStatus} onRatePaper={rateLibraryPaper} onDeletePaper={deleteLibraryPaper} onRenamePaper={renameLibraryPaper} onRenameFolder={renameLibraryFolder} onDeleteFolder={deleteLibraryFolder} onMoveFolder={moveLibraryFolder} onImportPapers={importLibraryPapers} />}
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} config={config} setConfig={setConfig} prompts={promptConfig} setPrompts={setPromptConfig} visionConfig={visionConfig} setVisionConfig={setVisionConfig} embeddingConfig={embeddingConfig} setEmbeddingConfig={setEmbeddingConfig} />}
       {usageOpen && <UsageModal onClose={() => setUsageOpen(false)} stats={usageStats} loading={usageLoading} />}
       {statsOpen && <StatsModal onClose={() => setStatsOpen(false)} stats={readingStats} loading={statsLoading} onOpenPaper={(id) => { setStatsOpen(false); void openLibraryPaper(id); }} />}

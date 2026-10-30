@@ -43,6 +43,7 @@ import {
   MessageSquareText,
   Minus,
   Moon,
+  MoveUpRight,
   MoreHorizontal,
   NotebookPen,
   PanelLeft,
@@ -211,6 +212,7 @@ function ShapeMark({ annotation, pageEl, selected, customColor, onSelect, onColo
   const dragRef = useRef<{ startX: number; startY: number; x1: number; y1: number; x2: number; y2: number; moved: boolean } | null>(null);
   // 四角手柄改大小：corner 决定哪两个坐标跟随指针
   const resizeRef = useRef<{ corner: "nw" | "ne" | "sw" | "se"; startX: number; startY: number; x1: number; y1: number; x2: number; y2: number } | null>(null);
+  const arrowEndpointRef = useRef<{ endpoint: "start" | "end"; startX: number; startY: number; x1: number; y1: number; x2: number; y2: number } | null>(null);
   if (!pageEl || annotation.shapeX1 === undefined || annotation.shapeY1 === undefined || annotation.shapeX2 === undefined || annotation.shapeY2 === undefined) return null;
   const left = Math.min(annotation.shapeX1, annotation.shapeX2) * 100;
   const top = Math.min(annotation.shapeY1, annotation.shapeY2) * 100;
@@ -264,6 +266,25 @@ function ShapeMark({ annotation, pageEl, selected, customColor, onSelect, onColo
     if (Math.abs(x2 - x1) >= 0.005 && Math.abs(y2 - y1) >= 0.005) onMove(id, x1, y1, x2, y2);
   };
   const endResize = () => { resizeRef.current = null; };
+  const startArrowEndpoint = (endpoint: "start" | "end") => (event: React.PointerEvent<HTMLSpanElement>) => {
+    event.stopPropagation();
+    event.preventDefault();
+    arrowEndpointRef.current = { endpoint, startX: event.clientX, startY: event.clientY, x1: annotation.shapeX1!, y1: annotation.shapeY1!, x2: annotation.shapeX2!, y2: annotation.shapeY2! };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const moveArrowEndpoint = (event: React.PointerEvent<HTMLSpanElement>) => {
+    const drag = arrowEndpointRef.current;
+    if (!drag) return;
+    const pageRect = pageEl.getBoundingClientRect();
+    const x = Math.min(1, Math.max(0, (drag.endpoint === "start" ? drag.x1 : drag.x2) + (event.clientX - drag.startX) / Math.max(1, pageRect.width)));
+    const y = Math.min(1, Math.max(0, (drag.endpoint === "start" ? drag.y1 : drag.y2) + (event.clientY - drag.startY) / Math.max(1, pageRect.height)));
+    onMove(id, drag.endpoint === "start" ? x : drag.x1, drag.endpoint === "start" ? y : drag.y1, drag.endpoint === "end" ? x : drag.x2, drag.endpoint === "end" ? y : drag.y2);
+  };
+  const endArrowEndpoint = () => { arrowEndpointRef.current = null; };
+  const arrowHandleStyle = (x: number, y: number) => ({
+    left: `${width ? (x - Math.min(annotation.shapeX1!, annotation.shapeX2!)) / Math.abs(annotation.shapeX2! - annotation.shapeX1!) * 100 : 0}%`,
+    top: `${height ? (y - Math.min(annotation.shapeY1!, annotation.shapeY2!)) / Math.abs(annotation.shapeY2! - annotation.shapeY1!) * 100 : 0}%`,
+  });
   return createPortal(
     <div
       className={`pdf-shape-wrap ${annotation.shapeType}${annotation.shapeDash ? " dashed" : ""}${selected ? " selected" : ""}`}
@@ -281,13 +302,25 @@ function ShapeMark({ annotation, pageEl, selected, customColor, onSelect, onColo
             </marker>
           </defs>
           <line
+            className="pdf-shape-hit-line"
+            x1={annotation.shapeX1 < annotation.shapeX2 ? 1 : 99} y1={annotation.shapeY1 < annotation.shapeY2 ? 1 : 99}
+            x2={annotation.shapeX1 < annotation.shapeX2 ? 99 : 1} y2={annotation.shapeY1 < annotation.shapeY2 ? 99 : 1}
+            stroke="transparent" strokeWidth="18" vectorEffect="non-scaling-stroke"
+            onPointerDown={(event) => event.stopPropagation()} onClick={select}
+          />
+          <line
             x1={annotation.shapeX1 < annotation.shapeX2 ? 1 : 99} y1={annotation.shapeY1 < annotation.shapeY2 ? 1 : 99}
             x2={annotation.shapeX1 < annotation.shapeX2 ? 99 : 1} y2={annotation.shapeY1 < annotation.shapeY2 ? 99 : 1}
             stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeDasharray={annotation.shapeDash ? "7 5" : undefined} vectorEffect="non-scaling-stroke" markerEnd={`url(#shape-arrowhead-${id})`}
-            pointerEvents="visibleStroke" onPointerDown={(event) => event.stopPropagation()} onClick={select}
+            pointerEvents="none"
           />
         </svg>
       )}
+      {selected && isArrow && (["start", "end"] as const).map((endpoint) => {
+        const x = endpoint === "start" ? annotation.shapeX1! : annotation.shapeX2!;
+        const y = endpoint === "start" ? annotation.shapeY1! : annotation.shapeY2!;
+        return <span key={endpoint} className="pdf-shape-arrow-handle" style={arrowHandleStyle(x, y)} title={endpoint === "start" ? "拖动箭尾" : "拖动箭头"} onPointerDown={startArrowEndpoint(endpoint)} onPointerMove={moveArrowEndpoint} onPointerUp={endArrowEndpoint} onPointerCancel={endArrowEndpoint} onLostPointerCapture={endArrowEndpoint} />;
+      })}
       {selected && !isArrow && (["nw", "ne", "sw", "se"] as const).map((corner) => (
         <span key={corner} className={`pdf-shape-handle ${corner}`} onPointerDown={startResize(corner)} onPointerMove={resizeMove} onPointerUp={endResize} onPointerCancel={endResize} />
       ))}
@@ -2947,6 +2980,35 @@ export default function Home() {
   const citationFlashTimerRef = useRef<number | null>(null);
   const selectionFrameRef = useRef(0);
   const scrollFrameRef = useRef(0);
+  // Ctrl/⌘ + 滚轮缩放阅读页；以指针位置为锚点补偿滚动，避免缩放时内容跳走
+  useEffect(() => {
+    const reader = readerRef.current;
+    if (!reader) return;
+    let lastZoomAt = 0;
+    const handleWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      event.preventDefault();
+      // PDF 缩放会重绘可视页面；高频滚轮事件逐条触发容易卡顿，合并到每 120ms 一次
+      const now = performance.now();
+      if (now - lastZoomAt < 120) return;
+      lastZoomAt = now;
+      const nextZoom = Math.min(1.8, Math.max(.55, zoom + (event.deltaY < 0 ? .1 : -.1)));
+      if (nextZoom === zoom) return;
+      const rect = reader.getBoundingClientRect();
+      const pointerX = event.clientX - rect.left;
+      const pointerY = event.clientY - rect.top;
+      const contentX = reader.scrollLeft + pointerX;
+      const contentY = reader.scrollTop + pointerY;
+      const ratio = nextZoom / zoom;
+      setZoom(nextZoom);
+      window.requestAnimationFrame(() => {
+        reader.scrollLeft = contentX * ratio - pointerX;
+        reader.scrollTop = contentY * ratio - pointerY;
+      });
+    };
+    reader.addEventListener("wheel", handleWheel, { passive: false });
+    return () => reader.removeEventListener("wheel", handleWheel);
+  }, [zoom]);
   // 全文 AI 聊天流：新消息/流式增量到达时自动滚到底部；
   // chatStickRef 记录用户是否停留在底部附近——上滑阅读历史时暂停自动滚动，回到底部附近（80px 内）自动恢复
   const chatStreamRef = useRef<HTMLDivElement>(null);
@@ -3917,7 +3979,7 @@ export default function Home() {
     });
   }, []);
 
-  const requestInlineAnswer = useCallback(async (id: number, action: ToolAction, text: string, surrounding: string, customQuestion?: string, history: ChatMessage[] = [], imageDataUrl?: string) => {
+  const requestInlineAnswer = useCallback(async (id: number, action: ToolAction, text: string, surrounding: string, customQuestion?: string, history: ChatMessage[] = [], imageDataUrl?: string, pageNumber?: number) => {
     const prompt = customQuestion || (action === "translate" ? "请将选中的内容准确翻译成中文，保留公式与专业术语，并简短标注关键术语。" : action === "formula" ? "请逐项解释这个公式：说明每个符号、公式的直觉含义、它在论文中的作用，以及阅读时应注意的假设。" : action === "figure" ? "请解读这张图表/表格：说明它的构成、坐标轴与单位、主要趋势、关键数值，以及它支持的结论。" : "请直观解释选中内容的含义、它在本段中的作用，以及读者容易误解的地方。");
     const userMessage: ChatMessage = { id: Date.now(), role: "user", content: customQuestion || (action === "translate" ? "翻译这段内容" : action === "formula" ? "解释这个公式" : action === "figure" ? "解读这张图表" : action === "explain" ? "解释这段内容" : prompt) };
     const nextThread = [...history, userMessage];
@@ -3932,7 +3994,7 @@ export default function Home() {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline", history: history.filter((message) => !message.failed).slice(-10), systemPrompts: promptConfig, effort: inlineEffort, ...(paperId ? { paperId } : {}), ...(paperId && paperText === lastSavedTextRef.current ? {} : { paperContext: paperText }), ...(imageDataUrl ? { imageDataUrl } : {}) }),
+          body: JSON.stringify({ endpoint: config.endpoint, apiKey: config.apiKey || undefined, model: config.model, paperTitle, question: prompt, selectedText: text, surroundingContext: surrounding, mode: "inline", action, pageNumber, history: history.filter((message) => !message.failed).slice(-10), systemPrompts: promptConfig, effort: inlineEffort, ...(paperId ? { paperId } : {}), ...(paperId && paperText === lastSavedTextRef.current ? {} : { paperContext: paperText }), ...(imageDataUrl ? { imageDataUrl } : {}) }),
           signal: controller.signal,
         });
         if (!response.ok) {
@@ -3988,7 +4050,7 @@ export default function Home() {
     if (!last?.failed || last.role !== "assistant" || !userMessage || userMessage.role !== "user") return;
     const history = thread.slice(0, -2).filter((message) => !message.failed);
     const isAutoFirst = thread.length === 2 && annotation.kind !== "ask";
-    void requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, isAutoFirst ? undefined : userMessage.content, history, annotation.kind === "figure" ? annotation.figureImage || undefined : undefined);
+    void requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, isAutoFirst ? undefined : userMessage.content, history, annotation.kind === "figure" ? annotation.figureImage || undefined : undefined, annotation.pageNumber);
   }, [requestInlineAnswer]);
 
   const handleSelectionStart = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
@@ -4196,7 +4258,7 @@ export default function Home() {
     setSelectionRects([]);
     setShowColors(false);
     window.getSelection()?.removeAllRanges();
-    if (kind === "translate" || kind === "explain") void requestInlineAnswer(id, kind, text, context);
+    if (kind === "translate" || kind === "explain") void requestInlineAnswer(id, kind, text, context, undefined, [], undefined, anchor.pageNumber);
     if (kind !== "highlight") window.setTimeout(() => flashAnnotationRange(id), 0);
     setSelectedText("");
     setSelectionContext("");
@@ -4230,12 +4292,17 @@ export default function Home() {
     const id = Date.now() + Math.floor(Math.random() * 1000);
     const cardLeft = left + 358 > visibleRight ? Math.max(reader.scrollLeft + 14, left - 360) : left + 15;
     const cardTop = Math.max(reader.scrollTop + 8, Math.min(reader.scrollTop + reader.clientHeight - 110, top + 15));
-    const surrounding = String(page.innerText || formula.text).replace(/\s+/g, " ").slice(0, 2000);
+    const pageText = String(page.innerText || formula.text).replace(/\s+/g, " ").trim();
+    const normalizedFormula = formula.text.replace(/\s+/g, " ").trim();
+    const formulaIndex = pageText.indexOf(normalizedFormula);
+    const surrounding = formulaIndex >= 0
+      ? pageText.slice(Math.max(0, formulaIndex - 1800), Math.min(pageText.length, formulaIndex + normalizedFormula.length + 2600))
+      : pageText.slice(0, 10000);
     const annotation: Annotation = { id, kind: "formula", color: "blue", text: formula.text, surrounding, top, left, cardTop, cardLeft, open: true, loading: false, result: "", draft: "", thread: [], pageNumber: formula.pageNumber, pageX: formula.pageX, pageY: formula.pageY, formulaRegionX: formula.regionX, formulaRegionY: formula.regionY, formulaRegionWidth: formula.regionWidth, formulaRegionHeight: formula.regionHeight, formulaRegionLeft, formulaRegionTop, formulaRegionPixelWidth, formulaRegionPixelHeight, pinOffsetX: 0, pinOffsetY: 0, cardOffsetX: cardLeft - left, cardOffsetY: cardTop - top };
     annotationAnchorsRef.current.set(id, { top, left });
     setAnnotations((items) => [...items, annotation]);
     window.setTimeout(() => flashFormulaRegion(id), 0);
-    void requestInlineAnswer(id, "formula", formula.text, surrounding);
+    void requestInlineAnswer(id, "formula", formula.text, surrounding, undefined, [], undefined, formula.pageNumber);
   }, [flashFormulaRegion, requestInlineAnswer]);
 
   // 右键菜单选形状 → 进入绘制模式：页面上左键拖出形状，Esc 取消
@@ -4387,14 +4454,14 @@ export default function Home() {
     const cardLeft = left + 358 > visibleRight ? Math.max(reader.scrollLeft + 14, left - 360) : left + 15;
     const cardTop = Math.max(reader.scrollTop + 8, Math.min(reader.scrollTop + reader.clientHeight - 110, top + 15));
     const text = `第 ${region.pageNumber} 页图表区域`;
-    const surrounding = String(page.innerText || "").replace(/\s+/g, " ").slice(0, 2000);
+    const surrounding = String(page.innerText || "").replace(/\s+/g, " ").trim().slice(0, 10000);
     const annotation: Annotation = { id, kind: "figure", color: "green", text, surrounding, top, left, cardTop, cardLeft, open: true, loading: false, result: "", draft: "", thread: [], pageNumber: region.pageNumber, pageX, pageY, formulaRegionX: region.regionX, formulaRegionY: region.regionY, formulaRegionWidth: region.regionWidth, formulaRegionHeight: region.regionHeight, formulaRegionLeft, formulaRegionTop, formulaRegionPixelWidth, formulaRegionPixelHeight, pinOffsetX: 0, pinOffsetY: 0, cardOffsetX: cardLeft - left, cardOffsetY: cardTop - top };
     annotationAnchorsRef.current.set(id, { top, left });
     setAnnotations((items) => [...items, annotation]);
     window.setTimeout(() => flashFormulaRegion(id), 0);
     const imageDataUrl = await capturePageRegion(pdf, region.pageNumber, region);
     if (imageDataUrl) updateAnnotation(id, { figureImage: imageDataUrl });
-    void requestInlineAnswer(id, "figure", text, surrounding, undefined, [], imageDataUrl || undefined);
+    void requestInlineAnswer(id, "figure", text, surrounding, undefined, [], imageDataUrl || undefined, region.pageNumber);
   }, [flashFormulaRegion, requestInlineAnswer, updateAnnotation]);
 
   const askAboutFigureRegion = useCallback(() => {
@@ -4413,7 +4480,7 @@ export default function Home() {
     if (lastPointerTypeRef.current !== "mouse" && target.closest(".textLayer, .demo-paper")) return;
     event.preventDefault();
     const rect = page.getBoundingClientRect();
-    setPdfContextMenu({ x: Math.min(event.clientX, window.innerWidth - 210), y: Math.min(event.clientY, window.innerHeight - 110), pageNumber: Number(page.dataset.pageNumber || 1), pageX: Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)), pageY: Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)) });
+    setPdfContextMenu({ x: Math.min(event.clientX, window.innerWidth - 210), y: Math.min(event.clientY, window.innerHeight - 155), pageNumber: Number(page.dataset.pageNumber || 1), pageX: Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)), pageY: Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)) });
     setSelectionPos(null);
   }, []);
 
@@ -5679,8 +5746,8 @@ export default function Home() {
                   {annotation.loading && <div className="inline-thinking"><LoaderCircle className="spin" size={16} />{annotation.loadingLabel || "正在结合相邻段落分析…"}</div>}
                   {annotation.kind !== "highlight" && !annotation.loading && (
                     <div className="inline-ask follow-up">
-                      <textarea rows={2} value={annotation.draft} onChange={(event) => updateAnnotation(annotation.id, { draft: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && annotation.draft.trim()) { event.preventDefault(); requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, annotation.draft, annotation.thread); } }} placeholder={annotation.thread.length ? "继续追问这段内容…" : "针对这段内容提问…"} autoFocus={annotation.kind === "ask" && annotation.thread.length === 0 && Boolean(annotation.fresh)} />
-                      <button disabled={!annotation.draft.trim()} onClick={() => requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, annotation.draft, annotation.thread)}><Send size={14} />发送</button>
+                      <textarea rows={2} value={annotation.draft} onChange={(event) => updateAnnotation(annotation.id, { draft: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && annotation.draft.trim()) { event.preventDefault(); requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, annotation.draft, annotation.thread, annotation.kind === "figure" ? annotation.figureImage || undefined : undefined, annotation.pageNumber); } }} placeholder={annotation.thread.length ? "继续追问这段内容…" : "针对这段内容提问…"} autoFocus={annotation.kind === "ask" && annotation.thread.length === 0 && Boolean(annotation.fresh)} />
+                      <button disabled={!annotation.draft.trim()} onClick={() => requestInlineAnswer(annotation.id, annotation.kind as ToolAction, annotation.text, annotation.surrounding, annotation.draft, annotation.thread, annotation.kind === "figure" ? annotation.figureImage || undefined : undefined, annotation.pageNumber)}><Send size={14} />发送</button>
                     </div>
                   )}
                   </div>
@@ -5884,6 +5951,7 @@ export default function Home() {
         <button onClick={createPdfTextNote}><MessageSquareText size={15} /><span><strong>添加文字批注</strong><small>写在当前 PDF 位置</small></span></button>
         <button onClick={() => startShapeTool("rect")}><Square size={15} /><span><strong>画方框</strong><small>圈出一块内容</small></span></button>
         <button onClick={() => startShapeTool("ellipse")}><Circle size={15} /><span><strong>画圆圈</strong><small>圈出重点位置</small></span></button>
+        <button onClick={() => startShapeTool("arrow")}><MoveUpRight size={15} /><span><strong>画箭头</strong><small>指向重点内容</small></span></button>
       </div>}
       {tourOpen && <TourOverlay step={tourStep} onStep={setTourStep} onClose={() => setTourOpen(false)} />}
       {openModal && <OpenPaperModal onClose={() => setOpenModal(false)} onOpenUrl={openUrl} onOpenFile={openFile} />}

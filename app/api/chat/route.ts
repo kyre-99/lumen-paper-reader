@@ -113,16 +113,36 @@ function historyDigest(history: Array<{ role: string; content: string }>) {
     .join("\n");
 }
 
-// 组装参考片段：按分块边界截断，不把最后一块拦腰切断；至少保留一块
-function buildReference(gathered: Map<number, Chunk>, budget: number) {
-  const ordered = [...gathered.values()].sort((a, b) => a.page - b.page || a.id - b.id);
-  let out = "";
-  for (const chunk of ordered) {
-    const block = `【P${chunk.page}${chunk.heading ? ` · ${chunk.heading}` : ""}】${chunk.text}\n\n`;
-    if (out && out.length + block.length > budget) break;
-    out += block;
+// 为直接命中块补充前后文，避免方法定义、公式假设或图表解释被分块边界截断
+function addNeighborContext(chunks: Chunk[], gathered: Map<number, Chunk>, limit = 8) {
+  const byId = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+  const directHits = [...gathered.values()];
+  let added = 0;
+  for (const chunk of directHits) {
+    for (const id of [chunk.id - 1, chunk.id + 1]) {
+      const neighbor = byId.get(id);
+      if (!neighbor || gathered.has(id)) continue;
+      gathered.set(id, neighbor);
+      added += 1;
+      if (added >= limit) return;
+    }
   }
-  return out.trim();
+}
+
+// 先按检索优先级装入预算，再按页码组织输出；跳过低相关块，不因单块超限提前终止
+function buildReference(gathered: Map<number, Chunk>, budget: number) {
+  const selected: Chunk[] = [];
+  let chars = 0;
+  for (const chunk of gathered.values()) {
+    const length = chunk.text.length + chunk.heading.length + 20;
+    if (chars + length > budget) continue;
+    selected.push(chunk);
+    chars += length;
+  }
+  return selected
+    .sort((a, b) => a.page - b.page || a.id - b.id)
+    .map((chunk) => `【P${chunk.page}${chunk.heading ? ` · ${chunk.heading}` : ""} · 片段${chunk.id}】${chunk.text}`)
+    .join("\n\n");
 }
 
 async function planRetrieval(target: URL, apiKey: string, model: string, question: string, historyContext: string, meter?: TokenMeter) {
@@ -214,6 +234,8 @@ export async function POST(request: NextRequest) {
     if (!user) return NextResponse.json({ error: "需要登录" }, { status: 401 });
     const body = await request.json();
     const { endpoint, apiKey, model, paperTitle, paperId = "", question, paperContext = "", selectedText = "", surroundingContext = "", mode = "global", history = [], systemPrompts = {}, effort = "medium" } = body;
+    const inlineAction = ["translate", "explain", "ask", "formula", "figure"].includes(body.action) ? String(body.action) : "ask";
+    const inlinePageNumber = Math.max(1, Math.floor(Number(body.pageNumber) || 1));
     // 无记忆模式：仅对侧边栏全文问答（global）生效，不检索、不注入任何论文上下文
     const freeChat = body.freeChat === true && mode !== "inline";
     // 输入大小上限：论文全文与对话历史分别限制 200KB / 100KB，避免超大请求体打满 Worker 内存
@@ -257,9 +279,10 @@ export async function POST(request: NextRequest) {
     const historyChars = historyMessages.reduce((sum, item) => sum + item.content.length, 0);
     const referenceBudget = Math.max(8000, MAX_REFERENCE_CHARS - Math.min(historyChars, 10000));
     const meter: TokenMeter = { prompt: 0, completion: 0 };
-    // 语义检索（Embedding）：模型名留空即未启用；仅论文已入库且文本来自库中（与索引内容一致）时可用；快速档永不触发
+    // 语义检索（Embedding）：模型名留空即未启用；仅论文已入库且文本来自库中（与索引内容一致）时可用。
+    // 快速档也合并语义召回，弥补中文提问与英文论文之间的关键词错配，但不额外调用检索规划模型。
     const embeddingConfig = await resolveModelConfig(savedSettings, {}, { embedding: true });
-    const embeddingReady = !fromClient && Boolean(paperIdText) && level !== "medium" && Boolean(embeddingConfig.model && embeddingConfig.endpoint && embeddingConfig.apiKey);
+    const embeddingReady = !fromClient && Boolean(paperIdText) && Boolean(embeddingConfig.model && embeddingConfig.endpoint && embeddingConfig.apiKey);
 
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
@@ -277,56 +300,61 @@ export async function POST(request: NextRequest) {
             return vectorRetrieve(db, user.id, paperIdText, chunks, queryVectors, k, exclude);
           };
         };
+        const gatherInlineReference = async (questionText: string) => {
+          if (inlineAction === "translate") return "";
+          const chunks = cachedChunkPaper(chunkKey, resolvedPaperContext);
+          const vectorSearch = await setupVectorSearch(chunks);
+          const gathered = new Map<number, Chunk>();
+          if (chunks.length) {
+            let queries = [questionText, String(selectedText).slice(0, 160)];
+            if (level !== "medium") {
+              try {
+                const plan = await planRetrieval(target, resolvedApiKey, resolvedModel, questionText, historyDigest(historyMessages), meter);
+                if (plan.queries.length) queries = plan.queries;
+              } catch { /* 检索规划失败时退回原问题 */ }
+            }
+            send({ type: "step", label: `在全文中检索：${queries.slice(0, 2).join(" / ")}` });
+            let first = retrieveChunks(chunks, queries, false, level === "medium" ? 4 : 6);
+            if (vectorSearch) {
+              try {
+                first = mergeHits(first, await vectorSearch(queries, 5), 10);
+              } catch { /* 向量召回失败保持关键词结果 */ }
+            }
+            first.forEach((chunk) => gathered.set(chunk.id, chunk));
+            if (first.length) send({ type: "step", label: `找到 ${first.length} 个相关片段（${pagesLabel(first)}）` });
+            if (level === "max") await runAgentLoop(target, resolvedApiKey, resolvedModel, questionText, chunks, gathered, send, meter);
+            addNeighborContext(chunks, gathered);
+            if (!gathered.has(chunks[0].id)) gathered.set(chunks[0].id, chunks[0]);
+          }
+          return buildReference(gathered, referenceBudget);
+        };
         try {
           if (isInline && imageDataUrl) {
-            // 框选图表问答：单次直接流式调用，跳过检索规划与 Agent
+            // 图表同时提供截图、所在页文字和全文相关证据，避免只能看到图而看不到正文论证
             const questionText = String(question);
+            const reference = await gatherInlineReference(questionText);
+            const referenceBlock = reference ? `\n\n<paper_reference>\n${reference}\n</paper_reference>` : "";
             const messages = [
               { role: "system", content: renderSystemPrompt(inlinePrompt, title) + INLINE_CONTRACT + FIGURE_CONTRACT },
               ...historyMessages,
               {
                 role: "user",
                 content: [
-                  { type: "text", text: `我正在阅读论文《${title}》，框选了其中一张图表/表格（${String(selectedText).slice(0, 200) || "页面截图区域"}）。\n\n该区域所在页面的文字内容：\n<nearby_text>\n${String(surroundingContext).slice(0, 10000)}\n</nearby_text>\n\n我的问题是：\n${questionText}` },
+                  { type: "text", text: `任务类型：figure\n论文：《${title}》\n图表位置：P${inlinePageNumber}（${String(selectedText).slice(0, 200) || "页面截图区域"}）\n\n<nearby_text source="P${inlinePageNumber}">\n${String(surroundingContext).slice(0, 10000)}\n</nearby_text>${referenceBlock}\n\n当前问题：\n${questionText}` },
                   { type: "image_url", image_url: { url: imageDataUrl } },
                 ],
               },
             ];
             for await (const delta of streamCompletion(target, resolvedApiKey, { model: resolvedModel, messages, temperature: 0.3 }, meter)) send({ type: "delta", text: delta });
           } else if (isInline) {
-            // 划词问答：medium 只用选区和相邻原文（零额外调用）；high/max 会从全论文检索补充上下文
             const questionText = String(question);
-            const chunks = cachedChunkPaper(chunkKey, resolvedPaperContext);
-            const vectorSearch = await setupVectorSearch(chunks);
-            const gathered = new Map<number, Chunk>();
-            if (chunks.length && level !== "medium") {
-              let queries = [questionText, String(selectedText).slice(0, 120)];
-              try {
-                const plan = await planRetrieval(target, resolvedApiKey, resolvedModel, questionText, historyDigest(historyMessages), meter);
-                if (plan.queries.length) queries = plan.queries;
-              } catch { /* 检索规划失败时退回原问题 */ }
-              send({ type: "step", label: `在全文中检索：${queries.slice(0, 2).join(" / ")}` });
-              let first = retrieveChunks(chunks, queries, false, 6);
-              if (vectorSearch) {
-                try {
-                  first = mergeHits(first, await vectorSearch(queries, 5), 10);
-                } catch { /* 向量召回失败保持关键词结果 */ }
-              }
-              first.forEach((chunk) => gathered.set(chunk.id, chunk));
-              if (first.length) send({ type: "step", label: `找到 ${first.length} 个相关片段（${pagesLabel(first)}）` });
-              if (level === "max") {
-                await runAgentLoop(target, resolvedApiKey, resolvedModel, questionText, chunks, gathered, send, meter);
-              }
-            }
-            // 全局锚点：非快速档时始终带上论文开头（摘要/引言），保证回答有全局语境；
-            // 快速档刻意只用选区+相邻原文，不注入额外内容
-            if (chunks.length && level !== "medium" && !gathered.has(chunks[0].id)) gathered.set(chunks[0].id, chunks[0]);
-            const reference = buildReference(gathered, referenceBudget);
-            const referenceBlock = reference ? `\n\n另外，我还从论文其他位置检索到这些相关内容：\n<paper_reference>\n${reference}\n</paper_reference>` : "";
+            const reference = await gatherInlineReference(questionText);
+            const referenceBlock = reference ? `\n\n<paper_reference>\n${reference}\n</paper_reference>` : "";
+            const actionContract = inlineAction === "translate" ? "\n\n翻译要求：直接给出忠实流畅的译文，保留公式、符号和专业术语；不需要检索或解释论文其他部分。" : INLINE_CONTRACT;
             const messages = [
-              { role: "system", content: renderSystemPrompt(inlinePrompt, title) + INLINE_CONTRACT },
+              { role: "system", content: renderSystemPrompt(inlinePrompt, title) + actionContract },
               ...historyMessages,
-              { role: "user", content: `我正在看下面这段论文。\n\n<selected_text>\n${String(selectedText).slice(0, 6000)}\n</selected_text>\n\n<nearby_text>\n${String(surroundingContext).slice(0, 10000)}\n</nearby_text>${referenceBlock}\n\n我的问题是：\n${questionText}` },
+              { role: "user", content: `任务类型：${inlineAction}\n锚点页码：P${inlinePageNumber}\n\n<selected_text source="P${inlinePageNumber}">\n${String(selectedText).slice(0, 6000)}\n</selected_text>\n\n<nearby_text source="P${inlinePageNumber}">\n${String(surroundingContext).slice(0, 10000)}\n</nearby_text>${referenceBlock}\n\n当前问题：\n${questionText}` },
             ];
             for await (const delta of streamCompletion(target, resolvedApiKey, { model: resolvedModel, messages, temperature: 0.3 }, meter)) send({ type: "delta", text: delta });
           } else if (freeChat) {
@@ -378,7 +406,8 @@ export async function POST(request: NextRequest) {
                   const previews = first.map((chunk) => `P${chunk.page} ${chunk.heading || ""}：${chunk.text.slice(0, 160)}`).join("\n");
                   const gap = await planSecondRound(target, resolvedApiKey, resolvedModel, questionText, previews, meter);
                   if (gap.needMore && gap.queries.length) {
-                    const more = retrieveChunks(chunks, gap.queries, false, 6, gathered);
+                    let more = retrieveChunks(chunks, gap.queries, false, 6, gathered);
+                    if (vectorSearch) more = mergeHits(more, await vectorSearch(gap.queries, 5, gathered), 8);
                     more.forEach((chunk) => gathered.set(chunk.id, chunk));
                     if (more.length) send({ type: "step", label: `第 2 轮检索补充 ${more.length} 个片段（${pagesLabel(more)}）` });
                     else send({ type: "step", label: "第 2 轮检索：资料已覆盖问题" });
@@ -390,6 +419,7 @@ export async function POST(request: NextRequest) {
               }
             }
 
+            addNeighborContext(chunks, gathered);
             // 全局锚点：无论问题多具体，始终带上论文开头（摘要/引言），保证回答有全局语境
             if (chunks.length && !gathered.has(chunks[0].id)) gathered.set(chunks[0].id, chunks[0]);
             const reference = buildReference(gathered, referenceBudget);

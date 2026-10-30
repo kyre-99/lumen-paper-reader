@@ -179,5 +179,5 @@ export function mergeHits(keywordHits: Chunk[], vectorHits: Chunk[], cap: number
     if (merged.size >= cap) break;
     if (!merged.has(chunk.id)) merged.set(chunk.id, chunk);
   }
-  return [...merged.values()].sort((a, b) => a.page - b.page);
+  return [...merged.values()];
 }
